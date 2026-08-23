@@ -5,10 +5,14 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "1080:1080"
-      - "20443:20443"
+      - "127.0.0.1:1080:1080"
+      - "127.0.0.1:20443:20443"
     volumes:
-      - ./data:/data
+      - type: bind
+        source: ./data
+        target: /data
+      - type: tmpfs
+        target: /tmp
     environment:
       SSH_HOST: "${SSH_HOST}"
       SSH_PORT: "22"
@@ -20,6 +24,11 @@ services:
       DIRECT_IP_FAMILY: "ipv4"
       DOH_IP: "9.9.9.9"
       LOG_LEVEL: "info"
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    cap_drop:
+      - ALL
     healthcheck:
       test: ["CMD", "sh", "-c", "echo | nc -z -w 2 127.0.0.1 1080"]
       interval: 10s
