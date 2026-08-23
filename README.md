@@ -21,9 +21,14 @@ Single Go process in a Docker container. No extra dependencies.
 # 2. Build and start
 docker compose up -d --build
 
-# 3. On first run, copy the output:
-#    - SSH public key → add to VPS ~/.ssh/authorized_keys
-#    - tg://proxy link → paste in Telegram
+# 3. Check first-run output
+docker compose logs
+
+# 4. Copy the SSH public key to VPS ~/.ssh/authorized_keys:
+#    command="echo 'tunnel only'",no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 AAAA...
+
+# 5. If MTProto is enabled, paste the `tg://proxy` link into Telegram to activate the proxy,
+#    or enter the server (localhost) and secret manually in Settings → Data and Storage → Proxy
 ```
 
 ## Configuration
