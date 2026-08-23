@@ -1,0 +1,237 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/netip"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog/log"
+)
+
+type Route int
+
+const (
+	RouteDirect Route = iota
+	RouteTunnel
+)
+
+type ruleEntry struct {
+	kind     ruleKind
+	ipPrefix *netip.Prefix
+	re       *regexp.Regexp
+	domain   string
+}
+
+type ruleKind int
+
+const (
+	kindDirect ruleKind = iota
+	kindTunnel
+)
+
+type RuleEngine struct {
+	rules   []ruleEntry
+	dns     *dnsCache
+	private []netip.Prefix
+}
+
+func NewRuleEngine(direct, tunnel, noProxy string) (*RuleEngine, error) {
+	e := &RuleEngine{
+		dns: &dnsCache{
+			mu:    sync.Mutex{},
+			cache: make(map[string]cacheEntry),
+			ttl:   30 * time.Second,
+		},
+		private: []netip.Prefix{
+			mustPrefix("10.0.0.0/8"),
+			mustPrefix("172.16.0.0/12"),
+			mustPrefix("192.168.0.0/16"),
+			mustPrefix("127.0.0.0/8"),
+			mustPrefix("::1/128"),
+			mustPrefix("169.254.0.0/16"),
+			mustPrefix("fe80::/10"),
+		},
+	}
+
+	if noProxy != "" {
+		for _, entry := range strings.Split(noProxy, ",") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue
+			}
+			r, err := parseRuleEntry(entry)
+			if err != nil {
+				return nil, err
+			}
+			e.rules = append(e.rules, r.withKind(kindDirect))
+		}
+	}
+
+	if direct != "" {
+		for _, entry := range strings.Split(direct, ",") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue
+			}
+			r, err := parseRuleEntry(entry)
+			if err != nil {
+				return nil, err
+			}
+			e.rules = append(e.rules, r.withKind(kindDirect))
+		}
+	}
+
+	if tunnel != "" {
+		for _, entry := range strings.Split(tunnel, ",") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue
+			}
+			r, err := parseRuleEntry(entry)
+			if err != nil {
+				return nil, err
+			}
+			e.rules = append(e.rules, r.withKind(kindTunnel))
+		}
+	}
+
+	return e, nil
+}
+
+func (e *RuleEngine) Route(host string, port int) Route {
+	// 1. RFC 1918 / loopback / link-local — always direct
+	if ip, err := netip.ParseAddr(host); err == nil && e.isPrivate(ip) {
+		log.Debug().Str("host", host).Int("port", port).Str("reason", "private").Msg("route")
+		return RouteDirect
+	}
+
+	// 2-3. Check rules in order
+	for _, r := range e.rules {
+		if r.matches(host, e.dns) {
+			kind := "direct"
+			if r.kind == kindTunnel {
+				kind = "tunnel"
+			}
+			log.Debug().Str("host", host).Int("port", port).Str("reason", kind).Msg("route")
+			if r.kind == kindDirect {
+				return RouteDirect
+			}
+			return RouteTunnel
+		}
+	}
+
+	// 4. Fallback: tunnel
+	log.Debug().Str("host", host).Int("port", port).Str("reason", "fallback").Msg("route")
+	return RouteTunnel
+}
+
+func (e *RuleEngine) isPrivate(ip netip.Addr) bool {
+	for _, p := range e.private {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r ruleEntry) withKind(k ruleKind) ruleEntry {
+	r.kind = k
+	return r
+}
+
+func (r ruleEntry) matches(host string, dns *dnsCache) bool {
+	if r.ipPrefix != nil {
+		if ip, err := netip.ParseAddr(host); err == nil && r.ipPrefix.Contains(ip) {
+			return true
+		}
+		if resolved, err := dns.Resolve(context.Background(), host); err == nil && r.ipPrefix.Contains(resolved) {
+			return true
+		}
+		return false
+	}
+	if r.re != nil {
+		return r.re.MatchString(host)
+	}
+	if r.domain != "" {
+		return host == r.domain || strings.HasSuffix(host, "."+r.domain)
+	}
+	return false
+}
+
+func parseRuleEntry(raw string) (ruleEntry, error) {
+	if strings.HasPrefix(raw, "ip:") {
+		prefix, err := netip.ParsePrefix(raw[3:])
+		if err != nil {
+			return ruleEntry{}, fmt.Errorf("invalid CIDR %q: %w", raw[3:], err)
+		}
+		return ruleEntry{ipPrefix: &prefix}, nil
+	}
+	if strings.HasPrefix(raw, "re:") {
+		re, err := regexp.Compile(raw[3:])
+		if err != nil {
+			return ruleEntry{}, fmt.Errorf("invalid regex %q: %w", raw[3:], err)
+		}
+		return ruleEntry{re: re}, nil
+	}
+	domain := strings.TrimPrefix(raw, ".")
+	return ruleEntry{domain: domain}, nil
+}
+
+// dnsCache caches DNS resolution with TTL.
+type dnsCache struct {
+	mu     sync.Mutex
+	cache  map[string]cacheEntry
+	ttl    time.Duration
+}
+
+type cacheEntry struct {
+	ip      netip.Addr
+	expires time.Time
+}
+
+func (c *dnsCache) Resolve(ctx context.Context, host string) (netip.Addr, error) {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip, nil
+	}
+
+	c.mu.Lock()
+	if entry, ok := c.cache[host]; ok && time.Now().Before(entry.expires) {
+		c.mu.Unlock()
+		return entry.ip, nil
+	}
+	c.mu.Unlock()
+
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+
+	for _, a := range addrs {
+		if ip, ok := netip.AddrFromSlice(a.IP); ok && ip.Is4() {
+			c.mu.Lock()
+			c.cache[host] = cacheEntry{ip: ip, expires: time.Now().Add(c.ttl)}
+			for k, v := range c.cache {
+				if time.Now().After(v.expires) {
+					delete(c.cache, k)
+				}
+			}
+			c.mu.Unlock()
+			return ip, nil
+		}
+	}
+
+	return netip.Addr{}, nil
+}
+
+func mustPrefix(s string) netip.Prefix {
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		panic(err)
+	}
+	return p
+}

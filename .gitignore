@@ -1,2 +1,4 @@
 mtproto-ssh
 data/
+.DS_Store
+.qwen/tmp/

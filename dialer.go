@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"math/rand"
 	"net"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
@@ -16,17 +14,23 @@ import (
 	"time"
 
 	"github.com/9seconds/mtg/v2/essentials"
+	"github.com/9seconds/mtg/v2/network"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/ssh"
 )
 
+// dialer abstracts SSH tunnel dialing — allows mocking in tests.
+type dialer interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+	NetworkDialer() network.Dialer
+	stop()
+}
+
 type sshDialer struct {
-	mu        sync.Mutex
-	client    *ssh.Client
-	fallback  *net.Dialer
-	cfg       sshDialerCfg
-	allowlist []netip.Prefix
-	done      atomic.Bool
+	mu     sync.Mutex
+	client *ssh.Client
+	cfg    sshDialerCfg
+	done   atomic.Bool
 }
 
 type sshDialerCfg struct {
@@ -37,11 +41,29 @@ type sshDialerCfg struct {
 	fingerprint string
 }
 
-func newSSHDialer(cfg sshDialerCfg, allowlist []netip.Prefix) (*sshDialer, error) {
-	// Load saved host key fingerprint
+// netConnToEssentials wraps net.Conn into essentials.Conn (adds CloseRead/CloseWrite).
+type netConnToEssentials struct {
+	net.Conn
+}
+
+func (n netConnToEssentials) CloseRead() error {
+	if cr, ok := n.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
+
+func (n netConnToEssentials) CloseWrite() error {
+	if cw, ok := n.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func newSSHDialer(cfg sshDialerCfg) (*sshDialer, error) {
 	knownHostsPath := filepath.Join(filepath.Dir(cfg.keyPath), sshKnownHostsFile)
 	if data, err := os.ReadFile(knownHostsPath); err == nil {
-		cfg.fingerprint = string(bytes.TrimSpace(data))
+		cfg.fingerprint = string(data)
 	}
 
 	client, fp, err := connectSSH(cfg)
@@ -51,42 +73,17 @@ func newSSHDialer(cfg sshDialerCfg, allowlist []netip.Prefix) (*sshDialer, error
 
 	log.Info().Str("host", cfg.host).Int("port", cfg.port).Str("fingerprint", fp).Msg("SSH connected")
 
-	// Store fingerprint for reconnects
 	cfg.fingerprint = fp
-
 	d := &sshDialer{
-		client:    client,
-		fallback:  &net.Dialer{Timeout: 10 * time.Second},
-		cfg:       cfg,
-		allowlist: allowlist,
+		client: client,
+		cfg:    cfg,
 	}
 
 	go d.monitor()
 	return d, nil
 }
 
-func (d *sshDialer) Dial(network_, address string) (essentials.Conn, error) {
-	return d.DialContext(context.Background(), network_, address)
-}
-
-func (d *sshDialer) DialContext(ctx context.Context, network_, address string) (essentials.Conn, error) {
-	// Resolve hostname to IP
-	host, _, sepErr := net.SplitHostPort(address)
-	if sepErr != nil {
-		host = address
-	}
-
-	ip, err := resolveIP(ctx, host)
-	if err == nil && d.inAllowlist(ip) {
-		// Direct dial for allowlisted IPs
-		conn, err := d.fallback.DialContext(ctx, network_, address)
-		if err != nil {
-			return nil, fmt.Errorf("direct dial %s %s: %w", network_, address, err)
-		}
-		return essentials.WrapNetConn(conn), nil
-	}
-
-	// Fall back to SSH tunnel
+func (d *sshDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	d.mu.Lock()
 	c := d.client
 	d.mu.Unlock()
@@ -95,38 +92,36 @@ func (d *sshDialer) DialContext(ctx context.Context, network_, address string) (
 		return nil, fmt.Errorf("SSH client not connected")
 	}
 
-	conn, err := c.DialContext(ctx, network_, address)
+	conn, err := c.DialContext(ctx, network, addr)
 	if err != nil {
-		return nil, fmt.Errorf("SSH dial %s %s: %w", network_, address, err)
+		return nil, fmt.Errorf("SSH dial %s %s: %w", network, addr, err)
 	}
-	return essentials.WrapNetConn(conn), nil
+	return conn, nil
 }
 
-func resolveIP(ctx context.Context, host string) (netip.Addr, error) {
-	// Fast path: host is already an IP
-	if ip, err := netip.ParseAddr(host); err == nil {
-		return ip, nil
-	}
-
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return netip.Addr{}, err
-	}
-	for _, a := range addrs {
-		if ip, ok := netip.AddrFromSlice(a.IP); ok && ip.Is4() {
-			return ip, nil
-		}
-	}
-	return netip.Addr{}, fmt.Errorf("no IPv4 address for %s", host)
+// NetworkDialer returns a dialer compatible with mtg network.Dialer interface.
+func (d *sshDialer) NetworkDialer() network.Dialer {
+	return &networkDialerWrapper{d: d}
 }
 
-func (d *sshDialer) inAllowlist(ip netip.Addr) bool {
-	for _, p := range d.allowlist {
-		if p.Contains(ip) {
-			return true
-		}
+type networkDialerWrapper struct {
+	d *sshDialer
+}
+
+func (w *networkDialerWrapper) Dial(network_, addr string) (essentials.Conn, error) {
+	conn, err := w.d.DialContext(context.Background(), network_, addr)
+	if err != nil {
+		return nil, err
 	}
-	return false
+	return netConnToEssentials{conn}, nil
+}
+
+func (w *networkDialerWrapper) DialContext(ctx context.Context, network_, addr string) (essentials.Conn, error) {
+	conn, err := w.d.DialContext(ctx, network_, addr)
+	if err != nil {
+		return nil, err
+	}
+	return netConnToEssentials{conn}, nil
 }
 
 func (d *sshDialer) monitor() {
@@ -157,7 +152,6 @@ func (d *sshDialer) monitor() {
 		d.client = newClient
 		d.mu.Unlock()
 
-		// Close old client so the Wait() above returns.
 		oldClient.Close()
 		log.Info().Str("fingerprint", fp).Msg("SSH reconnected")
 	}
@@ -214,7 +208,6 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, error) {
 
 	if remoteKey != nil {
 		fp := sshFingerprint(remoteKey)
-		// Save fingerprint for future reconnects
 		if cfg.fingerprint == "" {
 			if err := os.WriteFile(filepath.Join(filepath.Dir(cfg.keyPath), sshKnownHostsFile), []byte(fp), 0600); err != nil {
 				log.Warn().Err(err).Msg("save SSH host key fingerprint")

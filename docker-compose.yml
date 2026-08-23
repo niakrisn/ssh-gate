@@ -1,15 +1,34 @@
+name: ssh-gate
+
 services:
-  mtproto-ssh:
+  ssh-gate:
     build: .
     restart: unless-stopped
     ports:
+      - "1080:1080"
+      - "3128:3128"
       - "20443:20443"
     volumes:
       - ./data:/data
+    dns:
+      - 8.8.8.8
+      - 9.9.9.9
     environment:
       SSH_HOST: "${SSH_HOST}"
       SSH_PORT: "22"
       SSH_USER: "${SSH_USER}"
+      PROXY_MODES: "socks5,http,mtproto"
+      SOCKS5_LISTEN: "0.0.0.0:1080"
+      HTTP_LISTEN: "0.0.0.0:3128"
       MTPROTO_LISTEN: "0.0.0.0:20443"
+      DIRECT_RULES: "re:\\.ru$,ip:${DIRECT_RULES_IPS},ip:${DIRECT_RULES_IPS},ip:${DIRECT_RULES_IPS},ip:${DIRECT_RULES_IPS}"
+      TUNNEL_RULES: ""
+      NO_PROXY: ""
       DOH_IP: "9.9.9.9"
       LOG_LEVEL: "info"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo | nc -z -w 2 127.0.0.1 1080"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

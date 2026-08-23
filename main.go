@@ -1,17 +1,39 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
-	"net/netip"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
+
+type config struct {
+	sshHost    string
+	sshPort    int
+	sshUser    string
+	dataDir    string
+	proxyModes []string
+	socks5Addr string
+	httpAddr   string
+	mtprotoAddr string
+	directRules string
+	tunnelRules string
+	noProxy    string
+	dohIP      string
+}
+
+type server struct {
+	Name     string
+	Shutdown func(context.Context) error
+}
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
@@ -32,9 +54,12 @@ func main() {
 		log.Fatal().Err(err).Msg("ensure SSH key")
 	}
 
-	secret, err := EnsureMTProtoSecret(cfg.dataDir)
-	if err != nil {
-		log.Fatal().Err(err).Msg("ensure MTProto secret")
+	secret := ""
+	if contains(cfg.proxyModes, "mtproto") {
+		secret, err = EnsureMTProtoSecret(cfg.dataDir)
+		if err != nil {
+			log.Fatal().Err(err).Msg("ensure MTProto secret")
+		}
 	}
 
 	if _, err := os.Stat(filepath.Join(cfg.dataDir, firstRunDoneFile)); os.IsNotExist(err) {
@@ -47,38 +72,68 @@ func main() {
 		port:    cfg.sshPort,
 		user:    cfg.sshUser,
 		keyPath: filepath.Join(cfg.dataDir, sshKeyFile),
-	}, cfg.ipAllowlist)
+	})
 	if err != nil {
 		log.Fatal().Err(err).Msg("SSH dialer")
 	}
 
-	if err := runProxy(secret, cfg.listenAddr(), dialer, cfg.dohIP); err != nil {
-		log.Fatal().Err(err).Msg("proxy")
-	}
-}
-
-type config struct {
-	sshHost     string
-	sshPort     int
-	sshUser     string
-	dataDir     string
-	listen      string
-	dohIP       string
-	ipAllowlist []netip.Prefix
-}
-
-func (c config) listenAddr() string {
-	host, port, err := net.SplitHostPort(c.listen)
+	rules, err := NewRuleEngine(cfg.directRules, cfg.tunnelRules, cfg.noProxy)
 	if err != nil {
-		return c.listen
+		log.Fatal().Err(err).Msg("rule engine")
 	}
-	if port == "" {
-		port = "20443"
+
+	var servers []server
+
+	if contains(cfg.proxyModes, "socks5") {
+		s5, err := NewSOCKS5Server(cfg.socks5Addr, rules, dialer)
+		if err != nil {
+			log.Fatal().Err(err).Msg("SOCKS5 server")
+		}
+		s5.Start()
+		servers = append(servers, server{Name: "SOCKS5", Shutdown: s5.Shutdown})
 	}
-	if host == "" {
-		return ":" + port
+
+	if contains(cfg.proxyModes, "http") {
+		h, err := NewHTTPServer(cfg.httpAddr, rules, dialer)
+		if err != nil {
+			log.Fatal().Err(err).Msg("HTTP server")
+		}
+		h.Start()
+		servers = append(servers, server{Name: "HTTP", Shutdown: h.Shutdown})
 	}
-	return net.JoinHostPort(host, port)
+
+	if contains(cfg.proxyModes, "mtproto") {
+		mt, err := newMTProtoServer(cfg.mtprotoAddr, secret, dialer.NetworkDialer(), cfg.dohIP)
+		if err != nil {
+			log.Fatal().Err(err).Msg("MTProto server")
+		}
+		mt.Start()
+		servers = append(servers, server{Name: "MTProto", Shutdown: mt.Shutdown})
+	}
+
+	// Graceful shutdown on SIGTERM/SIGINT
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		cancel()
+	}()
+
+	<-ctx.Done()
+	log.Info().Msg("shutting down...")
+	shutdownServers(ctx, servers)
+	dialer.stop()
+}
+
+func shutdownServers(ctx context.Context, servers []server) {
+	for _, s := range servers {
+		if err := s.Shutdown(ctx); err != nil {
+			log.Warn().Str("server", s.Name).Err(err).Msg("shutdown")
+		} else {
+			log.Info().Str("server", s.Name).Msg("stopped")
+		}
+	}
 }
 
 func loadConfig() (config, error) {
@@ -88,40 +143,56 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("invalid SSH_PORT %q: %w", portStr, err)
 	}
 
-	allowlist, err := parseIPAllowlist(getEnv("IP_ALLOWLIST", ""))
+	modesRaw := getEnv("PROXY_MODES", "socks5")
+	modes := parseModes(modesRaw)
+
+	sshHost, err := getEnvRequired("SSH_HOST")
 	if err != nil {
-		return config{}, fmt.Errorf("parse IP_ALLOWLIST: %w", err)
+		return config{}, err
+	}
+	sshUser, err := getEnvRequired("SSH_USER")
+	if err != nil {
+		return config{}, err
 	}
 
 	return config{
-		sshHost:     getEnvRequired("SSH_HOST"),
+		sshHost:     sshHost,
 		sshPort:     port,
-		sshUser:     getEnvRequired("SSH_USER"),
+		sshUser:     sshUser,
 		dataDir:     getEnv("DATA_DIR", "/data"),
-		listen:      getEnv("MTPROTO_LISTEN", ":20443"),
+		proxyModes:  modes,
+		socks5Addr:  getEnv("SOCKS5_LISTEN", ":1080"),
+		httpAddr:    getEnv("HTTP_LISTEN", ":3128"),
+		mtprotoAddr: getEnv("MTPROTO_LISTEN", ":20443"),
+		directRules: getEnv("DIRECT_RULES", ""),
+		tunnelRules: getEnv("TUNNEL_RULES", ""),
+		noProxy:     getEnv("NO_PROXY", ""),
 		dohIP:       getEnv("DOH_IP", "9.9.9.9"),
-		ipAllowlist: allowlist,
 	}, nil
 }
 
-func parseIPAllowlist(raw string) ([]netip.Prefix, error) {
-	if raw == "" {
-		return nil, nil
-	}
-
-	var prefixes []netip.Prefix
-	for _, cidr := range strings.Split(raw, ",") {
-		cidr = strings.TrimSpace(cidr)
-		if cidr == "" {
+func parseModes(raw string) []string {
+	var modes []string
+	for _, m := range strings.Split(raw, ",") {
+		m = strings.TrimSpace(strings.ToLower(m))
+		if m == "" {
 			continue
 		}
-		p, err := netip.ParsePrefix(cidr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
-		}
-		prefixes = append(prefixes, p)
+		modes = append(modes, m)
 	}
-	return prefixes, nil
+	if len(modes) == 0 {
+		modes = []string{"socks5"}
+	}
+	return modes
+}
+
+func contains(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 func setLogLevel(level string) {
@@ -144,20 +215,15 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func getEnvRequired(key string) string {
+func getEnvRequired(key string) (string, error) {
 	v := os.Getenv(key)
 	if v == "" {
-		log.Warn().Str("key", key).Msg("required env var is empty")
+		return "", fmt.Errorf("required env var %s is empty", key)
 	}
-	return v
+	return v, nil
 }
 
 func printFirstRun(secret, pubKey string, cfg config) {
-	_, port, _ := net.SplitHostPort(cfg.listen)
-	if port == "" {
-		port = "20443"
-	}
-
 	fmt.Println()
 	fmt.Println("=== mtproto-ssh first run ===")
 	fmt.Println()
@@ -165,9 +231,33 @@ func printFirstRun(secret, pubKey string, cfg config) {
 	fmt.Println()
 	fmt.Printf("   command=\"echo 'tunnel only'\",no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc %s\n", pubKey)
 	fmt.Println()
-	fmt.Println("2. Telegram proxy link:")
-	fmt.Printf("   tg://proxy?server=localhost&port=%s&secret=%s\n", port, secret)
-	fmt.Println()
-	fmt.Println("3. Or connect in Settings → Data and Storage → Proxy → Secret Chat (FakeTLS)")
+
+	if contains(cfg.proxyModes, "socks5") {
+		_, port, _ := net.SplitHostPort(cfg.socks5Addr)
+		if port == "" {
+			port = "1080"
+		}
+		fmt.Printf("SOCKS5 proxy: localhost:%s\n", port)
+	}
+
+	if contains(cfg.proxyModes, "http") {
+		_, port, _ := net.SplitHostPort(cfg.httpAddr)
+		if port == "" {
+			port = "3128"
+		}
+		fmt.Printf("HTTP proxy:  localhost:%s\n", port)
+	}
+
+	if secret != "" {
+		_, port, _ := net.SplitHostPort(cfg.mtprotoAddr)
+		if port == "" {
+			port = "20443"
+		}
+		fmt.Println()
+		fmt.Println("2. Telegram proxy link:")
+		fmt.Printf("   tg://proxy?server=localhost&port=%s&secret=%s\n", port, secret)
+		fmt.Println()
+		fmt.Println("3. Or connect in Settings → Data and Storage → Proxy → Secret Chat (FakeTLS)")
+	}
 	fmt.Println()
 }

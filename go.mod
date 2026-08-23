@@ -1,10 +1,11 @@
-module mtproto-ssh
+module ssh-gate
 
 go 1.26
 
 require (
 	github.com/9seconds/mtg/v2 v2.2.7
 	github.com/rs/zerolog v1.35.0
+	github.com/things-go/go-socks5 v0.1.0
 	golang.org/x/crypto v0.49.0
 )
 
