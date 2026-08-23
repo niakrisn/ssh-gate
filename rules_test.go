@@ -25,7 +25,7 @@ func TestRuleEngine_RFC1918Bypass(t *testing.T) {
 		"127.255.255.255",
 		"169.254.0.1",
 	} {
-		if got := rules.Route(host, 80); got != RouteDirect {
+		if got := rules.Route(context.Background(), host, 80); got != RouteDirect {
 			t.Errorf("Route(%q, 80) = %v, want %v (RFC 1918 bypass)", host, got, RouteDirect)
 		}
 	}
@@ -38,7 +38,7 @@ func TestRuleEngine_LoopbackIPv6(t *testing.T) {
 	}
 
 	for _, host := range []string{"::1", "fe80::1"} {
-		if got := rules.Route(host, 80); got != RouteDirect {
+		if got := rules.Route(context.Background(), host, 80); got != RouteDirect {
 			t.Errorf("Route(%q, 80) = %v, want %v", host, got, RouteDirect)
 		}
 	}
@@ -50,7 +50,7 @@ func TestRuleEngine_FallbackTunnel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := rules.Route("google.com", 443); got != RouteTunnel {
+	if got := rules.Route(context.Background(), "google.com", 443); got != RouteTunnel {
 		t.Errorf("Route(%q, 443) = %v, want %v (fallback)", "google.com", got, RouteTunnel)
 	}
 }
@@ -72,7 +72,7 @@ func TestRuleEngine_DirectRules_IP(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		if got := rules.Route(tc.host, 80); got != tc.want {
+		if got := rules.Route(context.Background(), tc.host, 80); got != tc.want {
 			t.Errorf("Route(%q, 80) = %v, want %v", tc.host, got, tc.want)
 		}
 	}
@@ -95,7 +95,7 @@ func TestRuleEngine_DirectRules_Domain(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		if got := rules.Route(tc.host, 80); got != tc.want {
+		if got := rules.Route(context.Background(), tc.host, 80); got != tc.want {
 			t.Errorf("Route(%q, 80) = %v, want %v", tc.host, got, tc.want)
 		}
 	}
@@ -117,7 +117,7 @@ func TestRuleEngine_DirectRules_Regex(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		if got := rules.Route(tc.host, 80); got != tc.want {
+		if got := rules.Route(context.Background(), tc.host, 80); got != tc.want {
 			t.Errorf("Route(%q, 80) = %v, want %v", tc.host, got, tc.want)
 		}
 	}
@@ -130,12 +130,12 @@ func TestRuleEngine_MultipleRules(t *testing.T) {
 	}
 
 	for _, host := range []string{"10.1.2.3", "app.corp.com", "internal.net"} {
-		if got := rules.Route(host, 80); got != RouteDirect {
+		if got := rules.Route(context.Background(), host, 80); got != RouteDirect {
 			t.Errorf("Route(%q, 80) = %v, want %v", host, got, RouteDirect)
 		}
 	}
 
-	if got := rules.Route("external.com", 80); got != RouteTunnel {
+	if got := rules.Route(context.Background(), "external.com", 80); got != RouteTunnel {
 		t.Errorf("Route(external.com, 80) = %v, want %v", got, RouteTunnel)
 	}
 }
@@ -159,7 +159,7 @@ func TestRuleEngine_Decide(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			gotRoute, gotReason := rules.Decide(tc.host, 80)
+			gotRoute, gotReason := rules.Decide(context.Background(), tc.host, 80)
 			if gotRoute != tc.wantRoute {
 				t.Errorf("Decide(%q, 80) route = %v, want %v", tc.host, gotRoute, tc.wantRoute)
 			}

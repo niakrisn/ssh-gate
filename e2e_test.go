@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/9seconds/mtg/v2/essentials"
 	"github.com/9seconds/mtg/v2/network"
 )
 
@@ -117,7 +118,7 @@ func TestSOCKS5_Routing_Direct(t *testing.T) {
 	s5.Start()
 	defer s5.Shutdown(context.Background())
 
-	r := rules.Route(upHost, 80)
+	r := rules.Route(context.Background(), upHost, 80)
 	assertEqual(t, r, RouteDirect)
 }
 
@@ -136,7 +137,7 @@ func TestSOCKS5_Routing_Tunnel(t *testing.T) {
 	defer s5.Shutdown(context.Background())
 
 	// Non-private IP should route via tunnel (fallback)
-	r := rules.Route("8.8.8.8", 80)
+	r := rules.Route(context.Background(), "8.8.8.8", 80)
 	assertEqual(t, r, RouteTunnel)
 }
 
@@ -191,9 +192,8 @@ func TestParseModes(t *testing.T) {
 		want []string
 	}{
 		{"socks5", []string{"socks5"}},
-		{"socks5,http", []string{"socks5", "http"}},
-		{"socks5,http,mtproto", []string{"socks5", "http", "mtproto"}},
-		{"SOCKS5,HTTP", []string{"socks5", "http"}},
+		{"socks5,mtproto", []string{"socks5", "mtproto"}},
+		{"SOCKS5,MTPROTO", []string{"socks5", "mtproto"}},
 		{"", []string{"socks5"}},
 		{"socks5, , mtproto", []string{"socks5", "mtproto"}},
 	}
@@ -281,10 +281,30 @@ func (r *redirectDialer) DialContext(_ context.Context, network, _ string) (net.
 }
 
 func (r *redirectDialer) NetworkDialer() network.Dialer {
-	return &mockNetworkDialer{m: (*mockSSHDialer)(nil)} // unused in these tests
+	return &redirectNetworkDialer{r: r}
+}
+
+type redirectNetworkDialer struct{ r *redirectDialer }
+
+func (d *redirectNetworkDialer) Dial(network_, addr string) (essentials.Conn, error) {
+	conn, err := d.r.DialContext(context.Background(), network_, addr)
+	if err != nil {
+		return nil, err
+	}
+	return netConnToEssentials{conn}, nil
+}
+
+func (d *redirectNetworkDialer) DialContext(ctx context.Context, network_, addr string) (essentials.Conn, error) {
+	conn, err := d.r.DialContext(ctx, network_, addr)
+	if err != nil {
+		return nil, err
+	}
+	return netConnToEssentials{conn}, nil
 }
 
 func (r *redirectDialer) stop() {}
+
+func (r *redirectDialer) Connected() bool { return true }
 
 func TestSOCKS5_TunnelViaMockDialer(t *testing.T) {
 	upstream := newTestHTTPServer(t)
@@ -438,6 +458,10 @@ func TestSOCKS5_ServerShutdown(t *testing.T) {
 	// Shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	err = s5.Shutdown(ctx)
+	assertNoError(t, err)
+
+	// Second shutdown must not panic
 	err = s5.Shutdown(ctx)
 	assertNoError(t, err)
 
@@ -603,4 +627,11 @@ func TestSOCKS5_DirectRoute_TLS_Idle(t *testing.T) {
 
 	// Direct route → tunnel dialer not called
 	assertEqual(t, mockDialer.dialCount.Load(), int32(0))
+}
+
+func TestSSHDialer_NilClientError(t *testing.T) {
+	d := &sshDialer{} // client is nil
+	_, err := d.DialContext(context.Background(), "tcp", "example.com:80")
+	assertError(t, err)
+	assertContains(t, err.Error(), "SSH client not connected")
 }

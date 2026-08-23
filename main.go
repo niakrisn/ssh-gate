@@ -26,6 +26,7 @@ type config struct {
 	directRules    string
 	directIPFamily IPFamily
 	dohIP          string
+	healthAddr     string
 }
 
 type server struct {
@@ -100,6 +101,14 @@ func main() {
 		servers = append(servers, server{Name: "MTProto", Shutdown: mt.Shutdown})
 	}
 
+	// Health/ready endpoint
+	hs, err := NewHealthServer(cfg.healthAddr, dialer)
+	if err != nil {
+		log.Fatal().Err(err).Msg("health server")
+	}
+	hs.Start()
+	servers = append(servers, server{Name: "health", Shutdown: hs.Shutdown})
+
 	// Graceful shutdown on SIGTERM/SIGINT
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -109,9 +118,12 @@ func main() {
 		cancel()
 	}()
 
+	rules.Start(ctx)
+
 	<-ctx.Done()
 	log.Info().Msg("shutting down...")
 	shutdownServers(ctx, servers)
+	rules.Stop()
 	dialer.stop()
 }
 
@@ -160,15 +172,20 @@ func loadConfig() (config, error) {
 		directRules:    getEnv("DIRECT_RULES", ""),
 		directIPFamily: directIPFamily,
 		dohIP:          getEnv("DOH_IP", "9.9.9.9"),
+		healthAddr:     getEnv("HEALTH_LISTEN", "127.0.0.1:9090"),
 	}, nil
 }
 
 func parseModes(raw string) []string {
+	valid := map[string]bool{"socks5": true, "mtproto": true}
 	var modes []string
 	for _, m := range strings.Split(raw, ",") {
 		m = strings.TrimSpace(strings.ToLower(m))
 		if m == "" {
 			continue
+		}
+		if !valid[m] {
+			log.Fatal().Str("mode", m).Msg("unknown proxy mode (valid: socks5, mtproto)")
 		}
 		modes = append(modes, m)
 	}

@@ -15,12 +15,13 @@ import (
 
 // SOCKS5Server wraps things-go/go-socks5 with Rule Engine routing.
 type SOCKS5Server struct {
-	srv    *socks5.Server
-	ln     net.Listener
-	shutCh chan struct{}
-	rules  *RuleEngine
-	d      dialer
-	family IPFamily
+	srv       *socks5.Server
+	ln        net.Listener
+	shutCh    chan struct{}
+	closeOnce sync.Once
+	rules     *RuleEngine
+	d         dialer
+	family    IPFamily
 }
 
 // NewSOCKS5Server creates a new SOCKS5 server with routing.
@@ -48,7 +49,7 @@ func NewSOCKS5Server(listen string, rules *RuleEngine, d dialer, family IPFamily
 
 			src := request.RemoteAddr.String()
 
-			route, reason := s.rules.Decide(host, portInt)
+			route, reason := s.rules.Decide(ctx, host, portInt)
 
 			log.Info().Str("proto", "socks5").Str("src", src).Str("host", host).Int("port", portInt).
 				Str("route", route.String()).Str("reason", reason).Msg("request")
@@ -115,11 +116,15 @@ func (s *SOCKS5Server) Start() {
 }
 
 func (s *SOCKS5Server) Shutdown(ctx context.Context) error {
-	close(s.shutCh)
-	return s.ln.Close()
+	var err error
+	s.closeOnce.Do(func() {
+		close(s.shutCh)
+		err = s.ln.Close()
+	})
+	return err
 }
 
-// logConn wraps upstream conn to count bytes and emit access-строка on Close.
+// logConn wraps upstream conn to count bytes and emit access log on close.
 type logConn struct {
 	net.Conn
 	mu       sync.Mutex

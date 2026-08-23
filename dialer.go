@@ -23,6 +23,7 @@ import (
 type dialer interface {
 	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 	NetworkDialer() network.Dialer
+	Connected() bool
 	stop()
 }
 
@@ -125,6 +126,10 @@ func (w *networkDialerWrapper) DialContext(ctx context.Context, network_, addr s
 }
 
 func (d *sshDialer) monitor() {
+	attempt := 0
+	baseDelay := time.Second
+	maxDelay := 60 * time.Second
+
 	for {
 		d.mu.Lock()
 		conn := d.client.Conn
@@ -136,14 +141,27 @@ func (d *sshDialer) monitor() {
 			return
 		}
 
-		log.Warn().Msg("SSH connection lost, reconnecting...")
+		d.mu.Lock()
+		d.client = nil
+		d.mu.Unlock()
 
-		backoff := jitteredBackoff()
-		time.Sleep(backoff)
+		delay := baseDelay
+		if attempt > 0 {
+			delay = baseDelay << uint(attempt)
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+		}
+		jitter := time.Duration(rand.Intn(500)) * time.Millisecond
+		delay += jitter
+
+		log.Warn().Int("attempt", attempt+1).Dur("delay", delay).Msg("SSH connection lost, reconnecting...")
+		time.Sleep(delay)
 
 		newClient, fp, err := connectSSH(d.cfg)
 		if err != nil {
-			log.Error().Err(err).Msg("SSH reconnect failed")
+			log.Error().Err(err).Int("attempt", attempt+1).Msg("SSH reconnect failed")
+			attempt++
 			continue
 		}
 
@@ -152,7 +170,10 @@ func (d *sshDialer) monitor() {
 		d.client = newClient
 		d.mu.Unlock()
 
-		oldClient.Close()
+		if oldClient != nil {
+			oldClient.Close()
+		}
+		attempt = 0
 		log.Info().Str("fingerprint", fp).Msg("SSH reconnected")
 	}
 }
@@ -165,6 +186,13 @@ func (d *sshDialer) stop() {
 	if c != nil {
 		c.Close()
 	}
+}
+
+// Connected returns true if the SSH client is connected and ready to dial.
+func (d *sshDialer) Connected() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.client != nil
 }
 
 const sshKnownHostsFile = "ssh_known_hosts"
@@ -207,6 +235,10 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, error) {
 		return nil, "", fmt.Errorf("SSH dial to %s: %w", addr, err)
 	}
 
+	// Launch keepalive goroutine to detect dead connections.
+	// golang.org/x/crypto/ssh has no ClientAliveInterval support.
+	go sshKeepalive(conn, 15*time.Second, 3)
+
 	if remoteKey != nil {
 		fp := sshFingerprint(remoteKey)
 		if cfg.fingerprint == "" {
@@ -225,8 +257,23 @@ func sshFingerprint(key ssh.PublicKey) string {
 	return "SHA256:" + base64.StdEncoding.EncodeToString(hash[:])
 }
 
-func jitteredBackoff() time.Duration {
-	base := 500 * time.Millisecond
-	jitter := time.Duration(rand.Intn(500)) * time.Millisecond
-	return base + jitter
+// sshKeepalive sends SSH global requests every interval to detect dead connections.
+// After maxFailures consecutive failures it closes the client to trigger reconnect.
+// This is a workaround for golang.org/x/crypto/ssh lacking ClientAliveInterval.
+func sshKeepalive(c *ssh.Client, interval time.Duration, maxFailures int) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	fails := 0
+	for range ticker.C {
+		_, _, err := c.SendRequest("keepalive@ssh-gate", true, nil)
+		if err != nil {
+			fails++
+			if fails >= maxFailures {
+				c.Close()
+				return
+			}
+		} else {
+			fails = 0
+		}
+	}
 }
