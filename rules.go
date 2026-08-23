@@ -20,19 +20,19 @@ const (
 	RouteTunnel
 )
 
+func (r Route) String() string {
+	if r == RouteDirect {
+		return "direct"
+	}
+	return "tunnel"
+}
+
 type ruleEntry struct {
-	kind     ruleKind
+	raw      string
 	ipPrefix *netip.Prefix
 	re       *regexp.Regexp
 	domain   string
 }
-
-type ruleKind int
-
-const (
-	kindDirect ruleKind = iota
-	kindTunnel
-)
 
 type RuleEngine struct {
 	rules   []ruleEntry
@@ -40,7 +40,7 @@ type RuleEngine struct {
 	private []netip.Prefix
 }
 
-func NewRuleEngine(direct, tunnel, noProxy string) (*RuleEngine, error) {
+func NewRuleEngine(direct string) (*RuleEngine, error) {
 	e := &RuleEngine{
 		dns: &dnsCache{
 			mu:    sync.Mutex{},
@@ -58,20 +58,6 @@ func NewRuleEngine(direct, tunnel, noProxy string) (*RuleEngine, error) {
 		},
 	}
 
-	if noProxy != "" {
-		for _, entry := range strings.Split(noProxy, ",") {
-			entry = strings.TrimSpace(entry)
-			if entry == "" {
-				continue
-			}
-			r, err := parseRuleEntry(entry)
-			if err != nil {
-				return nil, err
-			}
-			e.rules = append(e.rules, r.withKind(kindDirect))
-		}
-	}
-
 	if direct != "" {
 		for _, entry := range strings.Split(direct, ",") {
 			entry = strings.TrimSpace(entry)
@@ -82,21 +68,7 @@ func NewRuleEngine(direct, tunnel, noProxy string) (*RuleEngine, error) {
 			if err != nil {
 				return nil, err
 			}
-			e.rules = append(e.rules, r.withKind(kindDirect))
-		}
-	}
-
-	if tunnel != "" {
-		for _, entry := range strings.Split(tunnel, ",") {
-			entry = strings.TrimSpace(entry)
-			if entry == "" {
-				continue
-			}
-			r, err := parseRuleEntry(entry)
-			if err != nil {
-				return nil, err
-			}
-			e.rules = append(e.rules, r.withKind(kindTunnel))
+			e.rules = append(e.rules, r)
 		}
 	}
 
@@ -104,30 +76,28 @@ func NewRuleEngine(direct, tunnel, noProxy string) (*RuleEngine, error) {
 }
 
 func (e *RuleEngine) Route(host string, port int) Route {
+	r, _ := e.Decide(host, port)
+	return r
+}
+
+func (e *RuleEngine) Decide(host string, port int) (Route, string) {
 	// 1. RFC 1918 / loopback / link-local — always direct
 	if ip, err := netip.ParseAddr(host); err == nil && e.isPrivate(ip) {
 		log.Debug().Str("host", host).Int("port", port).Str("reason", "private").Msg("route")
-		return RouteDirect
+		return RouteDirect, "private"
 	}
 
-	// 2-3. Check rules in order
+	// 2. Check direct rules
 	for _, r := range e.rules {
 		if r.matches(host, e.dns) {
-			kind := "direct"
-			if r.kind == kindTunnel {
-				kind = "tunnel"
-			}
-			log.Debug().Str("host", host).Int("port", port).Str("reason", kind).Msg("route")
-			if r.kind == kindDirect {
-				return RouteDirect
-			}
-			return RouteTunnel
+			log.Debug().Str("host", host).Int("port", port).Str("reason", "direct:"+r.raw).Msg("route")
+			return RouteDirect, "direct:" + r.raw
 		}
 	}
 
-	// 4. Fallback: tunnel
+	// 3. Fallback: tunnel
 	log.Debug().Str("host", host).Int("port", port).Str("reason", "fallback").Msg("route")
-	return RouteTunnel
+	return RouteTunnel, "fallback"
 }
 
 func (e *RuleEngine) isPrivate(ip netip.Addr) bool {
@@ -137,11 +107,6 @@ func (e *RuleEngine) isPrivate(ip netip.Addr) bool {
 		}
 	}
 	return false
-}
-
-func (r ruleEntry) withKind(k ruleKind) ruleEntry {
-	r.kind = k
-	return r
 }
 
 func (r ruleEntry) matches(host string, dns *dnsCache) bool {
@@ -169,17 +134,17 @@ func parseRuleEntry(raw string) (ruleEntry, error) {
 		if err != nil {
 			return ruleEntry{}, fmt.Errorf("invalid CIDR %q: %w", raw[3:], err)
 		}
-		return ruleEntry{ipPrefix: &prefix}, nil
+		return ruleEntry{raw: raw, ipPrefix: &prefix}, nil
 	}
 	if strings.HasPrefix(raw, "re:") {
 		re, err := regexp.Compile(raw[3:])
 		if err != nil {
 			return ruleEntry{}, fmt.Errorf("invalid regex %q: %w", raw[3:], err)
 		}
-		return ruleEntry{re: re}, nil
+		return ruleEntry{raw: raw, re: re}, nil
 	}
 	domain := strings.TrimPrefix(raw, ".")
-	return ruleEntry{domain: domain}, nil
+	return ruleEntry{raw: raw, domain: domain}, nil
 }
 
 // dnsCache caches DNS resolution with TTL.

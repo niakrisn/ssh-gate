@@ -6,24 +6,18 @@ services:
     restart: unless-stopped
     ports:
       - "1080:1080"
-      - "3128:3128"
       - "20443:20443"
     volumes:
       - ./data:/data
-    dns:
-      - 8.8.8.8
-      - 9.9.9.9
     environment:
       SSH_HOST: "${SSH_HOST}"
       SSH_PORT: "22"
       SSH_USER: "${SSH_USER}"
-      PROXY_MODES: "socks5,http,mtproto"
+      PROXY_MODES: "socks5,mtproto"
       SOCKS5_LISTEN: "0.0.0.0:1080"
-      HTTP_LISTEN: "0.0.0.0:3128"
       MTPROTO_LISTEN: "0.0.0.0:20443"
-      DIRECT_RULES: "re:\\.ru$,ip:${DIRECT_RULES_IPS},ip:${DIRECT_RULES_IPS},ip:${DIRECT_RULES_IPS},ip:${DIRECT_RULES_IPS}"
-      TUNNEL_RULES: ""
-      NO_PROXY: ""
+      DIRECT_RULES: "re:\\.ru$,re:google\\.com$,ip:${DIRECT_RULES_IPS},ip:${DIRECT_RULES_IPS},ip:${DIRECT_RULES_IPS},ip:${DIRECT_RULES_IPS}"
+      DIRECT_IP_FAMILY: "ipv4"
       DOH_IP: "9.9.9.9"
       LOG_LEVEL: "info"
     healthcheck:

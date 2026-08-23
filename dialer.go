@@ -201,7 +201,8 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, error) {
 		Timeout:         10 * time.Second,
 	}
 
-	conn, err := ssh.Dial("tcp", addr, sshConfig)
+	// VPS access is IPv4-only by design; destination IPv6 is resolved on the VPS side.
+	conn, err := ssh.Dial("tcp4", addr, sshConfig)
 	if err != nil {
 		return nil, "", fmt.Errorf("SSH dial to %s: %w", addr, err)
 	}

@@ -16,18 +16,16 @@ import (
 )
 
 type config struct {
-	sshHost    string
-	sshPort    int
-	sshUser    string
-	dataDir    string
-	proxyModes []string
-	socks5Addr string
-	httpAddr   string
-	mtprotoAddr string
-	directRules string
-	tunnelRules string
-	noProxy    string
-	dohIP      string
+	sshHost        string
+	sshPort        int
+	sshUser        string
+	dataDir        string
+	proxyModes     []string
+	socks5Addr     string
+	mtprotoAddr    string
+	directRules    string
+	directIPFamily IPFamily
+	dohIP          string
 }
 
 type server struct {
@@ -77,7 +75,7 @@ func main() {
 		log.Fatal().Err(err).Msg("SSH dialer")
 	}
 
-	rules, err := NewRuleEngine(cfg.directRules, cfg.tunnelRules, cfg.noProxy)
+	rules, err := NewRuleEngine(cfg.directRules)
 	if err != nil {
 		log.Fatal().Err(err).Msg("rule engine")
 	}
@@ -85,21 +83,12 @@ func main() {
 	var servers []server
 
 	if contains(cfg.proxyModes, "socks5") {
-		s5, err := NewSOCKS5Server(cfg.socks5Addr, rules, dialer)
+		s5, err := NewSOCKS5Server(cfg.socks5Addr, rules, dialer, cfg.directIPFamily)
 		if err != nil {
 			log.Fatal().Err(err).Msg("SOCKS5 server")
 		}
 		s5.Start()
 		servers = append(servers, server{Name: "SOCKS5", Shutdown: s5.Shutdown})
-	}
-
-	if contains(cfg.proxyModes, "http") {
-		h, err := NewHTTPServer(cfg.httpAddr, rules, dialer)
-		if err != nil {
-			log.Fatal().Err(err).Msg("HTTP server")
-		}
-		h.Start()
-		servers = append(servers, server{Name: "HTTP", Shutdown: h.Shutdown})
 	}
 
 	if contains(cfg.proxyModes, "mtproto") {
@@ -155,19 +144,22 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 
+	directIPFamily, err := parseIPFamily(getEnv("DIRECT_IP_FAMILY", "both"))
+	if err != nil {
+		return config{}, err
+	}
+
 	return config{
-		sshHost:     sshHost,
-		sshPort:     port,
-		sshUser:     sshUser,
-		dataDir:     getEnv("DATA_DIR", "/data"),
-		proxyModes:  modes,
-		socks5Addr:  getEnv("SOCKS5_LISTEN", ":1080"),
-		httpAddr:    getEnv("HTTP_LISTEN", ":3128"),
-		mtprotoAddr: getEnv("MTPROTO_LISTEN", ":20443"),
-		directRules: getEnv("DIRECT_RULES", ""),
-		tunnelRules: getEnv("TUNNEL_RULES", ""),
-		noProxy:     getEnv("NO_PROXY", ""),
-		dohIP:       getEnv("DOH_IP", "9.9.9.9"),
+		sshHost:        sshHost,
+		sshPort:        port,
+		sshUser:        sshUser,
+		dataDir:        getEnv("DATA_DIR", "/data"),
+		proxyModes:     modes,
+		socks5Addr:     getEnv("SOCKS5_LISTEN", ":1080"),
+		mtprotoAddr:    getEnv("MTPROTO_LISTEN", ":20443"),
+		directRules:    getEnv("DIRECT_RULES", ""),
+		directIPFamily: directIPFamily,
+		dohIP:          getEnv("DOH_IP", "9.9.9.9"),
 	}, nil
 }
 
@@ -238,14 +230,6 @@ func printFirstRun(secret, pubKey string, cfg config) {
 			port = "1080"
 		}
 		fmt.Printf("SOCKS5 proxy: localhost:%s\n", port)
-	}
-
-	if contains(cfg.proxyModes, "http") {
-		_, port, _ := net.SplitHostPort(cfg.httpAddr)
-		if port == "" {
-			port = "3128"
-		}
-		fmt.Printf("HTTP proxy:  localhost:%s\n", port)
 	}
 
 	if secret != "" {

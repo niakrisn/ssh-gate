@@ -3,9 +3,12 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -20,13 +23,13 @@ func TestSOCKS5_DirectRoute(t *testing.T) {
 	defer upstream.Close()
 
 	upHost, _, _ := net.SplitHostPort(upstream.Listener.Addr().String())
-	rules, err := NewRuleEngine("ip:"+upHost+"/32", "", "")
+	rules, err := NewRuleEngine("ip:"+upHost+"/32")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	mockDialer := newMockSSHDialer()
-	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer)
+	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer, FamilyBoth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,120 +98,6 @@ func TestSOCKS5_DirectRoute(t *testing.T) {
 	assertEqual(t, mockDialer.dialCount.Load(), int32(0))
 }
 
-func TestHTTP_CONNECT_DirectRoute(t *testing.T) {
-	upstream := newTestHTTPServer(t)
-	defer upstream.Close()
-
-	upHost, _, _ := net.SplitHostPort(upstream.Listener.Addr().String())
-
-	rules, err := NewRuleEngine("ip:"+upHost+"/32", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mockDialer := newMockSSHDialer()
-	hServer, err := NewHTTPServer("127.0.0.1:0", rules, mockDialer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hServer.Start()
-	defer hServer.Shutdown(context.Background())
-
-	proxyAddr := hServer.ln.Addr().String()
-	conn, err := net.Dial("tcp", proxyAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-
-	// Send CONNECT request manually
-	target := upstream.Listener.Addr().String()
-	connectReq := "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n"
-	if _, err := conn.Write([]byte(connectReq)); err != nil {
-		t.Fatal(err)
-	}
-
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	reader := bufio.NewReader(conn)
-	respHeaders, _ := http.ReadResponse(reader, nil)
-	conn.SetReadDeadline(time.Time{})
-	assertEqual(t, respHeaders.StatusCode, http.StatusOK)
-	respHeaders.Body.Close()
-
-	// Send HTTP request through established tunnel
-	reqStr := "GET /connect-test HTTP/1.1\r\nHost: " + target + "\r\nConnection: close\r\n\r\n"
-	conn.Write([]byte(reqStr))
-
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	bodyReader := bufio.NewReader(conn)
-	resp2, _ := http.ReadResponse(bodyReader, nil)
-	conn.SetReadDeadline(time.Time{})
-	assertEqual(t, resp2.StatusCode, http.StatusOK)
-
-	body, _ := io.ReadAll(resp2.Body)
-	resp2.Body.Close()
-	assertContains(t, string(body), "OK /connect-test")
-
-	// Direct route → tunnel dialer not called
-	assertEqual(t, mockDialer.dialCount.Load(), int32(0))
-}
-
-func TestHTTP_CONNECT_TunnelRoute(t *testing.T) {
-	upstream := newTestHTTPServer(t)
-	defer upstream.Close()
-
-	mockDialer := newMockSSHDialer()
-	rules, err := NewRuleEngine("", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	hServer, err := NewHTTPServer("127.0.0.1:0", rules, mockDialer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hServer.Start()
-	defer hServer.Shutdown(context.Background())
-
-	proxyAddr := hServer.ln.Addr().String()
-	conn, err := net.Dial("tcp", proxyAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-
-	// Send CONNECT request manually
-	target := upstream.Listener.Addr().String()
-	connectReq := "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n"
-	if _, err := conn.Write([]byte(connectReq)); err != nil {
-		t.Fatal(err)
-	}
-
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	reader := bufio.NewReader(conn)
-	respHeaders, _ := http.ReadResponse(reader, nil)
-	conn.SetReadDeadline(time.Time{})
-	assertEqual(t, respHeaders.StatusCode, http.StatusOK)
-	respHeaders.Body.Close()
-
-	// Send HTTP request through established tunnel
-	reqStr := "GET /tunnel-test HTTP/1.1\r\nHost: " + target + "\r\nConnection: close\r\n\r\n"
-	conn.Write([]byte(reqStr))
-
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	bodyReader := bufio.NewReader(conn)
-	resp2, _ := http.ReadResponse(bodyReader, nil)
-	conn.SetReadDeadline(time.Time{})
-	assertEqual(t, resp2.StatusCode, http.StatusOK)
-
-	body, _ := io.ReadAll(resp2.Body)
-	resp2.Body.Close()
-	assertContains(t, string(body), "OK /tunnel-test")
-
-	// Tunnel route → dialer should have been called (only if target is not private)
-	// Note: 127.x.x.x is private, so it routes direct even without rules
-}
-
 func TestSOCKS5_Routing_Direct(t *testing.T) {
 	upstream := newTestHTTPServer(t)
 	defer upstream.Close()
@@ -216,12 +105,12 @@ func TestSOCKS5_Routing_Direct(t *testing.T) {
 	upHost, _, _ := net.SplitHostPort(upstream.Listener.Addr().String())
 
 	mockDialer := newMockSSHDialer()
-	rules, err := NewRuleEngine("ip:"+upHost+"/32", "", "")
+	rules, err := NewRuleEngine("ip:"+upHost+"/32")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer)
+	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer, FamilyBoth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,12 +123,12 @@ func TestSOCKS5_Routing_Direct(t *testing.T) {
 
 func TestSOCKS5_Routing_Tunnel(t *testing.T) {
 	mockDialer := newMockSSHDialer()
-	rules, err := NewRuleEngine("", "", "")
+	rules, err := NewRuleEngine("")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer)
+	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer, FamilyBoth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,41 +138,6 @@ func TestSOCKS5_Routing_Tunnel(t *testing.T) {
 	// Non-private IP should route via tunnel (fallback)
 	r := rules.Route("8.8.8.8", 80)
 	assertEqual(t, r, RouteTunnel)
-}
-
-func TestHTTPServer_MethodNotAllowed(t *testing.T) {
-	upstream := newTestHTTPServer(t)
-	defer upstream.Close()
-
-	upHost, upPort, _ := net.SplitHostPort(upstream.Listener.Addr().String())
-
-	rules, err := NewRuleEngine("ip:"+upHost+"/32", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mockDialer := newMockSSHDialer()
-	hServer, err := NewHTTPServer("127.0.0.1:0", rules, mockDialer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hServer.Start()
-	defer hServer.Shutdown(context.Background())
-
-	addr := hServer.ln.Addr().String()
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-
-	_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: " + upHost + ":" + upPort + "\r\n\r\n"))
-	assertNoError(t, err)
-
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	data, _ := io.ReadAll(conn)
-	conn.SetReadDeadline(time.Time{})
-	assertContains(t, string(data), "405")
 }
 
 func TestMTProtoServer_Create(t *testing.T) {
@@ -390,32 +244,29 @@ func TestConfig_LoadConfig(t *testing.T) {
 	assertEqual(t, len(cfg.proxyModes), 1)
 	assertEqual(t, cfg.proxyModes[0], "socks5")
 	assertEqual(t, cfg.socks5Addr, ":1080")
+	assertEqual(t, cfg.directIPFamily, FamilyBoth)
 	assertEqual(t, cfg.dohIP, "9.9.9.9")
 }
 
 func TestConfig_ProxyModes(t *testing.T) {
 	t.Setenv("SSH_HOST", "vps.example.com")
 	t.Setenv("SSH_USER", "user")
-	t.Setenv("PROXY_MODES", "socks5,http,mtproto")
+	t.Setenv("PROXY_MODES", "socks5,mtproto")
 	t.Setenv("SOCKS5_LISTEN", "0.0.0.0:1080")
-	t.Setenv("HTTP_LISTEN", "0.0.0.0:3128")
 	t.Setenv("MTPROTO_LISTEN", "0.0.0.0:20443")
 	t.Setenv("DIRECT_RULES", "ip:10.0.0.0/8")
-	t.Setenv("TUNNEL_RULES", "re:.*\\.internal\\.com$")
-	t.Setenv("NO_PROXY", "localhost")
+	t.Setenv("DIRECT_IP_FAMILY", "ipv6")
 
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	assertEqual(t, len(cfg.proxyModes), 3)
+	assertEqual(t, len(cfg.proxyModes), 2)
 	assertEqual(t, cfg.socks5Addr, "0.0.0.0:1080")
-	assertEqual(t, cfg.httpAddr, "0.0.0.0:3128")
 	assertEqual(t, cfg.mtprotoAddr, "0.0.0.0:20443")
 	assertEqual(t, cfg.directRules, "ip:10.0.0.0/8")
-	assertEqual(t, cfg.tunnelRules, "re:.*\\.internal\\.com$")
-	assertEqual(t, cfg.noProxy, "localhost")
+	assertEqual(t, cfg.directIPFamily, FamilyIPv6)
 }
 
 // redirectDialer redirects all connections to a fixed target address.
@@ -445,12 +296,12 @@ func TestSOCKS5_TunnelViaMockDialer(t *testing.T) {
 	rd := &redirectDialer{target: upTarget}
 
 	// Empty rules → non-private IP routes via tunnel (mock dialer)
-	rules, err := NewRuleEngine("", "", "")
+	rules, err := NewRuleEngine("")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, rd)
+	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, rd, FamilyBoth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,78 +359,18 @@ func TestSOCKS5_TunnelViaMockDialer(t *testing.T) {
 	assertEqual(t, rd.dialCount.Load(), int32(1))
 }
 
-func TestHTTP_CONNECT_TunnelViaMockDialer(t *testing.T) {
-	upstream := newTestHTTPServer(t)
-	defer upstream.Close()
-
-	upTarget := upstream.Listener.Addr().String()
-
-	// Redirect dialer: any tunnel connection goes to upstream
-	rd := &redirectDialer{target: upTarget}
-
-	// Empty rules → non-private IP routes via tunnel
-	rules, err := NewRuleEngine("", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	hServer, err := NewHTTPServer("127.0.0.1:0", rules, rd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hServer.Start()
-	defer hServer.Shutdown(context.Background())
-
-	conn, err := net.Dial("tcp", hServer.ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-
-	// CONNECT to non-private IP (routes via tunnel → redirectDialer → upstream)
-	remoteTarget := "8.8.8.8:80"
-	connectReq := "CONNECT " + remoteTarget + " HTTP/1.1\r\nHost: " + remoteTarget + "\r\n\r\n"
-	if _, err := conn.Write([]byte(connectReq)); err != nil {
-		t.Fatal(err)
-	}
-
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	reader := bufio.NewReader(conn)
-	respHeaders, _ := http.ReadResponse(reader, nil)
-	conn.SetReadDeadline(time.Time{})
-	assertEqual(t, respHeaders.StatusCode, http.StatusOK)
-	respHeaders.Body.Close()
-
-	// Send HTTP request through tunnel
-	reqStr := "GET /tunnel-http HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-	conn.Write([]byte(reqStr))
-
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	bodyReader := bufio.NewReader(conn)
-	resp2, _ := http.ReadResponse(bodyReader, nil)
-	conn.SetReadDeadline(time.Time{})
-	assertEqual(t, resp2.StatusCode, http.StatusOK)
-
-	body, _ := io.ReadAll(resp2.Body)
-	resp2.Body.Close()
-	assertContains(t, string(body), "OK /tunnel-http")
-
-	// Tunnel route → dialer should have been called
-	assertEqual(t, rd.dialCount.Load(), int32(1))
-}
-
 func TestSOCKS5_DirectRoute_LargePayload(t *testing.T) {
 	upstream := newTestHTTPServer(t)
 	defer upstream.Close()
 
 	upHost, _, _ := net.SplitHostPort(upstream.Listener.Addr().String())
-	rules, err := NewRuleEngine("ip:"+upHost+"/32", "", "")
+	rules, err := NewRuleEngine("ip:"+upHost+"/32")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	mockDialer := newMockSSHDialer()
-	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer)
+	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer, FamilyBoth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,77 +413,14 @@ func TestSOCKS5_DirectRoute_LargePayload(t *testing.T) {
 	assertContains(t, string(data), "OK /post")
 }
 
-func TestHTTP_CONNECT_UpstreamUnreachable(t *testing.T) {
-	rules, err := NewRuleEngine("", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mockDialer := newMockSSHDialer()
-	hServer, err := NewHTTPServer("127.0.0.1:0", rules, mockDialer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hServer.Start()
-	defer hServer.Shutdown(context.Background())
-
-	conn, err := net.Dial("tcp", hServer.ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-
-	// CONNECT to a private IP with no listener → routes DIRECT, dial fails fast
-	connectReq := "CONNECT 127.0.0.1:19999 HTTP/1.1\r\nHost: 127.0.0.1:19999\r\n\r\n"
-	conn.Write([]byte(connectReq))
-
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	data, _ := io.ReadAll(conn)
-	conn.SetReadDeadline(time.Time{})
-	assertContains(t, string(data), "502")
-}
-
-func TestHTTPServer_Shutdown(t *testing.T) {
-	rules, err := NewRuleEngine("", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mockDialer := newMockSSHDialer()
-	hServer, err := NewHTTPServer("127.0.0.1:0", rules, mockDialer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hServer.Start()
-
-	addr := hServer.ln.Addr().String()
-
-	// Verify server is running
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn.Close()
-
-	// Shutdown should complete quickly
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	err = hServer.Shutdown(ctx)
-	assertNoError(t, err)
-
-	// Server should no longer accept connections
-	_, err = net.DialTimeout("tcp", addr, 1*time.Second)
-	assertError(t, err)
-}
-
 func TestSOCKS5_ServerShutdown(t *testing.T) {
-	rules, err := NewRuleEngine("", "", "")
+	rules, err := NewRuleEngine("")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	mockDialer := newMockSSHDialer()
-	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer)
+	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer, FamilyBoth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -723,36 +451,22 @@ func TestMultiServer_Concurrent(t *testing.T) {
 	defer upstream.Close()
 
 	upHost, _, _ := net.SplitHostPort(upstream.Listener.Addr().String())
-	rules, err := NewRuleEngine("ip:"+upHost+"/32", "", "")
+	rules, err := NewRuleEngine("ip:"+upHost+"/32")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	mockDialer := newMockSSHDialer()
 
-	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer)
+	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer, FamilyBoth)
 	if err != nil {
 		t.Fatal(err)
 	}
 	s5.Start()
 	defer s5.Shutdown(context.Background())
 
-	hServer, err := NewHTTPServer("127.0.0.1:0", rules, mockDialer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hServer.Start()
-	defer hServer.Shutdown(context.Background())
-
-	// Both should be listening on different ports
-	s5Addr := s5.ln.Addr().String()
-	hAddr := hServer.ln.Addr().String()
-	if s5Addr == hAddr {
-		t.Fatal("SOCKS5 and HTTP should listen on different ports")
-	}
-
 	// Test SOCKS5 works
-	s5Conn, err := net.Dial("tcp", s5Addr)
+	s5Conn, err := net.Dial("tcp", s5.ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -762,23 +476,6 @@ func TestMultiServer_Concurrent(t *testing.T) {
 	assertEqual(t, s5Resp[0], byte(5))
 	assertEqual(t, s5Resp[1], byte(0))
 	s5Conn.Close()
-
-	// Test HTTP works
-	hConn, err := net.Dial("tcp", hAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	target := upstream.Listener.Addr().String()
-	connectReq := "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n"
-	hConn.Write([]byte(connectReq))
-
-	hConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	reader := bufio.NewReader(hConn)
-	resp, _ := http.ReadResponse(reader, nil)
-	hConn.SetReadDeadline(time.Time{})
-	assertEqual(t, resp.StatusCode, http.StatusOK)
-	resp.Body.Close()
-	hConn.Close()
 }
 
 func TestSOCKS5_DirectRoute_ConcurrentConnections(t *testing.T) {
@@ -786,13 +483,13 @@ func TestSOCKS5_DirectRoute_ConcurrentConnections(t *testing.T) {
 	defer upstream.Close()
 
 	upHost, _, _ := net.SplitHostPort(upstream.Listener.Addr().String())
-	rules, err := NewRuleEngine("ip:"+upHost+"/32", "", "")
+	rules, err := NewRuleEngine("ip:"+upHost+"/32")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	mockDialer := newMockSSHDialer()
-	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer)
+	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer, FamilyBoth)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -838,4 +535,72 @@ func TestSOCKS5_DirectRoute_ConcurrentConnections(t *testing.T) {
 
 		assertContains(t, string(data), "OK /concurrent")
 	}
+}
+
+// newTestTLSServer creates an HTTPS server that echoes the request path.
+func newTestTLSServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK " + r.URL.Path))
+	}))
+	srv.Config.ErrorLog = nil
+	return srv
+}
+
+// TestSOCKS5_DirectRoute_TLS_Idle verifies that a direct-route SOCKS5 connection
+// to a TLS upstream survives idle periods >10 seconds.
+// Uses http.Client with socks5:// proxy (Go 1.19+ built-in SOCKS5 support)
+// to avoid racing tls.Client and go-socks5 Proxy on the same file descriptor.
+func TestSOCKS5_DirectRoute_TLS_Idle(t *testing.T) {
+	// Upstream TLS server that sleeps 12s before responding.
+	// During that sleep the proxy-relayed connection is idle.
+	// If proxy kills idle connections, the request fails.
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(12 * time.Second)
+		w.Write([]byte("OK " + r.URL.Path))
+	}))
+	defer upstream.Close()
+
+	upHost, _, _ := net.SplitHostPort(upstream.Listener.Addr().String())
+
+	rules, err := NewRuleEngine("ip:"+upHost+"/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mockDialer := newMockSSHDialer()
+	s5, err := NewSOCKS5Server("127.0.0.1:0", rules, mockDialer, FamilyBoth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s5.Start()
+	defer s5.Shutdown(context.Background())
+
+	proxyURL, _ := url.Parse("socks5://" + s5.ln.Addr().String())
+
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   20 * time.Second,
+	}
+
+	resp, err := client.Get(upstream.URL + "/socks5-idle")
+	if err != nil {
+		t.Fatalf("GET via SOCKS5: %v", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	assertContains(t, string(data), "OK /socks5-idle")
+
+	// Direct route → tunnel dialer not called
+	assertEqual(t, mockDialer.dialCount.Load(), int32(0))
 }
