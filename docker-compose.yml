@@ -1,0 +1,15 @@
+services:
+  mtproto-ssh:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "20443:20443"
+    volumes:
+      - ./data:/data
+    environment:
+      SSH_HOST: "${SSH_HOST}"
+      SSH_PORT: "22"
+      SSH_USER: "${SSH_USER}"
+      MTPROTO_LISTEN: "0.0.0.0:20443"
+      DOH_IP: "9.9.9.9"
+      LOG_LEVEL: "info"
