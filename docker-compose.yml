@@ -23,13 +23,18 @@ services:
       DIRECT_RULES: "${DIRECT_RULES}"
       DIRECT_IP_FAMILY: "${DIRECT_IP_FAMILY:-ipv4}"
       DOH_IP: "${DOH_IP:-9.9.9.9}"
-      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      LOG_LEVEL: "${LOG_LEVEL:-warn}"
       SSH_KEEPALIVE_PERIOD: "${SSH_KEEPALIVE_PERIOD:-90s}"
     security_opt:
       - no-new-privileges:true
     read_only: true
     cap_drop:
       - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/healthz"]
       interval: 10s
