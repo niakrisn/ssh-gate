@@ -10,23 +10,25 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
 type config struct {
-	sshHost        string
-	sshPort        int
-	sshUser        string
-	dataDir        string
-	proxyModes     []string
-	socks5Addr     string
-	mtprotoAddr    string
-	directRules    string
-	directIPFamily IPFamily
-	dohIP          string
-	healthAddr     string
+	sshHost            string
+	sshPort            int
+	sshUser            string
+	dataDir            string
+	proxyModes         []string
+	socks5Addr         string
+	mtprotoAddr        string
+	directRules        string
+	directIPFamily     IPFamily
+	dohIP              string
+	healthAddr         string
+	sshKeepalivePeriod time.Duration
 }
 
 type server struct {
@@ -67,10 +69,11 @@ func main() {
 	}
 
 	dialer, err := newSSHDialer(sshDialerCfg{
-		host:    cfg.sshHost,
-		port:    cfg.sshPort,
-		user:    cfg.sshUser,
-		keyPath: filepath.Join(cfg.dataDir, sshKeyFile),
+		host:            cfg.sshHost,
+		port:            cfg.sshPort,
+		user:            cfg.sshUser,
+		keyPath:         filepath.Join(cfg.dataDir, sshKeyFile),
+		keepalivePeriod: cfg.sshKeepalivePeriod,
 	})
 	if err != nil {
 		log.Fatal().Err(err).Msg("SSH dialer")
@@ -145,7 +148,10 @@ func loadConfig() (config, error) {
 	}
 
 	modesRaw := getEnv("PROXY_MODES", "socks5")
-	modes := parseModes(modesRaw)
+	modes, err := parseModes(modesRaw)
+	if err != nil {
+		return config{}, err
+	}
 
 	sshHost, err := getEnvRequired("SSH_HOST")
 	if err != nil {
@@ -161,22 +167,28 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 
+	sshKeepalivePeriod, err := parseKeepalivePeriod(getEnv("SSH_KEEPALIVE_PERIOD", "90s"))
+	if err != nil {
+		return config{}, err
+	}
+
 	return config{
-		sshHost:        sshHost,
-		sshPort:        port,
-		sshUser:        sshUser,
-		dataDir:        getEnv("DATA_DIR", "/data"),
-		proxyModes:     modes,
-		socks5Addr:     getEnv("SOCKS5_LISTEN", ":1080"),
-		mtprotoAddr:    getEnv("MTPROTO_LISTEN", ":20443"),
-		directRules:    getEnv("DIRECT_RULES", ""),
-		directIPFamily: directIPFamily,
-		dohIP:          getEnv("DOH_IP", "9.9.9.9"),
-		healthAddr:     getEnv("HEALTH_LISTEN", "127.0.0.1:9090"),
+		sshHost:            sshHost,
+		sshPort:            port,
+		sshUser:            sshUser,
+		dataDir:            getEnv("DATA_DIR", "/data"),
+		proxyModes:         modes,
+		socks5Addr:         getEnv("SOCKS5_LISTEN", ":1080"),
+		mtprotoAddr:        getEnv("MTPROTO_LISTEN", ":20443"),
+		directRules:        getEnv("DIRECT_RULES", ""),
+		directIPFamily:     directIPFamily,
+		dohIP:              getEnv("DOH_IP", "9.9.9.9"),
+		healthAddr:         getEnv("HEALTH_LISTEN", "127.0.0.1:9090"),
+		sshKeepalivePeriod: sshKeepalivePeriod,
 	}, nil
 }
 
-func parseModes(raw string) []string {
+func parseModes(raw string) ([]string, error) {
 	valid := map[string]bool{"socks5": true, "mtproto": true}
 	var modes []string
 	for _, m := range strings.Split(raw, ",") {
@@ -185,14 +197,14 @@ func parseModes(raw string) []string {
 			continue
 		}
 		if !valid[m] {
-			log.Fatal().Str("mode", m).Msg("unknown proxy mode (valid: socks5, mtproto)")
+			return nil, fmt.Errorf("unknown proxy mode %q (valid: socks5, mtproto)", m)
 		}
 		modes = append(modes, m)
 	}
 	if len(modes) == 0 {
-		modes = []string{"socks5"}
+		return []string{"socks5"}, nil
 	}
-	return modes
+	return modes, nil
 }
 
 func contains(slice []string, s string) bool {
@@ -222,6 +234,22 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseKeepalivePeriod parses SSH_KEEPALIVE_PERIOD as a Go duration.
+// Empty or non-positive values disable OS keepalive (returned as 0).
+func parseKeepalivePeriod(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid SSH_KEEPALIVE_PERIOD %q (Go duration, e.g. 90s): %w", raw, err)
+	}
+	if d <= 0 {
+		return 0, nil
+	}
+	return d, nil
 }
 
 func getEnvRequired(key string) (string, error) {

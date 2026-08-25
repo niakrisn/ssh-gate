@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,11 +36,12 @@ type sshDialer struct {
 }
 
 type sshDialerCfg struct {
-	host        string
-	port        int
-	user        string
-	keyPath     string
-	fingerprint string
+	host            string
+	port            int
+	user            string
+	keyPath         string
+	fingerprint     string
+	keepalivePeriod time.Duration
 }
 
 // netConnToEssentials wraps net.Conn into essentials.Conn (adds CloseRead/CloseWrite).
@@ -208,7 +210,7 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, error) {
 		return nil, "", fmt.Errorf("parse SSH key: %w", err)
 	}
 
-	addr := fmt.Sprintf("%s:%d", cfg.host, cfg.port)
+	addr := net.JoinHostPort(cfg.host, strconv.Itoa(cfg.port))
 
 	var remoteKey ssh.PublicKey
 	callback := func(hostname string, remote net.Addr, key ssh.PublicKey) error {
@@ -230,14 +232,28 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, error) {
 	}
 
 	// VPS access is IPv4-only by design; destination IPv6 is resolved on the VPS side.
-	conn, err := ssh.Dial("tcp4", addr, sshConfig)
+	rawConn, err := net.DialTimeout("tcp4", addr, sshConfig.Timeout)
 	if err != nil {
 		return nil, "", fmt.Errorf("SSH dial to %s: %w", addr, err)
 	}
-
-	// Launch keepalive goroutine to detect dead connections.
-	// golang.org/x/crypto/ssh has no ClientAliveInterval support.
-	go sshKeepalive(conn, 15*time.Second, 3)
+	// OS-level TCP keepalive detects silent (half-open) dead paths without
+	// relying on SSH cooperation; SSH_KEEPALIVE_PERIOD=0 disables it.
+	if tc, ok := rawConn.(*net.TCPConn); ok {
+		if cfg.keepalivePeriod > 0 {
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(cfg.keepalivePeriod)
+		} else {
+			_ = tc.SetKeepAlive(false)
+		}
+	} else {
+		log.Warn().Str("type", fmt.Sprintf("%T", rawConn)).Msg("raw TCPConn unavailable; OS keepalive skipped")
+	}
+	sshConn, chans, reqs, err := ssh.NewClientConn(rawConn, addr, sshConfig)
+	if err != nil {
+		rawConn.Close()
+		return nil, "", fmt.Errorf("SSH handshake to %s: %w", addr, err)
+	}
+	client := ssh.NewClient(sshConn, chans, reqs)
 
 	if remoteKey != nil {
 		fp := sshFingerprint(remoteKey)
@@ -246,34 +262,13 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, error) {
 				log.Warn().Err(err).Msg("save SSH host key fingerprint")
 			}
 		}
-		return conn, fp, nil
+		return client, fp, nil
 	}
 
-	return conn, "", nil
+	return client, "", nil
 }
 
 func sshFingerprint(key ssh.PublicKey) string {
 	hash := sha256.Sum256(key.Marshal())
 	return "SHA256:" + base64.StdEncoding.EncodeToString(hash[:])
-}
-
-// sshKeepalive sends SSH global requests every interval to detect dead connections.
-// After maxFailures consecutive failures it closes the client to trigger reconnect.
-// This is a workaround for golang.org/x/crypto/ssh lacking ClientAliveInterval.
-func sshKeepalive(c *ssh.Client, interval time.Duration, maxFailures int) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	fails := 0
-	for range ticker.C {
-		_, _, err := c.SendRequest("keepalive@ssh-gate", true, nil)
-		if err != nil {
-			fails++
-			if fails >= maxFailures {
-				c.Close()
-				return
-			}
-		} else {
-			fails = 0
-		}
-	}
 }

@@ -24,13 +24,14 @@ services:
       DIRECT_IP_FAMILY: "${DIRECT_IP_FAMILY:-ipv4}"
       DOH_IP: "${DOH_IP:-9.9.9.9}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
+      SSH_KEEPALIVE_PERIOD: "${SSH_KEEPALIVE_PERIOD:-90s}"
     security_opt:
       - no-new-privileges:true
     read_only: true
     cap_drop:
       - ALL
     healthcheck:
-      test: ["CMD", "sh", "-c", "echo | nc -z -w 2 127.0.0.1 1080"]
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/healthz"]
       interval: 10s
       timeout: 5s
       retries: 3

@@ -37,8 +37,8 @@ type ruleEntry struct {
 const dnsCacheMaxSize = 1000
 
 type RuleEngine struct {
-	rules []ruleEntry
-	dns   *dnsCache
+	rules   []ruleEntry
+	dns     *dnsCache
 	private []netip.Prefix
 	started bool
 }
@@ -63,6 +63,7 @@ func NewRuleEngine(direct string) (*RuleEngine, error) {
 			mu:    sync.Mutex{},
 			cache: make(map[string]cacheEntry),
 			ttl:   30 * time.Second,
+			done:  make(chan struct{}),
 		},
 		private: []netip.Prefix{
 			mustPrefix("10.0.0.0/8"),
@@ -166,22 +167,22 @@ func parseRuleEntry(raw string) (ruleEntry, error) {
 
 // dnsCache caches DNS resolution with TTL.
 type dnsCache struct {
-	mu    sync.Mutex
-	cache map[string]cacheEntry
-	ttl   time.Duration
-	done  chan struct{}
+	mu        sync.Mutex
+	cache     map[string]cacheEntry
+	ttl       time.Duration
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // startPurge launches a background goroutine that purges expired entries every TTL.
 func (c *dnsCache) startPurge(ctx context.Context) {
-	c.done = make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(c.ttl)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
-				close(c.done)
+				c.closeOnce.Do(func() { close(c.done) })
 				return
 			case <-c.done:
 				return
@@ -193,9 +194,7 @@ func (c *dnsCache) startPurge(ctx context.Context) {
 }
 
 func (c *dnsCache) stop() {
-	if c.done != nil {
-		close(c.done)
-	}
+	c.closeOnce.Do(func() { close(c.done) })
 }
 
 func (c *dnsCache) purge() {
