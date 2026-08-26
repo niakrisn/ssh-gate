@@ -137,15 +137,17 @@ func (d *sshDialer) monitor() {
 		conn := d.client.Conn
 		d.mu.Unlock()
 
-		conn.Wait()
+		if conn != nil {
+			conn.Wait()
 
-		if d.done.Load() {
-			return
+			if d.done.Load() {
+				return
+			}
+
+			d.mu.Lock()
+			d.client = nil
+			d.mu.Unlock()
 		}
-
-		d.mu.Lock()
-		d.client = nil
-		d.mu.Unlock()
 
 		delay := baseDelay
 		if attempt > 0 {
