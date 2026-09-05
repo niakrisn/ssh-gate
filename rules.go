@@ -34,13 +34,18 @@ type ruleEntry struct {
 	domain   string
 }
 
-const dnsCacheMaxSize = 1000
+const (
+	dnsCacheMaxSize = 1000
+	dnsCacheTTL     = 30 * time.Second
+)
 
 type RuleEngine struct {
 	rules   []ruleEntry
 	dns     *dnsCache
 	private []netip.Prefix
 	started bool
+	cacheHits   int64
+	cacheMisses int64
 }
 
 // Start launches background maintenance for the DNS cache purge goroutine.
@@ -62,7 +67,7 @@ func NewRuleEngine(direct string) (*RuleEngine, error) {
 		dns: &dnsCache{
 			mu:    sync.Mutex{},
 			cache: make(map[string]cacheEntry),
-			ttl:   30 * time.Second,
+			ttl:   dnsCacheTTL,
 			done:  make(chan struct{}),
 		},
 		private: []netip.Prefix{
@@ -230,7 +235,7 @@ func (c *dnsCache) Resolve(ctx context.Context, host string) (netip.Addr, error)
 
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		return netip.Addr{}, err
+		return netip.Addr{}, NewDNSError(host, err)
 	}
 
 	for _, a := range addrs {

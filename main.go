@@ -141,49 +141,95 @@ func shutdownServers(ctx context.Context, servers []server) {
 }
 
 func loadConfig() (config, error) {
+	// Validate SSH_PORT
 	portStr := getEnv("SSH_PORT", "22")
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return config{}, fmt.Errorf("invalid SSH_PORT %q: %w", portStr, err)
 	}
+	if err := validatePort(port); err != nil {
+		return config{}, fmt.Errorf("invalid SSH_PORT: %w", err)
+	}
 
+	// Validate PROXY_MODES
 	modesRaw := getEnv("PROXY_MODES", "socks5")
 	modes, err := parseModes(modesRaw)
 	if err != nil {
-		return config{}, err
+		return config{}, fmt.Errorf("invalid PROXY_MODES: %w", err)
 	}
 
+	// Validate SSH_HOST
 	sshHost, err := getEnvRequired("SSH_HOST")
 	if err != nil {
-		return config{}, err
+		return config{}, fmt.Errorf("configuration error: %w", err)
 	}
+	if sshHost == "" {
+		return config{}, fmt.Errorf("SSH_HOST cannot be empty")
+	}
+
+	// Validate SSH_USER
 	sshUser, err := getEnvRequired("SSH_USER")
 	if err != nil {
-		return config{}, err
+		return config{}, fmt.Errorf("configuration error: %w", err)
+	}
+	if sshUser == "" {
+		return config{}, fmt.Errorf("SSH_USER cannot be empty")
 	}
 
+	// Validate DIRECT_IP_FAMILY
 	directIPFamily, err := parseIPFamily(getEnv("DIRECT_IP_FAMILY", "both"))
 	if err != nil {
-		return config{}, err
+		return config{}, fmt.Errorf("invalid DIRECT_IP_FAMILY: %w", err)
 	}
 
+	// Validate SSH_KEEPALIVE_PERIOD
 	sshKeepalivePeriod, err := parseKeepalivePeriod(getEnv("SSH_KEEPALIVE_PERIOD", "90s"))
 	if err != nil {
-		return config{}, err
+		return config{}, fmt.Errorf("invalid SSH_KEEPALIVE_PERIOD: %w", err)
+	}
+
+	// Validate listen addresses
+	socks5Addr := getEnv("SOCKS5_LISTEN", ":1080")
+	if err := validateHostPort(socks5Addr); err != nil {
+		return config{}, fmt.Errorf("invalid SOCKS5_LISTEN: %w", err)
+	}
+
+	mtprotoAddr := getEnv("MTPROTO_LISTEN", ":20443")
+	if err := validateHostPort(mtprotoAddr); err != nil {
+		return config{}, fmt.Errorf("invalid MTPROTO_LISTEN: %w", err)
+	}
+
+	healthAddr := getEnv("HEALTH_LISTEN", "127.0.0.1:9090")
+	if err := validateHostPort(healthAddr); err != nil {
+		return config{}, fmt.Errorf("invalid HEALTH_LISTEN: %w", err)
+	}
+
+	// Validate DATA_DIR
+	dataDir := getEnv("DATA_DIR", "/data")
+	if dataDir == "" {
+		return config{}, fmt.Errorf("DATA_DIR cannot be empty")
+	}
+
+	// Validate DOH_IP
+	dohIP := getEnv("DOH_IP", "9.9.9.9")
+	if dohIP != "" {
+		if ip := net.ParseIP(dohIP); ip == nil {
+			return config{}, fmt.Errorf("invalid DOH_IP %q: not a valid IP address", dohIP)
+		}
 	}
 
 	return config{
 		sshHost:            sshHost,
 		sshPort:            port,
 		sshUser:            sshUser,
-		dataDir:            getEnv("DATA_DIR", "/data"),
+		dataDir:            dataDir,
 		proxyModes:         modes,
-		socks5Addr:         getEnv("SOCKS5_LISTEN", ":1080"),
-		mtprotoAddr:        getEnv("MTPROTO_LISTEN", ":20443"),
+		socks5Addr:         socks5Addr,
+		mtprotoAddr:        mtprotoAddr,
 		directRules:        getEnv("DIRECT_RULES", ""),
 		directIPFamily:     directIPFamily,
-		dohIP:              getEnv("DOH_IP", "9.9.9.9"),
-		healthAddr:         getEnv("HEALTH_LISTEN", "127.0.0.1:9090"),
+		dohIP:              dohIP,
+		healthAddr:         healthAddr,
 		sshKeepalivePeriod: sshKeepalivePeriod,
 	}, nil
 }
@@ -207,14 +253,7 @@ func parseModes(raw string) ([]string, error) {
 	return modes, nil
 }
 
-func contains(slice []string, s string) bool {
-	for _, v := range slice {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
+
 
 func setLogLevel(level string) {
 	switch strings.ToLower(level) {

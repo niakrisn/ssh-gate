@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -37,7 +38,7 @@ func NewSOCKS5Server(listen string, rules *RuleEngine, d dialer, family IPFamily
 		socks5.WithDialAndRequest(func(ctx context.Context, network, addr string, request *socks5.Request) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
-				return nil, err
+				return nil, NewConfigurationError("destination address", addr, fmt.Sprintf("invalid format: %v", err))
 			}
 
 			portInt, _ := strconv.Atoi(port)

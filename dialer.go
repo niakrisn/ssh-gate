@@ -71,7 +71,7 @@ func newSSHDialer(cfg sshDialerCfg) (*sshDialer, error) {
 
 	client, fp, err := connectSSH(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("connect SSH: %w", err)
+		return nil, NewSSHError("connection", cfg.host, cfg.port, err)
 	}
 
 	log.Info().Str("host", cfg.host).Int("port", cfg.port).Str("fingerprint", fp).Msg("SSH connected")
@@ -97,7 +97,7 @@ func (d *sshDialer) DialContext(ctx context.Context, network, addr string) (net.
 
 	conn, err := c.DialContext(ctx, network, addr)
 	if err != nil {
-		return nil, fmt.Errorf("SSH dial %s %s: %w", network, addr, err)
+		return nil, NewNetworkError("SSH dial", addr, err)
 	}
 	return conn, nil
 }

@@ -72,7 +72,7 @@ func dialDirect(ctx context.Context, host string, port int, family IPFamily) (ne
 	} else {
 		addrs, err = net.DefaultResolver.LookupIPAddr(ctx, host)
 		if err != nil {
-			return nil, "", fmt.Errorf("resolve %s: %w", host, err)
+			return nil, "", NewDNSError(host, err)
 		}
 	}
 
