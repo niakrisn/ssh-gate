@@ -80,6 +80,7 @@ func NewSOCKS5Server(listen string, rules *RuleEngine, d dialer, family IPFamily
 
 			return &logConn{
 				Conn:   upstream,
+				proto:  "socks5",
 				t0:     time.Now(),
 				src:    src,
 				host:   host,
@@ -134,7 +135,7 @@ type logConn struct {
 	t0       time.Time
 	closed   atomic.Bool
 	// access fields
-	src, host, dst, reason string
+	proto, src, host, dst, reason string
 	port   int
 	route  Route
 	family IPFamily
@@ -201,7 +202,7 @@ func (l *logConn) Close() error {
 	l.mu.Unlock()
 
 	event := log.Info().
-		Str("proto", "socks5").
+		Str("proto", l.proto).
 		Str("src", l.src).
 		Str("host", l.host).
 		Int("port", l.port).

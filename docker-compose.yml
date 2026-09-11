@@ -6,7 +6,10 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:1080:1080"
-      - "127.0.0.1:20443:20443"
+      # LAN access: bound to all host interfaces
+      - "20443:20443"
+      # LAN access: bound to all host interfaces
+      - "3128:3128"
     volumes:
       - type: bind
         source: ./data
@@ -20,6 +23,7 @@ services:
       PROXY_MODES: "${PROXY_MODES:-socks5,mtproto}"
       SOCKS5_LISTEN: "${SOCKS5_LISTEN:-0.0.0.0:1080}"
       MTPROTO_LISTEN: "${MTPROTO_LISTEN:-0.0.0.0:20443}"
+      HTTP_LISTEN: "${HTTP_LISTEN:-0.0.0.0:3128}"
       DIRECT_RULES: "${DIRECT_RULES}"
       DIRECT_IP_FAMILY: "${DIRECT_IP_FAMILY:-ipv4}"
       DOH_IP: "${DOH_IP:-9.9.9.9}"

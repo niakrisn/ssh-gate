@@ -24,6 +24,7 @@ type config struct {
 	proxyModes         []string
 	socks5Addr         string
 	mtprotoAddr        string
+	httpAddr           string
 	directRules        string
 	directIPFamily     IPFamily
 	dohIP              string
@@ -93,6 +94,15 @@ func main() {
 		}
 		s5.Start()
 		servers = append(servers, server{Name: "SOCKS5", Shutdown: s5.Shutdown})
+	}
+
+	if contains(cfg.proxyModes, "http") {
+		hp, err := NewHTTPProxyServer(cfg.httpAddr, rules, dialer, cfg.directIPFamily)
+		if err != nil {
+			log.Fatal().Err(err).Msg("HTTP proxy")
+		}
+		hp.Start()
+		servers = append(servers, server{Name: "HTTP", Shutdown: hp.Shutdown})
 	}
 
 	if contains(cfg.proxyModes, "mtproto") {
@@ -199,6 +209,11 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("invalid MTPROTO_LISTEN: %w", err)
 	}
 
+	httpAddr := getEnv("HTTP_LISTEN", ":3128")
+	if err := validateHostPort(httpAddr); err != nil {
+		return config{}, fmt.Errorf("invalid HTTP_LISTEN: %w", err)
+	}
+
 	healthAddr := getEnv("HEALTH_LISTEN", "127.0.0.1:9090")
 	if err := validateHostPort(healthAddr); err != nil {
 		return config{}, fmt.Errorf("invalid HEALTH_LISTEN: %w", err)
@@ -226,6 +241,7 @@ func loadConfig() (config, error) {
 		proxyModes:         modes,
 		socks5Addr:         socks5Addr,
 		mtprotoAddr:        mtprotoAddr,
+		httpAddr:           httpAddr,
 		directRules:        getEnv("DIRECT_RULES", ""),
 		directIPFamily:     directIPFamily,
 		dohIP:              dohIP,
@@ -235,7 +251,7 @@ func loadConfig() (config, error) {
 }
 
 func parseModes(raw string) ([]string, error) {
-	valid := map[string]bool{"socks5": true, "mtproto": true}
+	valid := map[string]bool{"socks5": true, "mtproto": true, "http": true}
 	var modes []string
 	for _, m := range strings.Split(raw, ",") {
 		m = strings.TrimSpace(strings.ToLower(m))
@@ -243,7 +259,7 @@ func parseModes(raw string) ([]string, error) {
 			continue
 		}
 		if !valid[m] {
-			return nil, fmt.Errorf("unknown proxy mode %q (valid: socks5, mtproto)", m)
+			return nil, fmt.Errorf("unknown proxy mode %q (valid: socks5, mtproto, http)", m)
 		}
 		modes = append(modes, m)
 	}
@@ -314,6 +330,14 @@ func printFirstRun(secret, pubKey string, cfg config) {
 			port = "1080"
 		}
 		fmt.Printf("SOCKS5 proxy: localhost:%s\n", port)
+	}
+
+	if contains(cfg.proxyModes, "http") {
+		_, port, _ := net.SplitHostPort(cfg.httpAddr)
+		if port == "" {
+			port = "3128"
+		}
+		fmt.Printf("HTTP proxy:  localhost:%s\n", port)
 	}
 
 	if secret != "" {

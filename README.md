@@ -1,15 +1,17 @@
 # ssh-gate
 
-SOCKS5/MTProto proxy over SSH tunnel with rule-based routing.
+SOCKS5/HTTP/MTProto proxy over SSH tunnel with rule-based routing.
 
 ## Architecture
 
 ```
 Client → localhost:1080 → SOCKS5 → SSH tunnel → VPS → Internet
+Client → localhost:3128 → HTTP   → SSH tunnel → VPS → Internet
 Client → localhost:20443 → MTProto → SSH tunnel → VPS → Telegram DC
 
 Direct route:
 Client → localhost:1080 → SOCKS5 → (DIRECT_RULES) → Internet
+Client → localhost:3128 → HTTP   → (DIRECT_RULES) → Internet
 ```
 
 Single Go process in a Docker container. No extra dependencies.
@@ -38,8 +40,9 @@ docker compose logs
 | `SSH_HOST` | yes | — | VPS hostname or IP |
 | `SSH_PORT` | no | `22` | SSH port |
 | `SSH_USER` | yes | — | SSH username |
-| `PROXY_MODES` | no | `socks5` | Comma-separated: `socks5`, `mtproto` |
+| `PROXY_MODES` | no | `socks5` | Comma-separated: `socks5`, `mtproto`, `http` |
 | `SOCKS5_LISTEN` | no | `:1080` | SOCKS5 listen address |
+| `HTTP_LISTEN` | no | `:3128` | HTTP proxy listen address (CONNECT + absolute-form requests) |
 | `MTPROTO_LISTEN` | no | `:20443` | MTProto listen address |
 | `DIRECT_RULES` | no | — | Comma-separated rules for direct connections (see below) |
 | `DIRECT_IP_FAMILY` | no | `both` | Address families for direct: `ipv4`, `ipv6`, `both` |
@@ -72,6 +75,10 @@ Restrict the key to tunnel-only access:
 ```
 command="echo 'tunnel only'",no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 AAAA...
 ```
+
+### Network exposure
+
+The default `docker-compose.yml` binds the HTTP proxy (3128) and MTProto (20443) to all host interfaces for LAN access, without authentication. Keep the host in a trusted network; if LAN access is not needed, bind the ports to `127.0.0.1` instead.
 
 ### Security note: permitopen=
 
