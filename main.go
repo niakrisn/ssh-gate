@@ -27,7 +27,6 @@ type config struct {
 	httpAddr           string
 	directRules        string
 	directIPFamily     IPFamily
-	dohIP              string
 	dohHost            string
 	healthAddr         string
 	sshKeepalivePeriod time.Duration
@@ -125,7 +124,7 @@ func main() {
 	}
 
 	if contains(cfg.proxyModes, "mtproto") {
-		mt, err := newMTProtoServer(cfg.mtprotoAddr, secret, dialer.NetworkDialer(), cfg.dohIP)
+		mt, err := newMTProtoServer(cfg.mtprotoAddr, secret, dialer.NetworkDialer())
 		if err != nil {
 			log.Fatal().Err(err).Msg("MTProto server")
 		}
@@ -253,14 +252,6 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("DATA_DIR cannot be empty")
 	}
 
-	// Validate DOH_IP
-	dohIP := getEnv("DOH_IP", "9.9.9.9")
-	if dohIP != "" {
-		if ip := net.ParseIP(dohIP); ip == nil {
-			return config{}, fmt.Errorf("invalid DOH_IP %q: not a valid IP address", dohIP)
-		}
-	}
-
 	// Validate DOH_HOST: a hostname (optionally with port 443) for the
 	// DNS-over-HTTPS endpoint that tunnel destinations resolve through.
 	dohHost := getEnv("DOH_HOST", "cloudflare-dns.com")
@@ -293,7 +284,6 @@ func loadConfig() (config, error) {
 		httpAddr:           httpAddr,
 		directRules:        getEnv("DIRECT_RULES", ""),
 		directIPFamily:     directIPFamily,
-		dohIP:              dohIP,
 		dohHost:            dohHost,
 		healthAddr:         healthAddr,
 		sshKeepalivePeriod: sshKeepalivePeriod,

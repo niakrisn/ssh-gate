@@ -22,13 +22,19 @@ type MTProtoServer struct {
 	closeOnce sync.Once
 }
 
-func newMTProtoServer(listen, secret string, dialer network.Dialer, doh string) (*MTProtoServer, error) {
+// mtgDoHPlaceholder satisfies the DoH-IP check in mtg's network.NewNetwork.
+// The DoH resolver is never used in this setup: MTProto dials the static
+// Telegram DC IPs hardcoded in the library, and mtg only triggers DoH for
+// hostname dials.
+const mtgDoHPlaceholder = "1.1.1.1"
+
+func newMTProtoServer(listen, secret string, dialer network.Dialer) (*MTProtoServer, error) {
 	secretVal, err := mtglib.ParseSecret(secret)
 	if err != nil {
 		return nil, fmt.Errorf("parse MTProto secret: %w", err)
 	}
 
-	netw, err := network.NewNetwork(dialer, "", doh, 5*time.Second)
+	netw, err := network.NewNetwork(dialer, "", mtgDoHPlaceholder, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("create network: %w", err)
 	}
