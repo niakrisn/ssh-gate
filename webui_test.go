@@ -158,11 +158,12 @@ func TestWebUIStatusAPI(t *testing.T) {
 
 	var out struct {
 		SSH struct {
-			Host      string `json:"host"`
-			Port      int    `json:"port"`
-			Connected bool   `json:"connected"`
-			Reachable bool   `json:"reachable"`
-			RttMs     int64  `json:"rtt_ms"`
+			Host      string    `json:"host"`
+			Port      int       `json:"port"`
+			Connected bool      `json:"connected"`
+			Reachable bool      `json:"reachable"`
+			RttMs     int64     `json:"rtt_ms"`
+			TCP       *tcpStats `json:"tcp"`
 		} `json:"ssh"`
 		Active      map[string]int `json:"active"`
 		ActiveTotal int            `json:"active_total"`
@@ -198,6 +199,10 @@ func TestWebUIStatusAPI(t *testing.T) {
 	if out.ActiveTotal != 3 || out.Active["socks5"] != 2 || out.Active["http"] != 1 {
 		t.Fatalf("active: total=%d map=%v", out.ActiveTotal, out.Active)
 	}
+	// testDialer implements tcpStatsProvider with fixed values.
+	if out.SSH.TCP == nil || out.SSH.TCP.RTTMs != 42 || out.SSH.TCP.TotalRetrans != 7 {
+		t.Fatalf("tcp: %+v, want fixed test values", out.SSH.TCP)
+	}
 
 	resp, err := http.Post("http://"+addr+"/api/status", "", nil)
 	if err != nil {
@@ -206,6 +211,34 @@ func TestWebUIStatusAPI(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("POST: code=%d, want 405", resp.StatusCode)
+	}
+}
+
+// TestWebUIStatusAPIWithoutProvider: a dialer without TunnelTCPStats must
+// yield "tcp": null in /api/status, not fail the request.
+func TestWebUIStatusAPIWithoutProvider(t *testing.T) {
+	sshHost, sshPort := liveLocalPort(t)
+	addr := startTestHealth(t, &captureMetaDialer{}, nil, sshHost, sshPort)
+
+	resp, err := http.Get("http://" + addr + "/api/status")
+	if err != nil {
+		t.Fatalf("GET /api/status: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("code=%d, want 200", resp.StatusCode)
+	}
+
+	var out struct {
+		SSH struct {
+			TCP *tcpStats `json:"tcp"`
+		} `json:"ssh"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.SSH.TCP != nil {
+		t.Fatalf("tcp = %+v, want null", out.SSH.TCP)
 	}
 }
 

@@ -188,6 +188,17 @@ function renderStatus(s) {
   let info = ssh.host + ':' + ssh.port + ' · ';
   info += ssh.reachable ? ssh.rtt_ms + ' мс · ' : 'недоступен · ';
   info += ssh.connected ? 'SSH-сессия активна' : 'SSH-сессия не подключена';
+  // live tcp_info of the tunnel connection (null off-Linux or without a
+  // session); retrans and >60 s of silence are early path-degradation signs.
+  if (ssh.connected && ssh.tcp) {
+    const t = ssh.tcp;
+    info += ' · RTT ' + t.rtt_ms + ' мс';
+    if (t.min_rtt_ms > 0) info += ' (min ' + t.min_rtt_ms + ')';
+    info += ' · retrans ' + t.total_retrans + ' · cwnd ' + t.cwnd;
+    info += ' · ' + fmtBytes(t.bytes_sent) + '↑ ' + fmtBytes(t.bytes_received) + '↓';
+    const silent = Math.max(t.last_data_recv_s, t.last_ack_recv_s);
+    if (silent > 60) info += ' · тишина ' + Math.round(silent) + ' с';
+  }
   $('ssh-info').textContent = info;
 
   const parts = [];

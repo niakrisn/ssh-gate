@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/9seconds/mtg/v2/essentials"
@@ -30,10 +31,11 @@ type dialer interface {
 }
 
 type sshDialer struct {
-	mu     sync.Mutex
-	client *ssh.Client
-	cfg    sshDialerCfg
-	done   atomic.Bool
+	mu      sync.Mutex
+	client  *ssh.Client
+	rawConn syscall.RawConn
+	cfg     sshDialerCfg
+	done    atomic.Bool
 }
 
 type sshDialerCfg struct {
@@ -75,7 +77,7 @@ func newSSHDialer(cfg sshDialerCfg) (*sshDialer, error) {
 		cfg.fingerprint = string(data)
 	}
 
-	client, fp, err := connectSSH(cfg)
+	client, fp, raw, err := connectSSH(cfg)
 	if err != nil {
 		return nil, NewSSHError("connection", cfg.host, cfg.port, err)
 	}
@@ -84,8 +86,9 @@ func newSSHDialer(cfg sshDialerCfg) (*sshDialer, error) {
 
 	cfg.fingerprint = fp
 	d := &sshDialer{
-		client: client,
-		cfg:    cfg,
+		client:  client,
+		rawConn: raw,
+		cfg:     cfg,
 	}
 
 	go d.monitor()
@@ -171,6 +174,19 @@ func parseDialAddr(addr string) (string, int) {
 	return host, port
 }
 
+// TunnelTCPStats returns the live tcp_info counters for the tunnel
+// connection, or nil when the connection is absent or the platform lacks
+// tcp_info (see tcpinfo_linux.go / tcpinfo_other.go).
+func (d *sshDialer) TunnelTCPStats() *tcpStats {
+	d.mu.Lock()
+	rc := d.rawConn
+	d.mu.Unlock()
+	if rc == nil {
+		return nil
+	}
+	return readTCPStats(rc)
+}
+
 // NetworkDialer returns a dialer compatible with mtg network.Dialer interface.
 func (d *sshDialer) NetworkDialer() network.Dialer {
 	return &networkDialerWrapper{d: d}
@@ -231,7 +247,7 @@ func (d *sshDialer) monitor() {
 		log.Warn().Int("attempt", attempt+1).Dur("delay", delay).Msg("SSH connection lost, reconnecting...")
 		time.Sleep(delay)
 
-		newClient, fp, err := connectSSH(d.cfg)
+		newClient, fp, newRaw, err := connectSSH(d.cfg)
 		if err != nil {
 			log.Error().Err(err).Int("attempt", attempt+1).Msg("SSH reconnect failed")
 			attempt++
@@ -241,6 +257,7 @@ func (d *sshDialer) monitor() {
 		d.mu.Lock()
 		oldClient := d.client
 		d.client = newClient
+		d.rawConn = newRaw
 		d.mu.Unlock()
 
 		if oldClient != nil {
@@ -270,15 +287,18 @@ func (d *sshDialer) Connected() bool {
 
 const sshKnownHostsFile = "ssh_known_hosts"
 
-func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, error) {
+// connectSSH establishes the tunnel connection and returns the client, the
+// host key fingerprint and the syscall.RawConn of the TCP connection (the
+// handle readTCPStats uses to fetch SOL_TCP/TCP_INFO for /api/status).
+func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) {
 	keyData, err := os.ReadFile(cfg.keyPath)
 	if err != nil {
-		return nil, "", fmt.Errorf("read SSH key: %w", err)
+		return nil, "", nil, fmt.Errorf("read SSH key: %w", err)
 	}
 
 	signer, err := ssh.ParsePrivateKey(keyData)
 	if err != nil {
-		return nil, "", fmt.Errorf("parse SSH key: %w", err)
+		return nil, "", nil, fmt.Errorf("parse SSH key: %w", err)
 	}
 
 	addr := net.JoinHostPort(cfg.host, strconv.Itoa(cfg.port))
@@ -303,9 +323,19 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, error) {
 	}
 
 	// VPS access is IPv4-only by design; destination IPv6 is resolved on the VPS side.
-	rawConn, err := net.DialTimeout("tcp4", addr, sshConfig.Timeout)
+	var raw syscall.RawConn
+	// Control captures the fd's RawConn; it is called for the exact
+	// connection that is returned, so it stays valid for the connection's life.
+	dl := net.Dialer{
+		Timeout: sshConfig.Timeout,
+		Control: func(_, _ string, c syscall.RawConn) error {
+			raw = c
+			return nil
+		},
+	}
+	rawConn, err := dl.Dial("tcp4", addr)
 	if err != nil {
-		return nil, "", fmt.Errorf("SSH dial to %s: %w", addr, err)
+		return nil, "", nil, fmt.Errorf("SSH dial to %s: %w", addr, err)
 	}
 	// OS-level TCP keepalive detects silent (half-open) dead paths without
 	// relying on SSH cooperation; SSH_KEEPALIVE_PERIOD=0 disables it.
@@ -322,7 +352,7 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, error) {
 	sshConn, chans, reqs, err := ssh.NewClientConn(rawConn, addr, sshConfig)
 	if err != nil {
 		rawConn.Close()
-		return nil, "", fmt.Errorf("SSH handshake to %s: %w", addr, err)
+		return nil, "", nil, fmt.Errorf("SSH handshake to %s: %w", addr, err)
 	}
 	client := ssh.NewClient(sshConn, chans, reqs)
 
@@ -333,10 +363,10 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, error) {
 				log.Warn().Err(err).Msg("save SSH host key fingerprint")
 			}
 		}
-		return client, fp, nil
+		return client, fp, raw, nil
 	}
 
-	return client, "", nil
+	return client, "", raw, nil
 }
 
 func sshFingerprint(key ssh.PublicKey) string {

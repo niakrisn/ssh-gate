@@ -146,8 +146,8 @@ func (h *HealthServer) readyHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // statusHandler serves GET /api/status: the SSH tunnel endpoint, the current
-// session state, the latest port probe and active connection counts per
-// protocol.
+// session state, the latest port probe, the live tcp_info tunnel counters
+// (null when unavailable) and active connection counts per protocol.
 func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -157,6 +157,11 @@ func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	h.probeMu.Lock()
 	probe := h.probe
 	h.probeMu.Unlock()
+
+	var tcp *tcpStats
+	if p, ok := h.dialer.(tcpStatsProvider); ok {
+		tcp = p.TunnelTCPStats()
+	}
 
 	active := map[string]int{}
 	if h.tracker != nil {
@@ -176,6 +181,7 @@ func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 			"reachable":  probe.reachable,
 			"rtt_ms":     probe.rttMs,
 			"checked_at": probe.at.Unix(),
+			"tcp":        tcp,
 		},
 		"active":       active,
 		"active_total": total,

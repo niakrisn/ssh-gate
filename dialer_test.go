@@ -4,8 +4,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -295,6 +299,67 @@ func TestNetworkDialerWrapperMeta(t *testing.T) {
 		if v.Port != 443 || (v.Host != "149.154.175.50" && v.Host != "149.154.165.22") {
 			t.Fatalf("record: %+v", v)
 		}
+	}
+}
+
+// TestTunnelTCPStatsAbsent: without a tunnel connection the stats must be
+// nil, not a zero-value struct (the status API reports "tcp": null).
+func TestTunnelTCPStatsAbsent(t *testing.T) {
+	d := &sshDialer{}
+	if s := d.TunnelTCPStats(); s != nil {
+		t.Fatalf("stats = %+v, want nil", s)
+	}
+}
+
+// TestConnectSSHCapturesRawConn: the SSH dial must capture the TCP
+// connection's RawConn — the handle /api/status reads tcp_info through.
+// A regression to a plain net.DialTimeout would silently yield a nil
+// handle and "tcp": null in the status API.
+func TestConnectSSHCapturesRawConn(t *testing.T) {
+	addr, _ := startTestSSHServer(t, false)
+
+	// The test server accepts any publickey, so a freshly generated
+	// client key is fine; connectSSH reads it from disk.
+	_, clientPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("client key: %v", err)
+	}
+	keyBlock, err := ssh.MarshalPrivateKey(clientPriv, "test")
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(keyBlock)
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "id_ed25519")
+	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("port: %v", err)
+	}
+
+	client, fp, raw, err := connectSSH(sshDialerCfg{
+		host:    host,
+		port:    port,
+		user:    "test",
+		keyPath: keyPath,
+	})
+	if err != nil {
+		t.Fatalf("connectSSH: %v", err)
+	}
+	defer client.Close()
+
+	if fp == "" {
+		t.Fatal("fingerprint empty, want the host key")
+	}
+	if raw == nil {
+		t.Fatal("RawConn nil, want the captured tunnel fd handle")
 	}
 }
 

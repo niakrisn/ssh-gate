@@ -7,6 +7,7 @@ require (
 	github.com/rs/zerolog v1.35.0
 	github.com/things-go/go-socks5 v0.1.3
 	golang.org/x/crypto v0.49.0
+	golang.org/x/sys v0.42.0
 )
 
 require (
@@ -21,5 +22,4 @@ require (
 	github.com/txthinking/socks5 v0.0.0-20251011041537-5c31f201a10e // indirect
 	github.com/tylertreat/BoomFilters v0.0.0-20251117164519-53813c36cc1b // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
 )

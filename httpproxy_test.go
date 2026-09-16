@@ -40,6 +40,12 @@ func (testDialer) NetworkDialer() network.Dialer { return nil }
 func (testDialer) Connected() bool               { return true }
 func (testDialer) stop()                         {}
 
+// testDialer implements tcpStatsProvider with fixed values so /api/status
+// can be asserted without a real tunnel connection.
+func (testDialer) TunnelTCPStats() *tcpStats {
+	return &tcpStats{RTTMs: 42, MinRTTMs: 12, TotalRetrans: 7, Cwnd: 10, BytesSent: 1024, BytesReceived: 512}
+}
+
 func startTestProxy(t *testing.T, dialTarget string) *HTTPProxyServer {
 	t.Helper()
 	rules, err := NewRuleEngine("")
