@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -105,6 +107,21 @@ type noTrackKey struct{}
 // appear in the connection tracker.
 func ctxWithNoTrack(ctx context.Context) context.Context {
 	return context.WithValue(ctx, noTrackKey{}, true)
+}
+
+// tunnelHTTPClient builds an HTTP client whose dials go through the SSH
+// tunnel (untracked), for internal clients like DoH transports. A timeout
+// of 0 leaves requests unbounded; a nil tlsCfg uses the system roots.
+func tunnelHTTPClient(d dialer, timeout time.Duration, tlsCfg *tls.Config) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			TLSClientConfig: tlsCfg,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return d.DialContext(ctxWithNoTrack(ctx), network, addr)
+			},
+		},
+	}
 }
 
 // trackDial performs the dial and, when a tracker is set, registers the

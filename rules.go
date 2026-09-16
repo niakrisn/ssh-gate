@@ -76,11 +76,8 @@ func (e *RuleEngine) Stop() {
 // local resolver is used only when the DoH endpoint is unreachable.
 // Direct destinations keep using local DNS.
 func (e *RuleEngine) SetDOH(host string, d dialer) {
-	tr := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return d.DialContext(ctxWithNoTrack(ctx), network, addr)
-	}}
 	e.dns.dohHost = host
-	e.dns.dohClient = &http.Client{Transport: tr}
+	e.dns.dohClient = tunnelHTTPClient(d, 0, nil)
 }
 
 func NewRuleEngine(direct string) (*RuleEngine, error) {
@@ -365,47 +362,66 @@ type dohResponse struct {
 	} `json:"Answer"`
 }
 
-// dohLookup queries the DoH endpoint for A (1) and AAAA (28) records.
-func (c *dnsCache) dohLookup(ctx context.Context, host string) ([]netip.Addr, error) {
-	queries := []struct {
-		name string
-		want int
-	}{
-		{"A", 1},
-		{"AAAA", 28},
+// dohQuery pairs a DNS record type with how it is addressed in a dns-json
+// query (the "type" URL parameter) and how it is matched in answers.
+type dohQuery struct {
+	name string
+	want int
+}
+
+var (
+	dohQueryA    = dohQuery{name: "A", want: 1}
+	dohQueryAAAA = dohQuery{name: "AAAA", want: 28}
+)
+
+// dohJSONQuery performs one dns-json DoH query (RFC 8484 GET) on the
+// endpoint and returns the addresses of the wanted record type, unmapped.
+// errDohNotFound marks a definitive NXDOMAIN; any other error is a
+// transport or protocol failure.
+func dohJSONQuery(ctx context.Context, client *http.Client, endpoint, host string, q dohQuery) ([]netip.Addr, error) {
+	u := "https://" + endpoint + "/dns-query?" + url.Values{"name": {host}, "type": {q.name}}.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/dns-json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	var d dohResponse
+	err = json.NewDecoder(io.LimitReader(resp.Body, dohMaxResponse)).Decode(&d)
+	resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	if d.Status == 3 { // NXDOMAIN
+		return nil, errDohNotFound
+	}
+	if resp.StatusCode != http.StatusOK || d.Status != 0 {
+		return nil, fmt.Errorf("doh: status %d/%d", resp.StatusCode, d.Status)
 	}
 	var out []netip.Addr
-	for _, q := range queries {
-		u := "https://" + c.dohHost + "/dns-query?" + url.Values{"name": {host}, "type": {q.name}}.Encode()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	for _, a := range d.Answer {
+		if a.Type != q.want {
+			continue
+		}
+		if ip, perr := netip.ParseAddr(a.Data); perr == nil {
+			out = append(out, ip.Unmap())
+		}
+	}
+	return out, nil
+}
+
+// dohLookup queries the DoH endpoint for A and AAAA records.
+func (c *dnsCache) dohLookup(ctx context.Context, host string) ([]netip.Addr, error) {
+	var out []netip.Addr
+	for _, q := range [2]dohQuery{dohQueryA, dohQueryAAAA} {
+		addrs, err := dohJSONQuery(ctx, c.dohClient, c.dohHost, host, q)
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Accept", "application/dns-json")
-		resp, err := c.dohClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		var d dohResponse
-		err = json.NewDecoder(io.LimitReader(resp.Body, dohMaxResponse)).Decode(&d)
-		resp.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-		if d.Status == 3 { // NXDOMAIN
-			return nil, errDohNotFound
-		}
-		if resp.StatusCode != http.StatusOK || d.Status != 0 {
-			return nil, fmt.Errorf("doh: status %d/%d", resp.StatusCode, d.Status)
-		}
-		for _, a := range d.Answer {
-			if a.Type != q.want {
-				continue
-			}
-			if ip, perr := netip.ParseAddr(a.Data); perr == nil {
-				out = append(out, ip.Unmap())
-			}
-		}
+		out = append(out, addrs...)
 	}
 	if len(out) == 0 {
 		return nil, errDohNotFound

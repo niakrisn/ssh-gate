@@ -123,22 +123,25 @@ func main() {
 		servers = append(servers, server{Name: "HTTP", Shutdown: hp.Shutdown})
 	}
 
-	if contains(cfg.proxyModes, "mtproto") {
-		mt, err := newMTProtoServer(cfg.mtprotoAddr, secret, dialer.NetworkDialer())
-		if err != nil {
-			log.Fatal().Err(err).Msg("MTProto server")
-		}
-		mt.Start()
-		servers = append(servers, server{Name: "MTProto", Shutdown: mt.Shutdown})
-	}
-
-	// Health/ready endpoint + Web UI
+	// Health/ready endpoint + Web UI. Starts before MTProto, whose DoH
+	// bootstrap can take up to a few seconds on a degraded tunnel: the
+	// healthcheck must not wait on it.
 	hs, err := NewHealthServer(cfg.healthAddr, cfg.sshHost, cfg.sshPort, dialer, tracker)
 	if err != nil {
 		log.Fatal().Err(err).Msg("health server")
 	}
 	hs.Start()
 	servers = append(servers, server{Name: "health", Shutdown: hs.Shutdown})
+
+	if contains(cfg.proxyModes, "mtproto") {
+		dohIP := resolveDohIP(cfg.dohHost, dialer, defaultDohBootstrap)
+		mt, err := newMTProtoServer(cfg.mtprotoAddr, secret, dohIP, dialer.NetworkDialer())
+		if err != nil {
+			log.Fatal().Err(err).Msg("MTProto server")
+		}
+		mt.Start()
+		servers = append(servers, server{Name: "MTProto", Shutdown: mt.Shutdown})
+	}
 
 	// Graceful shutdown on SIGTERM/SIGINT
 	ctx, cancel := context.WithCancel(context.Background())
@@ -309,8 +312,6 @@ func parseModes(raw string) ([]string, error) {
 	}
 	return modes, nil
 }
-
-
 
 func setLogLevel(level string) {
 	switch strings.ToLower(level) {
