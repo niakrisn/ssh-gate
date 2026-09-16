@@ -10,6 +10,8 @@ services:
       - "20443:20443"
       # LAN access: bound to all host interfaces
       - "3128:3128"
+      # Web UI + health: host loopback only
+      - "127.0.0.1:9090:9090"
     volumes:
       - type: bind
         source: ./data
@@ -27,8 +29,10 @@ services:
       DIRECT_RULES: "${DIRECT_RULES}"
       DIRECT_IP_FAMILY: "${DIRECT_IP_FAMILY:-ipv4}"
       DOH_IP: "${DOH_IP:-9.9.9.9}"
+      HEALTH_LISTEN: "${HEALTH_LISTEN:-0.0.0.0:9090}"
       LOG_LEVEL: "${LOG_LEVEL:-warn}"
       SSH_KEEPALIVE_PERIOD: "${SSH_KEEPALIVE_PERIOD:-90s}"
+      SSH_DIAL_TIMEOUT: "${SSH_DIAL_TIMEOUT:-30s}"
     security_opt:
       - no-new-privileges:true
     read_only: true

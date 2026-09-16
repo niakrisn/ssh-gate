@@ -30,12 +30,19 @@ type config struct {
 	dohIP              string
 	healthAddr         string
 	sshKeepalivePeriod time.Duration
+	dialTimeout        time.Duration
 }
 
 type server struct {
 	Name     string
 	Shutdown func(context.Context) error
 }
+
+// connHistoryMaxAge bounds the in-memory connection history window.
+// SSH_DIAL_TIMEOUT must stay below it: dropStalled moves dialing records
+// older than this window to history, so a dial in flight past it would lose
+// its record.
+const connHistoryMaxAge = 10 * time.Minute
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
@@ -69,12 +76,17 @@ func main() {
 		os.WriteFile(filepath.Join(cfg.dataDir, firstRunDoneFile), nil, 0644)
 	}
 
+	// Connection history is in-memory only: last 1000 connections / 10 minutes.
+	tracker := NewConnTracker(1000, connHistoryMaxAge)
+
 	dialer, err := newSSHDialer(sshDialerCfg{
 		host:            cfg.sshHost,
 		port:            cfg.sshPort,
 		user:            cfg.sshUser,
 		keyPath:         filepath.Join(cfg.dataDir, sshKeyFile),
 		keepalivePeriod: cfg.sshKeepalivePeriod,
+		tracker:         tracker,
+		dialTimeout:     cfg.dialTimeout,
 	})
 	if err != nil {
 		log.Fatal().Err(err).Msg("SSH dialer")
@@ -114,8 +126,8 @@ func main() {
 		servers = append(servers, server{Name: "MTProto", Shutdown: mt.Shutdown})
 	}
 
-	// Health/ready endpoint
-	hs, err := NewHealthServer(cfg.healthAddr, dialer)
+	// Health/ready endpoint + Web UI
+	hs, err := NewHealthServer(cfg.healthAddr, cfg.sshHost, cfg.sshPort, dialer, tracker)
 	if err != nil {
 		log.Fatal().Err(err).Msg("health server")
 	}
@@ -198,6 +210,15 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("invalid SSH_KEEPALIVE_PERIOD: %w", err)
 	}
 
+	// Validate SSH_DIAL_TIMEOUT
+	dialTimeout, err := parseDialTimeout(getEnv("SSH_DIAL_TIMEOUT", "30s"))
+	if err != nil {
+		return config{}, fmt.Errorf("invalid SSH_DIAL_TIMEOUT: %w", err)
+	}
+	if dialTimeout >= connHistoryMaxAge {
+		return config{}, fmt.Errorf("invalid SSH_DIAL_TIMEOUT %s: must be below %s (connection history window)", dialTimeout, connHistoryMaxAge)
+	}
+
 	// Validate listen addresses
 	socks5Addr := getEnv("SOCKS5_LISTEN", ":1080")
 	if err := validateHostPort(socks5Addr); err != nil {
@@ -247,6 +268,7 @@ func loadConfig() (config, error) {
 		dohIP:              dohIP,
 		healthAddr:         healthAddr,
 		sshKeepalivePeriod: sshKeepalivePeriod,
+		dialTimeout:        dialTimeout,
 	}, nil
 }
 
@@ -303,6 +325,20 @@ func parseKeepalivePeriod(raw string) (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, nil
+	}
+	return d, nil
+}
+
+// parseDialTimeout parses SSH_DIAL_TIMEOUT as a Go duration.
+// A non-positive value is rejected: an unbounded destination dial can
+// hang forever on a blackholed host.
+func parseDialTimeout(raw string) (time.Duration, error) {
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid SSH_DIAL_TIMEOUT %q (Go duration, e.g. 30s): %w", raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("SSH_DIAL_TIMEOUT must be positive, got %s", raw)
 	}
 	return d, nil
 }

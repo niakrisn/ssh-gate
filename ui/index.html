@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ssh-gate</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>ssh-gate</h1>
+    <p>Соединения через SSH-туннель</p>
+  </div>
+  <div class="filters">
+    <select id="proto" aria-label="Фильтр по типу прокси">
+      <option value="">Все протоколы</option>
+      <option value="socks5">SOCKS5</option>
+      <option value="http">HTTP</option>
+      <option value="mtproto">MTProto</option>
+    </select>
+    <form class="search">
+      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <circle cx="7" cy="7" r="4.5" stroke="currentColor" stroke-width="1.5"/>
+        <path d="m10.5 10.5 3.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      <input id="q" type="search" placeholder="Поиск по host, IP или источнику" autocomplete="off" spellcheck="false">
+    </form>
+  </div>
+</header>
+<div class="statusline">
+  <span class="dot" id="ssh-dot"></span>
+  <span id="ssh-info"></span>
+  <span id="active-summary"></span>
+</div>
+<nav class="tabs">
+  <button class="tab active" data-tab="active" type="button">Активные</button>
+  <button class="tab" data-tab="history" type="button">История <span id="history-count"></span></button>
+</nav>
+<main>
+  <div class="table-wrap">
+    <table id="table">
+      <thead>
+        <tr>
+          <th>Протокол</th>
+          <th>Источник</th>
+          <th>Назначение</th>
+          <th>Статус</th>
+          <th>Начало</th>
+          <th class="num">Длительность</th>
+          <th class="num">↑ Байты</th>
+          <th class="num">↓ Байты</th>
+          <th>Причина</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div id="empty" class="empty" hidden>Нет соединений</div>
+  <div class="pager">
+    <button id="prev" type="button" aria-label="Предыдущая страница">&larr;</button>
+    <span id="page-info"></span>
+    <button id="next" type="button" aria-label="Следующая страница">&rarr;</button>
+  </div>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

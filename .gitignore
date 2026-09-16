@@ -3,3 +3,7 @@ data/
 .qwen/tmp/
 ssh-gate
 .env
+# Planning artifacts
+plan.md
+review.md
+todo.md

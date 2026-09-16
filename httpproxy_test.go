@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -419,4 +421,71 @@ func TestHTTPProxyDialFailure(t *testing.T) {
 
 	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", closedAddr, closedAddr)
 	expectStatus(t, bufio.NewReader(c), "502")
+}
+
+// captureMetaDialer captures connection metadata from the dial context and
+// fails the dial.
+type captureMetaDialer struct {
+	mu       sync.Mutex
+	captured []ConnMeta
+}
+
+func (d *captureMetaDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	meta, ok := connMetaFromCtx(ctx)
+	d.mu.Lock()
+	if ok {
+		d.captured = append(d.captured, meta)
+	}
+	d.mu.Unlock()
+	return nil, errors.New("dial blocked")
+}
+
+func (d *captureMetaDialer) NetworkDialer() network.Dialer { return nil }
+func (d *captureMetaDialer) Connected() bool               { return true }
+func (d *captureMetaDialer) stop()                         {}
+
+// TestHTTPProxyConnMeta checks that openUpstream attaches
+// ConnMeta{http, src, host} to the SSH dial context.
+func TestHTTPProxyConnMeta(t *testing.T) {
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	d := &captureMetaDialer{}
+	s, err := NewHTTPProxyServer("127.0.0.1:0", rules, d, FamilyBoth)
+	if err != nil {
+		t.Fatalf("NewHTTPProxyServer: %v", err)
+	}
+	s.Start()
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+
+	c, err := net.Dial("tcp", proxyAddr(s))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	// TEST-NET IP literal: routed through the tunnel without a DNS lookup, so
+	// the capturing dialer is reached deterministically.
+	fmt.Fprintf(c, "CONNECT 192.0.2.1:443 HTTP/1.1\r\nHost: 192.0.2.1:443\r\n\r\n")
+	expectStatus(t, bufio.NewReader(c), "502")
+	c.Close()
+
+	c, err = net.Dial("tcp", proxyAddr(s))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	fmt.Fprintf(c, "GET http://192.0.2.2:8080/ HTTP/1.1\r\nHost: 192.0.2.2:8080\r\nConnection: close\r\n\r\n")
+	expectStatus(t, bufio.NewReader(c), "502")
+	c.Close()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.captured) != 2 {
+		t.Fatalf("captured %d metas, want 2", len(d.captured))
+	}
+	if m := d.captured[0]; m.Proto != "http" || m.Host != "192.0.2.1" || m.Src == "" {
+		t.Fatalf("CONNECT meta: %+v", m)
+	}
+	if m := d.captured[1]; m.Proto != "http" || m.Host != "192.0.2.2" || m.Src == "" {
+		t.Fatalf("GET meta: %+v", m)
+	}
 }

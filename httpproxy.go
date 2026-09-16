@@ -134,6 +134,7 @@ func (s *HTTPProxyServer) openUpstream(ctx context.Context, src, method, host st
 		Str("route", route.String()).Str("reason", reason).Msg("request")
 
 	start := time.Now()
+	ctx = ctxWithConnMeta(ctx, ConnMeta{Proto: "http", Src: src, Host: host})
 	upstream, dst, err := s.dialUpstream(ctx, host, port, route)
 	dialMS := time.Since(start).Milliseconds()
 

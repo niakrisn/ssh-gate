@@ -63,6 +63,7 @@ func NewSOCKS5Server(listen string, rules *RuleEngine, d dialer, family IPFamily
 				upstream, dst, err = dialDirect(ctx, host, portInt, s.family)
 			} else {
 				dst = "ssh"
+				ctx = ctxWithConnMeta(ctx, ConnMeta{Proto: "socks5", Src: src, Host: host})
 				upstream, err = s.d.DialContext(ctx, network, addr)
 			}
 

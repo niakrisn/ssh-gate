@@ -40,6 +40,7 @@ docker compose logs
 | `SSH_HOST` | yes | — | VPS hostname or IP |
 | `SSH_PORT` | no | `22` | SSH port |
 | `SSH_USER` | yes | — | SSH username |
+| `SSH_DIAL_TIMEOUT` | no | `30s` | Max duration of a single destination dial through the tunnel (Go duration, must be positive and below 10m — the connection history window). A dial to a blackholed host fails with a deadline error instead of hanging |
 | `PROXY_MODES` | no | `socks5` | Comma-separated: `socks5`, `mtproto`, `http` |
 | `SOCKS5_LISTEN` | no | `:1080` | SOCKS5 listen address |
 | `HTTP_LISTEN` | no | `:3128` | HTTP proxy listen address (CONNECT + absolute-form requests) |
@@ -47,6 +48,7 @@ docker compose logs
 | `DIRECT_RULES` | no | — | Comma-separated rules for direct connections (see below) |
 | `DIRECT_IP_FAMILY` | no | `both` | Address families for direct: `ipv4`, `ipv6`, `both` |
 | `DOH_IP` | no | `9.9.9.9` | DNS-over-HTTPS server IP |
+| `HEALTH_LISTEN` | no | `127.0.0.1:9090` | Health + Web UI listen address (compose sets `0.0.0.0:9090` inside the container and maps it to `127.0.0.1:9090` on the host) |
 | `LOG_LEVEL` | no | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 | `DATA_DIR` | no | `/data` | Directory for keys and secrets |
 
@@ -59,6 +61,17 @@ Rules are checked in order. First match wins. Unmatched traffic goes through the
 - `example.com` — match domain (and subdomains)
 
 Example: `DIRECT_RULES="re:\\.ru$,ip:10.0.0.0/8,internal.local"`
+
+## Web UI
+
+The proxy exposes a Web UI at `http://127.0.0.1:9090/` (same address as the health endpoint, no authentication). It shows:
+
+- **Active** — tunnels currently open: destination `host:port`, protocol, client source, status, start time, duration, bytes up/down
+- **History** — finished connections with the close reason (last 1000 connections / 10 minutes, in-memory ring buffer — lost on restart)
+
+Search by IP or hostname and pagination (50 per page, 2.5 s polling) are supported. Connections matching `DIRECT_RULES` (direct route) are not tracked; only traffic tunneled over SSH appears in the UI. The endpoint is intentionally bound to host loopback — do not expose it publicly.
+
+API: `GET /api/connections?tab=active|history&q=<substring>&page=<n>&page_size=<n>`.
 
 ## Data volume
 

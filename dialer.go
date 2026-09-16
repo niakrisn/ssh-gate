@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -42,6 +43,11 @@ type sshDialerCfg struct {
 	keyPath         string
 	fingerprint     string
 	keepalivePeriod time.Duration
+	tracker         *ConnTracker
+	// dialTimeout bounds a single destination dial (channel open through
+	// the SSH tunnel). A blackholed destination keeps the open request
+	// pending on the VPS sshd side until this deadline cancels it.
+	dialTimeout time.Duration
 }
 
 // netConnToEssentials wraps net.Conn into essentials.Conn (adds CloseRead/CloseWrite).
@@ -87,6 +93,42 @@ func newSSHDialer(cfg sshDialerCfg) (*sshDialer, error) {
 }
 
 func (d *sshDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return d.trackDial(ctx, network, addr)
+}
+
+// trackDial performs the dial and, when a tracker is set, registers the
+// connection: host comes from ctx metadata (the original hostname), falling
+// back to parsing addr.
+func (d *sshDialer) trackDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	tr := d.cfg.tracker
+	if tr == nil {
+		return d.dial(ctx, network, addr)
+	}
+
+	dialHost, port := parseDialAddr(addr)
+	meta, ok := connMetaFromCtx(ctx)
+	host := dialHost
+	if ok && meta.Host != "" {
+		host = meta.Host
+	}
+	if ok {
+		// SOCKS5 and HTTP resolve FQDNs client-side and MTProto dials IP
+		// literals, so the dial address is an IP whenever it parses as one.
+		if ip, err := netip.ParseAddr(dialHost); err == nil {
+			meta.DstIP = ip.String()
+		}
+	}
+
+	id := tr.Begin(meta, host, port)
+	conn, err := d.dial(ctx, network, addr)
+	if err != nil {
+		tr.Fail(id, err)
+		return nil, err
+	}
+	return tr.Done(id, conn), nil
+}
+
+func (d *sshDialer) dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	d.mu.Lock()
 	c := d.client
 	d.mu.Unlock()
@@ -95,11 +137,27 @@ func (d *sshDialer) DialContext(ctx context.Context, network, addr string) (net.
 		return nil, fmt.Errorf("SSH client not connected")
 	}
 
+	if d.cfg.dialTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d.cfg.dialTimeout)
+		defer cancel()
+	}
+
 	conn, err := c.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, NewNetworkError("SSH dial", addr, err)
 	}
 	return conn, nil
+}
+
+// parseDialAddr splits an addr in host:port form into host and port.
+func parseDialAddr(addr string) (string, int) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, 0
+	}
+	port, _ := strconv.Atoi(portStr)
+	return host, port
 }
 
 // NetworkDialer returns a dialer compatible with mtg network.Dialer interface.
@@ -112,14 +170,14 @@ type networkDialerWrapper struct {
 }
 
 func (w *networkDialerWrapper) Dial(network_, addr string) (essentials.Conn, error) {
-	conn, err := w.d.DialContext(context.Background(), network_, addr)
-	if err != nil {
-		return nil, err
-	}
-	return netConnToEssentials{conn}, nil
+	return w.DialContext(context.Background(), network_, addr)
 }
 
+// DialContext marks the dial as MTProto: src is unavailable (the mtg dial
+// does not pass the client address), host is the DC IP that trackDial takes
+// from addr.
 func (w *networkDialerWrapper) DialContext(ctx context.Context, network_, addr string) (essentials.Conn, error) {
+	ctx = ctxWithConnMeta(ctx, ConnMeta{Proto: "mtproto", Src: "-"})
 	conn, err := w.d.DialContext(ctx, network_, addr)
 	if err != nil {
 		return nil, err
