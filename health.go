@@ -21,6 +21,10 @@ const (
 	probeTimeout  = 3 * time.Second
 )
 
+// processStartedAt is when this process began; /api/status reports the
+// elapsed time as uptime_s.
+var processStartedAt = time.Now()
+
 // sshProbe is the latest result of probing the SSH server port.
 type sshProbe struct {
 	reachable bool
@@ -185,6 +189,7 @@ func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 		},
 		"active":       active,
 		"active_total": total,
+		"uptime_s":     int64(time.Since(processStartedAt).Seconds()),
 	}); err != nil {
 		// client went away; nothing to report.
 	}

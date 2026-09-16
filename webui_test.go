@@ -167,6 +167,7 @@ func TestWebUIStatusAPI(t *testing.T) {
 		} `json:"ssh"`
 		Active      map[string]int `json:"active"`
 		ActiveTotal int            `json:"active_total"`
+		UptimeS     int64          `json:"uptime_s"`
 	}
 	// the first probe runs right after Start; retry briefly until it landed.
 	for i := 0; i < 20; i++ {
@@ -202,6 +203,11 @@ func TestWebUIStatusAPI(t *testing.T) {
 	// testDialer implements tcpStatsProvider with fixed values.
 	if out.SSH.TCP == nil || out.SSH.TCP.RTTMs != 42 || out.SSH.TCP.TotalRetrans != 7 {
 		t.Fatalf("tcp: %+v, want fixed test values", out.SSH.TCP)
+	}
+	// uptime_s is the process uptime; handler and test share the clock, so
+	// the value must lie within [0, elapsed].
+	if want := int64(time.Since(processStartedAt).Seconds()); out.UptimeS < 0 || out.UptimeS > want+1 {
+		t.Fatalf("uptime_s=%d, want in [0, %d]", out.UptimeS, want+1)
 	}
 
 	resp, err := http.Post("http://"+addr+"/api/status", "", nil)

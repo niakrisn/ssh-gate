@@ -53,6 +53,16 @@ function fmtDuration(ms) {
   return h + ' ч ' + (m % 60) + ' мин';
 }
 
+function fmtUptime(s) {
+  if (s < 60) return s + ' с';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + ' мин';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + ' ч ' + (m % 60) + ' мин';
+  const d = Math.floor(h / 24);
+  return d + ' д ' + (h % 24) + ' ч';
+}
+
 function fmtStarted(unix) {
   return new Date(unix * 1000).toLocaleTimeString('ru-RU');
 }
@@ -188,18 +198,26 @@ function renderStatus(s) {
   let info = ssh.host + ':' + ssh.port + ' · ';
   info += ssh.reachable ? ssh.rtt_ms + ' мс · ' : 'недоступен · ';
   info += ssh.connected ? 'SSH-сессия активна' : 'SSH-сессия не подключена';
-  // live tcp_info of the tunnel connection (null off-Linux or without a
-  // session); retrans and >60 s of silence are early path-degradation signs.
+  info += ' · работает ' + fmtUptime(s.uptime_s);
+  $('ssh-info').textContent = info;
+
+  // Second row: live tcp_info of the tunnel connection (null off-Linux or
+  // without a session); retrans and >60 s of silence are early
+  // path-degradation signs.
+  const detail = $('tunnel-info');
   if (ssh.connected && ssh.tcp) {
     const t = ssh.tcp;
-    info += ' · RTT ' + t.rtt_ms + ' мс';
-    if (t.min_rtt_ms > 0) info += ' (min ' + t.min_rtt_ms + ')';
-    info += ' · retrans ' + t.total_retrans + ' · cwnd ' + t.cwnd;
-    info += ' · ' + fmtBytes(t.bytes_sent) + '↑ ' + fmtBytes(t.bytes_received) + '↓';
+    let d = 'Туннель: RTT ' + t.rtt_ms + ' мс';
+    if (t.min_rtt_ms > 0) d += ' (min ' + t.min_rtt_ms + ')';
+    d += ' · retrans ' + t.total_retrans + ' · cwnd ' + t.cwnd;
+    d += ' · ' + fmtBytes(t.bytes_sent) + '↑ ' + fmtBytes(t.bytes_received) + '↓';
     const silent = Math.max(t.last_data_recv_s, t.last_ack_recv_s);
-    if (silent > 60) info += ' · тишина ' + Math.round(silent) + ' с';
+    if (silent > 60) d += ' · тишина ' + Math.round(silent) + ' с';
+    detail.textContent = d;
+    detail.hidden = false;
+  } else {
+    detail.hidden = true;
   }
-  $('ssh-info').textContent = info;
 
   const parts = [];
   for (const [p, n] of Object.entries(s.active || {})) {

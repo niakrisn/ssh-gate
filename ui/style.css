@@ -22,7 +22,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-header, .statusline, .tabs, main {
+header, .statusline, main {
   max-width: 1280px;
   margin: 0 auto;
   padding-left: 24px;
@@ -55,6 +55,7 @@ h1 {
 
 .filters {
   display: flex;
+  align-items: center;
   gap: 10px;
 }
 
@@ -120,14 +121,27 @@ h1 {
 
 /* ---------- status line ---------- */
 
+/* Two rows: state (endpoint, probe, session, uptime, active) on top,
+   tunnel tcp_info counters below. Rows wrap instead of overflowing, so
+   the layout survives narrow windows. */
 .statusline {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 3px;
   font-size: 13px;
   color: var(--dim);
   margin-bottom: 12px;
 }
+
+.status-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* The author display rule above would otherwise override the UA [hidden] rule. */
+.status-row[hidden] { display: none; }
 
 .dot {
   width: 8px;
@@ -143,6 +157,12 @@ h1 {
 
 #ssh-info { font-variant-numeric: tabular-nums; }
 
+/* The counter row aligns with the text, past the dot. */
+#tunnel-info {
+  padding-left: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
 #active-summary {
   margin-left: auto;
   white-space: nowrap;
@@ -155,8 +175,7 @@ h1 {
   gap: 2px;
   padding: 3px;
   background: #ececee;
-  border-radius: 10px;
-  margin-bottom: 14px;
+  border-radius: 9px;
 }
 
 .tab {
@@ -164,6 +183,9 @@ h1 {
   font: inherit;
   font-size: 13.5px;
   font-weight: 500;
+  /* A button's intrinsic width comes from its longest word, so the full
+     label ("История (N)") would otherwise wrap and stretch the pill. */
+  white-space: nowrap;
   color: var(--dim);
   background: none;
   border: none;
