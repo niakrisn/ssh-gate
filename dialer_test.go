@@ -141,6 +141,28 @@ func TestTrackDialAddrFallback(t *testing.T) {
 	}
 }
 
+// TestTrackDialV6DstIP: a bracketed IPv6 dial address must land in history
+// as the dialed IP (the tunnel resolves client-side, so the VPS dials this
+// literal and the tracker must record it).
+func TestTrackDialV6DstIP(t *testing.T) {
+	tr := NewConnTracker(8, time.Minute)
+	d := &sshDialer{cfg: sshDialerCfg{tracker: tr}}
+	// DstIP is only filled for tracked proxy dials, which always carry
+	// ConnMeta; an empty Host keeps the literal as the record host.
+	ctx := ctxWithConnMeta(context.Background(), ConnMeta{Proto: "socks5", Src: "10.0.0.5:4321"})
+
+	if _, err := d.DialContext(ctx, "tcp", "[2001:db8::1]:443"); err == nil {
+		t.Fatal("want dial error (no SSH client)")
+	}
+
+	hist, total, err := tr.List("history", "", "", 1, 50)
+	if err != nil || total != 1 {
+		t.Fatalf("history total=%d err=%v", total, err)
+	}
+	if hist[0].Host != "2001:db8::1" || hist[0].Port != 443 || hist[0].DstIP != "2001:db8::1" {
+		t.Fatalf("record: %+v", hist[0])
+	}
+}
 
 func TestTrackDialNoTracker(t *testing.T) {
 	d := &sshDialer{cfg: sshDialerCfg{}}
@@ -267,6 +289,7 @@ func TestParseDialAddr(t *testing.T) {
 	}{
 		{"1.2.3.4:443", "1.2.3.4", 443},
 		{"[::1]:80", "::1", 80},
+		{"[2001:db8::1]:443", "2001:db8::1", 443},
 		{"example.com", "example.com", 0},
 		{"example.com:bad", "example.com", 0},
 	} {

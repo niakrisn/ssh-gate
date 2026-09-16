@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -113,12 +114,24 @@ func statusForDialErr(err error) int {
 	return http.StatusBadGateway
 }
 
-// dialUpstream dials host:port according to the route decided by the rule engine.
+// dialUpstream dials host:port according to the route decided by the rule
+// engine. Tunnel destinations are resolved client-side (same cached resolver
+// as the SOCKS5 path, v4 first with v6 fallback): the VPS sshd would
+// otherwise resolve the FQDN itself, and the dialed IP would stay unknown to
+// the connection tracker.
 func (s *HTTPProxyServer) dialUpstream(ctx context.Context, host string, port int, route Route) (net.Conn, string, error) {
 	if route == RouteDirect {
 		return dialDirect(ctx, host, port, s.family)
 	}
-	conn, err := s.d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	dialHost := host
+	if _, err := netip.ParseAddr(dialHost); err != nil {
+		ip, rerr := s.rules.ResolveTunnel(ctx, dialHost)
+		if rerr != nil {
+			return nil, "ssh", rerr
+		}
+		dialHost = ip.String()
+	}
+	conn, err := s.d.DialContext(ctx, "tcp", net.JoinHostPort(dialHost, strconv.Itoa(port)))
 	if err != nil {
 		return nil, "ssh", err
 	}

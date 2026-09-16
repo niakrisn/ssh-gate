@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -44,8 +45,6 @@ type RuleEngine struct {
 	dns     *dnsCache
 	private []netip.Prefix
 	started bool
-	cacheHits   int64
-	cacheMisses int64
 }
 
 // Start launches background maintenance for the DNS cache purge goroutine.
@@ -123,6 +122,38 @@ func (e *RuleEngine) Decide(ctx context.Context, host string, port int) (Route, 
 	return RouteTunnel, "fallback"
 }
 
+// ResolveAll resolves host through the engine's cached resolver,
+// sharing the rule-matching cache (TTL 30 s, 5 s lookup timeout).
+// Returns all IPv4 and IPv6 addresses; IP literals are returned as-is.
+func (e *RuleEngine) ResolveAll(ctx context.Context, host string) ([]netip.Addr, error) {
+	return e.dns.ResolveAll(ctx, host)
+}
+
+// pickTunnelAddr picks the address the VPS should dial for a tunneled
+// connection: the first IPv4 if present (IPv4 egress is the baseline),
+// otherwise the first IPv6 so v6-only destinations still resolve.
+func pickTunnelAddr(addrs []netip.Addr) (netip.Addr, error) {
+	for _, a := range addrs {
+		if a.Is4() {
+			return a, nil
+		}
+	}
+	if len(addrs) == 0 {
+		return netip.Addr{}, fmt.Errorf("no address")
+	}
+	return addrs[0], nil
+}
+
+// ResolveTunnel resolves host and picks the tunnel address (v4 first, v6
+// fallback) for client-side dialing through the SSH tunnel.
+func (e *RuleEngine) ResolveTunnel(ctx context.Context, host string) (netip.Addr, error) {
+	addrs, err := e.ResolveAll(ctx, host)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	return pickTunnelAddr(addrs)
+}
+
 func (e *RuleEngine) isPrivate(ip netip.Addr) bool {
 	for _, p := range e.private {
 		if p.Contains(ip) {
@@ -134,11 +165,14 @@ func (e *RuleEngine) isPrivate(ip netip.Addr) bool {
 
 func (r ruleEntry) matches(ctx context.Context, host string, dns *dnsCache) bool {
 	if r.ipPrefix != nil {
-		if ip, err := netip.ParseAddr(host); err == nil && r.ipPrefix.Contains(ip) {
-			return true
+		addrs, err := dns.ResolveAll(ctx, host)
+		if err != nil {
+			return false
 		}
-		if resolved, err := dns.Resolve(ctx, host); err == nil && r.ipPrefix.Contains(resolved) {
-			return true
+		for _, a := range addrs {
+			if r.ipPrefix.Contains(a) {
+				return true
+			}
 		}
 		return false
 	}
@@ -177,6 +211,9 @@ type dnsCache struct {
 	ttl       time.Duration
 	done      chan struct{}
 	closeOnce sync.Once
+	// lookups counts real resolver queries (cache hits and IP literals
+	// excluded); tests use it to assert caching without timing tricks.
+	lookups atomic.Int64
 }
 
 // startPurge launches a background goroutine that purges expired entries every TTL.
@@ -214,54 +251,61 @@ func (c *dnsCache) purge() {
 }
 
 type cacheEntry struct {
-	ip      netip.Addr
+	addrs   []netip.Addr
 	expires time.Time
 }
 
-func (c *dnsCache) Resolve(ctx context.Context, host string) (netip.Addr, error) {
+// ResolveAll resolves host to all of its IPv4 and IPv6 addresses. IP
+// literals are returned as-is without touching the resolver or the cache.
+func (c *dnsCache) ResolveAll(ctx context.Context, host string) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
-		return ip, nil
+		return []netip.Addr{ip.Unmap()}, nil
 	}
 
 	c.mu.Lock()
 	if entry, ok := c.cache[host]; ok && time.Now().Before(entry.expires) {
 		c.mu.Unlock()
-		return entry.ip, nil
+		return entry.addrs, nil
 	}
 	c.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	c.lookups.Add(1)
 
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		return netip.Addr{}, NewDNSError(host, err)
+		return nil, NewDNSError(host, err)
 	}
 
+	var out []netip.Addr
 	for _, a := range addrs {
-		if ip, ok := netip.AddrFromSlice(a.IP); ok && ip.Is4() {
-			c.mu.Lock()
-			if len(c.cache) >= dnsCacheMaxSize {
-				// Evict oldest entries to make room
-				var oldestKey string
-				var oldestTime time.Time
-				for k, v := range c.cache {
-					if oldestKey == "" || v.expires.Before(oldestTime) {
-						oldestKey = k
-						oldestTime = v.expires
-					}
-				}
-				if oldestKey != "" {
-					delete(c.cache, oldestKey)
-				}
-			}
-			c.cache[host] = cacheEntry{ip: ip, expires: time.Now().Add(c.ttl)}
-			c.mu.Unlock()
-			return ip, nil
+		if ip, ok := netip.AddrFromSlice(a.IP); ok {
+			out = append(out, ip.Unmap())
 		}
 	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no address for %s", host)
+	}
 
-	return netip.Addr{}, fmt.Errorf("no IPv4 address for %s", host)
+	c.mu.Lock()
+	if len(c.cache) >= dnsCacheMaxSize {
+		// Evict oldest entries to make room
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range c.cache {
+			if oldestKey == "" || v.expires.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.expires
+			}
+		}
+		if oldestKey != "" {
+			delete(c.cache, oldestKey)
+		}
+	}
+	c.cache[host] = cacheEntry{addrs: out, expires: time.Now().Add(c.ttl)}
+	c.mu.Unlock()
+	return out, nil
 }
 
 func mustPrefix(s string) netip.Prefix {

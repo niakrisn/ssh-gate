@@ -93,6 +93,10 @@ func NewSOCKS5Server(listen string, rules *RuleEngine, d dialer, family IPFamily
 				dialMS: dialMS,
 			}, nil
 		}),
+		// FQDNs are resolved through the rule engine's cached resolver
+		// (v4 first, v6 fallback; 5 s lookup timeout, 30 s TTL) instead of
+		// the library default, which is unbounded and uncached.
+		socks5.WithResolver(ruleEngineResolver{rules: rules}),
 	)
 
 	ln, err := net.Listen("tcp", listen)
@@ -223,4 +227,19 @@ func (l *logConn) Close() error {
 	event.Msg("access")
 
 	return err
+}
+
+// ruleEngineResolver adapts the rule engine's cached resolver (v4 first,
+// v6 fallback) to the go-socks5 NameResolver interface so proxy-level
+// lookups share the rule-matching DNS cache.
+type ruleEngineResolver struct {
+	rules *RuleEngine
+}
+
+func (r ruleEngineResolver) Resolve(ctx context.Context, host string) (context.Context, net.IP, error) {
+	ip, err := r.rules.ResolveTunnel(ctx, host)
+	if err != nil {
+		return ctx, nil, err
+	}
+	return ctx, ip.AsSlice(), nil
 }

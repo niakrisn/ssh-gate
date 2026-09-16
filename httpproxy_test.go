@@ -314,8 +314,9 @@ func TestHTTPProxyTunnelRoute(t *testing.T) {
 	}
 	defer c.Close()
 
-	// Non-private hostname: the rule engine routes it through the tunnel.
-	fmt.Fprintf(c, "CONNECT tunnel.test:443 HTTP/1.1\r\nHost: tunnel.test:443\r\n\r\n")
+	// TEST-NET IP literal: non-private, so the rule engine routes it through
+	// the tunnel without any DNS lookup.
+	fmt.Fprintf(c, "CONNECT 192.0.2.1:443 HTTP/1.1\r\nHost: 192.0.2.1:443\r\n\r\n")
 	r := bufio.NewReader(c)
 	expectStatus(t, r, "200")
 	if _, err := r.ReadSlice('\n'); err != nil {
@@ -396,8 +397,9 @@ func TestHTTPProxyDialTimeout(t *testing.T) {
 	}
 	defer c.Close()
 
-	// Non-private hostname: routed through the tunnel, so the failing dialer is used.
-	fmt.Fprintf(c, "CONNECT tunnel.test:443 HTTP/1.1\r\nHost: tunnel.test:443\r\n\r\n")
+	// TEST-NET IP literal: routed through the tunnel (no DNS lookup), so the
+	// failing dialer is used.
+	fmt.Fprintf(c, "CONNECT 192.0.2.1:443 HTTP/1.1\r\nHost: 192.0.2.1:443\r\n\r\n")
 	expectStatus(t, bufio.NewReader(c), "504")
 }
 
@@ -421,6 +423,91 @@ func TestHTTPProxyDialFailure(t *testing.T) {
 
 	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", closedAddr, closedAddr)
 	expectStatus(t, bufio.NewReader(c), "502")
+}
+
+// TestHTTPProxyTunnelV6 dials an IPv6 literal through the tunnel path: no
+// name resolution is involved, the dialer (standing in for the SSH tunnel)
+// receives the bracketed address and the relay must work.
+func TestHTTPProxyTunnelV6(t *testing.T) {
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listener: %v", err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(c)
+		}
+	}()
+
+	// dialTarget set: the dialer stands in for the SSH tunnel and redirects
+	// any destination to the local echo server.
+	s := startTestProxy(t, echo.Addr().String())
+
+	c, err := net.Dial("tcp", proxyAddr(s))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+
+	// Documentation-prefixed v6 literal: non-private, so the rule engine
+	// routes it through the tunnel without any DNS lookup.
+	fmt.Fprintf(c, "CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: [2001:db8::1]:443\r\n\r\n")
+	r := bufio.NewReader(c)
+	expectStatus(t, r, "200")
+	if _, err := r.ReadSlice('\n'); err != nil {
+		t.Fatalf("read CONNECT end: %v", err)
+	}
+
+	c.Write([]byte("via-v6"))
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 6)
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(buf) != "via-v6" {
+		t.Fatalf("echo = %q, want %q", buf, "via-v6")
+	}
+}
+
+// TestHTTPProxyTunnelResolveFailure returns a gateway error when a tunnel
+// destination FQDN cannot be resolved client-side (the reserved .invalid TLD
+// never resolves).
+func TestHTTPProxyTunnelResolveFailure(t *testing.T) {
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	// If the resolver answers for .invalid, the test dialer would hang on an
+	// unbounded dial — skip instead (same premise as TestSOCKS5UnresolvableHost).
+	if _, err := rules.ResolveTunnel(context.Background(), "no-such-host.invalid"); err == nil {
+		t.Skip("resolver answered for .invalid (hijacked DNS?), skipping")
+	}
+	s, err := NewHTTPProxyServer("127.0.0.1:0", rules, testDialer{}, FamilyBoth)
+	if err != nil {
+		t.Fatalf("NewHTTPProxyServer: %v", err)
+	}
+	s.Start()
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+
+	c, err := net.Dial("tcp", proxyAddr(s))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+
+	fmt.Fprintf(c, "CONNECT no-such-host.invalid:443 HTTP/1.1\r\nHost: no-such-host.invalid:443\r\n\r\n")
+	status := readStatus(t, bufio.NewReader(c))
+	if !strings.HasPrefix(status, "HTTP/1.1 502") && !strings.HasPrefix(status, "HTTP/1.1 504") {
+		t.Fatalf("status = %q, want 502 or 504", status)
+	}
 }
 
 // captureMetaDialer captures connection metadata from the dial context and
