@@ -2,9 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/netip"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -38,6 +43,9 @@ type ruleEntry struct {
 const (
 	dnsCacheMaxSize = 1000
 	dnsCacheTTL     = 30 * time.Second
+	// dohMaxResponse bounds a single DoH answer body against a misbehaving
+	// endpoint returning an unreasonably large response.
+	dohMaxResponse = 1 << 20
 )
 
 type RuleEngine struct {
@@ -59,6 +67,20 @@ func (e *RuleEngine) Start(ctx context.Context) {
 // Stop cleans up DNS cache state.
 func (e *RuleEngine) Stop() {
 	e.dns.stop()
+}
+
+// SetDOH makes cached resolution query the given DNS-over-HTTPS endpoint
+// (https://host/dns-query, RFC 8484) through the SSH dialer, so DNS traffic
+// stays inside the encrypted tunnel and cannot be poisoned on the client
+// side. A definitive DoH answer (including NXDOMAIN) is authoritative; the
+// local resolver is used only when the DoH endpoint is unreachable.
+// Direct destinations keep using local DNS.
+func (e *RuleEngine) SetDOH(host string, d dialer) {
+	tr := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return d.DialContext(ctxWithNoTrack(ctx), network, addr)
+	}}
+	e.dns.dohHost = host
+	e.dns.dohClient = &http.Client{Transport: tr}
 }
 
 func NewRuleEngine(direct string) (*RuleEngine, error) {
@@ -213,7 +235,9 @@ type dnsCache struct {
 	closeOnce sync.Once
 	// lookups counts real resolver queries (cache hits and IP literals
 	// excluded); tests use it to assert caching without timing tricks.
-	lookups atomic.Int64
+	lookups   atomic.Int64
+	dohHost   string
+	dohClient *http.Client
 }
 
 // startPurge launches a background goroutine that purges expired entries every TTL.
@@ -273,18 +297,12 @@ func (c *dnsCache) ResolveAll(ctx context.Context, host string) ([]netip.Addr, e
 	defer cancel()
 	c.lookups.Add(1)
 
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	// Both lookup sources return unmapped addresses.
+	addrs, err := c.lookup(ctx, host)
 	if err != nil {
 		return nil, NewDNSError(host, err)
 	}
-
-	var out []netip.Addr
-	for _, a := range addrs {
-		if ip, ok := netip.AddrFromSlice(a.IP); ok {
-			out = append(out, ip.Unmap())
-		}
-	}
-	if len(out) == 0 {
+	if len(addrs) == 0 {
 		return nil, fmt.Errorf("no address for %s", host)
 	}
 
@@ -303,8 +321,95 @@ func (c *dnsCache) ResolveAll(ctx context.Context, host string) ([]netip.Addr, e
 			delete(c.cache, oldestKey)
 		}
 	}
-	c.cache[host] = cacheEntry{addrs: out, expires: time.Now().Add(c.ttl)}
+	c.cache[host] = cacheEntry{addrs: addrs, expires: time.Now().Add(c.ttl)}
 	c.mu.Unlock()
+	return addrs, nil
+}
+
+// errDohNotFound marks a definitive not-found from the DoH endpoint
+// (NXDOMAIN or an empty answer); it must not fall back to the local
+// resolver.
+var errDohNotFound = errors.New("no answer")
+
+// lookup resolves host through the configured DoH endpoint when set and
+// falls back to the local resolver only on DoH transport failure.
+func (c *dnsCache) lookup(ctx context.Context, host string) ([]netip.Addr, error) {
+	if c.dohClient != nil {
+		addrs, err := c.dohLookup(ctx, host)
+		if err == nil || errors.Is(err, errDohNotFound) {
+			return addrs, err
+		}
+		// DoH endpoint unreachable: fall back to the local resolver. The
+		// warning is the only signal that resolution degraded to local DNS.
+		log.Warn().Str("host", host).Err(err).Msg("DoH lookup failed, falling back to the local resolver")
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]netip.Addr, 0, len(addrs))
+	for _, a := range addrs {
+		if ip, ok := netip.AddrFromSlice(a.IP); ok {
+			out = append(out, ip.Unmap())
+		}
+	}
+	return out, nil
+}
+
+// dohResponse is an RFC 8484 dns-json answer subset.
+type dohResponse struct {
+	Status int `json:"Status"`
+	Answer []struct {
+		Type int    `json:"Type"`
+		Data string `json:"Data"`
+	} `json:"Answer"`
+}
+
+// dohLookup queries the DoH endpoint for A (1) and AAAA (28) records.
+func (c *dnsCache) dohLookup(ctx context.Context, host string) ([]netip.Addr, error) {
+	queries := []struct {
+		name string
+		want int
+	}{
+		{"A", 1},
+		{"AAAA", 28},
+	}
+	var out []netip.Addr
+	for _, q := range queries {
+		u := "https://" + c.dohHost + "/dns-query?" + url.Values{"name": {host}, "type": {q.name}}.Encode()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/dns-json")
+		resp, err := c.dohClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var d dohResponse
+		err = json.NewDecoder(io.LimitReader(resp.Body, dohMaxResponse)).Decode(&d)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if d.Status == 3 { // NXDOMAIN
+			return nil, errDohNotFound
+		}
+		if resp.StatusCode != http.StatusOK || d.Status != 0 {
+			return nil, fmt.Errorf("doh: status %d/%d", resp.StatusCode, d.Status)
+		}
+		for _, a := range d.Answer {
+			if a.Type != q.want {
+				continue
+			}
+			if ip, perr := netip.ParseAddr(a.Data); perr == nil {
+				out = append(out, ip.Unmap())
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, errDohNotFound
+	}
 	return out, nil
 }
 

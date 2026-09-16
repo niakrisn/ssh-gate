@@ -28,7 +28,7 @@ services:
       HTTP_LISTEN: "${HTTP_LISTEN:-0.0.0.0:3128}"
       DIRECT_RULES: "${DIRECT_RULES}"
       DIRECT_IP_FAMILY: "${DIRECT_IP_FAMILY:-ipv4}"
-      DOH_IP: "${DOH_IP:-9.9.9.9}"
+      DOH_HOST: "${DOH_HOST:-cloudflare-dns.com}"
       HEALTH_LISTEN: "${HEALTH_LISTEN:-0.0.0.0:9090}"
       LOG_LEVEL: "${LOG_LEVEL:-warn}"
       SSH_KEEPALIVE_PERIOD: "${SSH_KEEPALIVE_PERIOD:-90s}"

@@ -47,7 +47,7 @@ docker compose logs
 | `MTPROTO_LISTEN` | no | `:20443` | MTProto listen address |
 | `DIRECT_RULES` | no | — | Comma-separated rules for direct connections (see below) |
 | `DIRECT_IP_FAMILY` | no | `both` | Address families for direct: `ipv4`, `ipv6`, `both` |
-| `DOH_IP` | no | `9.9.9.9` | DNS-over-HTTPS server IP |
+| `DOH_HOST` | no | `cloudflare-dns.com` | DNS-over-HTTPS endpoint for tunnel destinations, queried through the SSH tunnel; direct destinations keep local DNS. Empty disables |
 | `HEALTH_LISTEN` | no | `127.0.0.1:9090` | Health + Web UI listen address (compose sets `0.0.0.0:9090` inside the container and maps it to `127.0.0.1:9090` on the host) |
 | `LOG_LEVEL` | no | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 | `DATA_DIR` | no | `/data` | Directory for keys and secrets |

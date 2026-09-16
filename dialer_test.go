@@ -173,6 +173,22 @@ func TestTrackDialNoTracker(t *testing.T) {
 	}
 }
 
+// TestTrackDialNoTrack: a dial marked with ctxWithNoTrack (the DoH
+// transport) must not register a tracker record.
+func TestTrackDialNoTrack(t *testing.T) {
+	tr := NewConnTracker(8, time.Minute)
+	d := &sshDialer{cfg: sshDialerCfg{tracker: tr}}
+
+	if _, err := d.DialContext(ctxWithNoTrack(context.Background()), "tcp", "9.9.9.9:53"); err == nil {
+		t.Fatal("want dial error (no SSH client)")
+	}
+
+	hist, total, err := tr.List("history", "", "", 1, 50)
+	if err != nil || total != 0 || len(hist) != 0 {
+		t.Fatalf("history total=%d err=%v, want none", total, err)
+	}
+}
+
 func TestTrackDialSuccessLifecycle(t *testing.T) {
 	addr, signer := startTestSSHServer(t, true)
 	client := connectTestSSHClient(t, addr, signer)

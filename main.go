@@ -28,6 +28,7 @@ type config struct {
 	directRules        string
 	directIPFamily     IPFamily
 	dohIP              string
+	dohHost            string
 	healthAddr         string
 	sshKeepalivePeriod time.Duration
 	dialTimeout        time.Duration
@@ -95,6 +96,12 @@ func main() {
 	rules, err := NewRuleEngine(cfg.directRules)
 	if err != nil {
 		log.Fatal().Err(err).Msg("rule engine")
+	}
+
+	// Route tunnel-destination resolution through the configured DoH
+	// endpoint, inside the SSH tunnel. Direct destinations keep local DNS.
+	if cfg.dohHost != "" {
+		rules.SetDOH(cfg.dohHost, dialer)
 	}
 
 	var servers []server
@@ -254,6 +261,27 @@ func loadConfig() (config, error) {
 		}
 	}
 
+	// Validate DOH_HOST: a hostname (optionally with port 443) for the
+	// DNS-over-HTTPS endpoint that tunnel destinations resolve through.
+	dohHost := getEnv("DOH_HOST", "cloudflare-dns.com")
+	if dohHost != "" {
+		if strings.Contains(dohHost, "/") {
+			return config{}, fmt.Errorf("invalid DOH_HOST %q: use a hostname, e.g. cloudflare-dns.com", dohHost)
+		}
+		hostOnly := dohHost
+		if host, port, err := net.SplitHostPort(dohHost); err == nil {
+			hostOnly = host
+			if port != "443" {
+				return config{}, fmt.Errorf("invalid DOH_HOST %q: only port 443 is supported", dohHost)
+			}
+		}
+		// IP-literal endpoints are unusable: TLS certificates are validated
+		// against the hostname, and DoH provider certs carry no IP SANs.
+		if net.ParseIP(hostOnly) != nil {
+			return config{}, fmt.Errorf("invalid DOH_HOST %q: use a hostname (e.g. cloudflare-dns.com), not an IP address", dohHost)
+		}
+	}
+
 	return config{
 		sshHost:            sshHost,
 		sshPort:            port,
@@ -266,6 +294,7 @@ func loadConfig() (config, error) {
 		directRules:        getEnv("DIRECT_RULES", ""),
 		directIPFamily:     directIPFamily,
 		dohIP:              dohIP,
+		dohHost:            dohHost,
 		healthAddr:         healthAddr,
 		sshKeepalivePeriod: sshKeepalivePeriod,
 		dialTimeout:        dialTimeout,

@@ -77,6 +77,35 @@ func TestParseDialTimeout(t *testing.T) {
 	}
 }
 
+// TestLoadConfigDohHost covers DOH_HOST semantics: a plain hostname and an
+// explicit :443 pass; URLs, other ports and IP-literal addresses are
+// rejected (TLS is validated against the hostname, and DoH provider certs
+// carry no IP SANs).
+func TestLoadConfigDohHost(t *testing.T) {
+	for _, v := range []string{"", "cloudflare-dns.com", "dns.google:443"} {
+		t.Setenv("SSH_HOST", "h")
+		t.Setenv("SSH_USER", "u")
+		t.Setenv("DOH_HOST", v)
+		if _, err := loadConfig(); err != nil {
+			t.Errorf("DOH_HOST=%q: unexpected error: %v", v, err)
+		}
+	}
+	for _, v := range []string{
+		"https://dns.google",
+		"dns.google/dns-query",
+		"dns.google:8443",
+		"1.1.1.1",
+		"1.1.1.1:443",
+	} {
+		t.Setenv("SSH_HOST", "h")
+		t.Setenv("SSH_USER", "u")
+		t.Setenv("DOH_HOST", v)
+		if _, err := loadConfig(); err == nil {
+			t.Errorf("DOH_HOST=%q: expected error, got nil", v)
+		}
+	}
+}
+
 // TestLoadConfigDialTimeoutCap: SSH_DIAL_TIMEOUT must stay below the
 // connection-history window — dropStalled moves dialing records out of the
 // active map once they outlive it, so a longer dial could lose its record.
