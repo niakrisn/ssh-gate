@@ -184,7 +184,7 @@ h1 {
   font-size: 13.5px;
   font-weight: 500;
   /* A button's intrinsic width comes from its longest word, so the full
-     label ("История (N)") would otherwise wrap and stretch the pill. */
+     label ("Архивные (N)") would otherwise wrap and stretch the pill. */
   white-space: nowrap;
   color: var(--dim);
   background: none;
@@ -202,6 +202,7 @@ h1 {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
 }
 
+#active-count,
 #history-count {
   color: var(--dim);
   font-weight: 400;

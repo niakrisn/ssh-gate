@@ -224,6 +224,7 @@ function renderStatus(s) {
     if (n > 0) parts.push((PROTO_LABEL[p] || p) + ' ' + n);
   }
   $('active-summary').textContent = parts.length ? 'Активные: ' + parts.join(' · ') : 'Активных нет';
+  $('active-count').textContent = s.active_total > 0 ? '(' + s.active_total + ')' : '';
 }
 
 document.querySelector('.search').addEventListener('submit', (e) => e.preventDefault());
