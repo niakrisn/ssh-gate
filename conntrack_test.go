@@ -281,6 +281,25 @@ func TestConnTrackerActiveByProto(t *testing.T) {
 	}
 }
 
+// TestConnTrackerActiveByProtoStalledDial: the status counts must not
+// include dials that dropStalled has moved to history.
+func TestConnTrackerActiveByProtoStalledDial(t *testing.T) {
+	tr := NewConnTracker(8, 30*time.Millisecond)
+	tr.Begin(ConnMeta{Proto: "socks5"}, "stalled.example.com", 443)
+	id := tr.Begin(ConnMeta{Proto: "http"}, "live.example.com", 443)
+	tr.Done(id, &fakeHalfCloseConn{})
+
+	time.Sleep(40 * time.Millisecond)
+
+	got := tr.ActiveByProto()
+	if got["http"] != 1 || got["socks5"] != 0 || len(got) != 1 {
+		t.Fatalf("active by proto after stall: %v", got)
+	}
+	if _, total, _ := tr.List("active", "", "", 1, 50); total != 1 {
+		t.Fatalf("active list after stall: %d", total)
+	}
+}
+
 func TestConnTrackerProtoFilter(t *testing.T) {
 	tr := NewConnTracker(8, time.Minute)
 	for _, p := range []string{"socks5", "http", "socks5"} {

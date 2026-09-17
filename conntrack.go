@@ -147,10 +147,12 @@ func (t *ConnTracker) Fail(id uint64, err error) {
 }
 
 // ActiveByProto returns the number of active connections (dialing or
-// established) per protocol.
+// established) per protocol. Stalled dials are moved to history first,
+// matching the "active" view of List.
 func (t *ConnTracker) ActiveByProto() map[string]int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.dropStalled(time.Now())
 	m := make(map[string]int)
 	for _, r := range t.active {
 		m[r.proto]++
