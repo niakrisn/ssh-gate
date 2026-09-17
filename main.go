@@ -103,10 +103,14 @@ func main() {
 		rules.SetDOH(cfg.dohHost, dialer)
 	}
 
+	// One Opener per process: both proxy protocols share the route/resolve
+	// policy (direct via local DNS, tunnel via DoH) and the SSH dialer.
+	opener := &Opener{rules: rules, d: dialer, family: cfg.directIPFamily}
+
 	var servers []server
 
 	if contains(cfg.proxyModes, "socks5") {
-		s5, err := NewSOCKS5Server(cfg.socks5Addr, rules, dialer, cfg.directIPFamily)
+		s5, err := NewSOCKS5Server(cfg.socks5Addr, opener)
 		if err != nil {
 			log.Fatal().Err(err).Msg("SOCKS5 server")
 		}
@@ -115,7 +119,7 @@ func main() {
 	}
 
 	if contains(cfg.proxyModes, "http") {
-		hp, err := NewHTTPProxyServer(cfg.httpAddr, rules, dialer, cfg.directIPFamily)
+		hp, err := NewHTTPProxyServer(cfg.httpAddr, opener)
 		if err != nil {
 			log.Fatal().Err(err).Msg("HTTP proxy")
 		}

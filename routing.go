@@ -4,11 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 // IPFamily controls which address families direct connections may use.
@@ -60,56 +59,20 @@ var directDialer = &net.Dialer{
 	KeepAlive: 30 * time.Second,
 }
 
-// dialDirect resolves host and dials the first matching address that accepts
-// the connection. Returns (conn, selectedIP, error); selectedIP is empty on error.
-func dialDirect(ctx context.Context, host string, port int, family IPFamily) (net.Conn, string, error) {
-	t0 := time.Now()
-	var addrs []net.IPAddr
-	var err error
-
-	if ip := net.ParseIP(host); ip != nil {
-		addrs = []net.IPAddr{{IP: ip}}
-	} else {
-		addrs, err = net.DefaultResolver.LookupIPAddr(ctx, host)
-		if err != nil {
-			return nil, "", NewDNSError(host, err)
-		}
+// dialDirectIP dials one already-resolved address with the direct dialer's
+// timeout. Resolution and the address choice (route policy, family filter)
+// happen in the Opener.
+func dialDirectIP(ctx context.Context, ip netip.Addr, port int, family IPFamily) (net.Conn, error) {
+	if !familyMatches(family, ip.AsSlice()) {
+		return nil, fmt.Errorf("dial %s:%d: no %s addresses", ip, port, family)
 	}
-
-	if len(addrs) > 0 {
-		ipStrs := make([]string, len(addrs))
-		for i, a := range addrs {
-			ipStrs[i] = a.IP.String()
-		}
-		log.Debug().Str("host", host).Str("family", family.String()).Strs("addrs", ipStrs).
-			Int64("ms", time.Since(t0).Milliseconds()).Msg("dial resolve")
+	network := "tcp4"
+	if !ip.Is4() {
+		network = "tcp6"
 	}
-
-	var dialErr error
-	matched := false
-	for _, a := range addrs {
-		if !familyMatches(family, a.IP) {
-			continue
-		}
-		matched = true
-		network := "tcp4"
-		if a.IP.To4() == nil {
-			network = "tcp6"
-		}
-		addr := net.JoinHostPort(a.IP.String(), strconv.Itoa(port))
-		conn, dErr := directDialer.DialContext(ctx, network, addr)
-		if dErr == nil {
-			return conn, a.IP.String(), nil
-		}
-		dialErr = dErr
-		log.Debug().Str("ip", a.IP.String()).Err(dErr).Msg("dial direct: attempt failed")
+	conn, err := directDialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+	if err != nil {
+		return nil, fmt.Errorf("dial %s:%d: %w", ip, port, err)
 	}
-
-	if !matched {
-		return nil, "", fmt.Errorf("dial %s:%d: no %s addresses", host, port, family)
-	}
-	if dialErr != nil {
-		return nil, "", fmt.Errorf("dial %s:%d: %w", host, port, dialErr)
-	}
-	return nil, "", fmt.Errorf("dial %s:%d: no addresses", host, port)
+	return conn, nil
 }

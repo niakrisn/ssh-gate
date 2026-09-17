@@ -46,13 +46,19 @@ func (testDialer) TunnelTCPStats() *tcpStats {
 	return &tcpStats{RTTMs: 42, MinRTTMs: 12, TotalRetrans: 7, Cwnd: 10, BytesSent: 1024, BytesReceived: 512}
 }
 
+// newTestOpener builds an Opener with FamilyBoth, as the tests dial both
+// address families.
+func newTestOpener(rules *RuleEngine, d dialer) *Opener {
+	return &Opener{rules: rules, d: d, family: FamilyBoth}
+}
+
 func startTestProxy(t *testing.T, dialTarget string) *HTTPProxyServer {
 	t.Helper()
 	rules, err := NewRuleEngine("")
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
-	s, err := NewHTTPProxyServer("127.0.0.1:0", rules, testDialer{Target: dialTarget}, FamilyBoth)
+	s, err := NewHTTPProxyServer("127.0.0.1:0", newTestOpener(rules, testDialer{Target: dialTarget}))
 	if err != nil {
 		t.Fatalf("NewHTTPProxyServer: %v", err)
 	}
@@ -390,7 +396,7 @@ func TestHTTPProxyDialTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
-	s, err := NewHTTPProxyServer("127.0.0.1:0", rules, testDialer{Err: &net.DNSError{IsTimeout: true}}, FamilyBoth)
+	s, err := NewHTTPProxyServer("127.0.0.1:0", newTestOpener(rules, testDialer{Err: &net.DNSError{IsTimeout: true}}))
 	if err != nil {
 		t.Fatalf("NewHTTPProxyServer: %v", err)
 	}
@@ -491,12 +497,13 @@ func TestHTTPProxyTunnelResolveFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
-	// If the resolver answers for .invalid, the test dialer would hang on an
-	// unbounded dial — skip instead (same premise as TestSOCKS5UnresolvableHost).
+	// If the resolver answers for .invalid, the request would dial instead of
+	// failing resolution — skip instead (same premise as
+	// TestSOCKS5UnresolvableHost).
 	if _, err := rules.ResolveTunnel(context.Background(), "no-such-host.invalid"); err == nil {
 		t.Skip("resolver answered for .invalid (hijacked DNS?), skipping")
 	}
-	s, err := NewHTTPProxyServer("127.0.0.1:0", rules, testDialer{}, FamilyBoth)
+	s, err := NewHTTPProxyServer("127.0.0.1:0", newTestOpener(rules, testDialer{}))
 	if err != nil {
 		t.Fatalf("NewHTTPProxyServer: %v", err)
 	}
@@ -545,7 +552,7 @@ func TestHTTPProxyConnMeta(t *testing.T) {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
 	d := &captureMetaDialer{}
-	s, err := NewHTTPProxyServer("127.0.0.1:0", rules, d, FamilyBoth)
+	s, err := NewHTTPProxyServer("127.0.0.1:0", newTestOpener(rules, d))
 	if err != nil {
 		t.Fatalf("NewHTTPProxyServer: %v", err)
 	}

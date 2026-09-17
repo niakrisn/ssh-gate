@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -106,7 +107,7 @@ func TestSOCKS5ServerResolver(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
-	s, err := NewSOCKS5Server("127.0.0.1:0", rules, testDialer{Target: echo.Addr().String()}, FamilyBoth)
+	s, err := NewSOCKS5Server("127.0.0.1:0", &Opener{rules: rules, d: testDialer{Target: echo.Addr().String()}, family: FamilyBoth})
 	if err != nil {
 		t.Fatalf("NewSOCKS5Server: %v", err)
 	}
@@ -134,7 +135,7 @@ func TestSOCKS5UnresolvableHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
-	s, err := NewSOCKS5Server("127.0.0.1:0", rules, testDialer{}, FamilyBoth)
+	s, err := NewSOCKS5Server("127.0.0.1:0", &Opener{rules: rules, d: testDialer{}, family: FamilyBoth})
 	if err != nil {
 		t.Fatalf("NewSOCKS5Server: %v", err)
 	}
@@ -147,6 +148,123 @@ func TestSOCKS5UnresolvableHost(t *testing.T) {
 	}
 	if code != 0x04 {
 		t.Fatalf("reply code %d, want 4 (host unreachable)", code)
+	}
+}
+
+// TestSOCKS5DirectHostResolvesLocally: an FQDN matching a direct rule must
+// resolve through the local resolver, not the DoH endpoint — a DoH NXDOMAIN
+// (the public DNS knows no corporate names) must not break the connection.
+func TestSOCKS5DirectHostResolvesLocally(t *testing.T) {
+	var dohReqs atomic.Int64
+	// The DoH endpoint answers NXDOMAIN for every name, standing in for
+	// public DNS that has no record of an internal one.
+	srv := startFakeDoHServer(t, func(_, _ string) dohAnswer {
+		dohReqs.Add(1)
+		return dohAnswer{status: 3}
+	})
+
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listener: %v", err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(c)
+		}
+	}()
+
+	// localhost resolves locally to 127.0.0.1 regardless of the ambient DNS
+	// configuration; the direct rule keeps it off the tunnel.
+	rules, err := NewRuleEngine("localhost")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	d, b := setBootstrap(t, srv)
+	rules.SetDOH(b.addr, d)
+	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
+
+	s, err := NewSOCKS5Server("127.0.0.1:0", &Opener{rules: rules, d: d, family: FamilyIPv4})
+	if err != nil {
+		t.Fatalf("NewSOCKS5Server: %v", err)
+	}
+	s.Start()
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+
+	_, portStr, _ := net.SplitHostPort(echo.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	// Success proves the local resolver was used: the DoH endpoint answers
+	// NXDOMAIN for every name, so a DoH-routed resolution would fail.
+	if code := socks5Connect(t, s.ln.Addr().String(), "localhost", port); code != 0x00 {
+		t.Fatalf("reply code %d, want 0", code)
+	}
+	if got := dohReqs.Load(); got != 0 {
+		t.Fatalf("DoH queries for a direct host: %d, want 0", got)
+	}
+}
+
+// TestSOCKS5TunnelHostResolvesViaDoH: the opposite side of the policy — a
+// tunnel-routed FQDN must resolve through the DoH endpoint, where a
+// definitive answer is authoritative even when the name is unknown to the
+// local resolver (.example is reserved).
+func TestSOCKS5TunnelHostResolvesViaDoH(t *testing.T) {
+	var dohReqs atomic.Int64
+	srv := startFakeDoHServer(t, func(name, _ string) dohAnswer {
+		dohReqs.Add(1)
+		if name == "dohtarget.example" {
+			return dohAnswer{a: []string{"203.0.113.7"}}
+		}
+		return dohAnswer{status: 3}
+	})
+
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listener: %v", err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(c)
+		}
+	}()
+
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	d, b := setBootstrap(t, srv)
+	rules.SetDOH(b.addr, d)
+	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
+
+	s, err := NewSOCKS5Server("127.0.0.1:0", &Opener{rules: rules, d: d, family: FamilyBoth})
+	if err != nil {
+		t.Fatalf("NewSOCKS5Server: %v", err)
+	}
+	s.Start()
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+
+	// The dialer (SSH tunnel stand-in) redirects the dial to the local echo
+	// listener; only the reply code and the DoH usage are under test.
+	if code := socks5Connect(t, s.ln.Addr().String(), "dohtarget.example", 443); code != 0x00 {
+		t.Fatalf("reply code %d, want 0", code)
+	}
+	if got := dohReqs.Load(); got == 0 {
+		t.Fatal("DoH was not used for a tunnel host")
 	}
 }
 
@@ -208,7 +326,7 @@ func TestSOCKS5ServerV6Literal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
-	s, err := NewSOCKS5Server("127.0.0.1:0", rules, testDialer{Target: echo.Addr().String()}, FamilyBoth)
+	s, err := NewSOCKS5Server("127.0.0.1:0", &Opener{rules: rules, d: testDialer{Target: echo.Addr().String()}, family: FamilyBoth})
 	if err != nil {
 		t.Fatalf("NewSOCKS5Server: %v", err)
 	}

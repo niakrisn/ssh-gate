@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,12 +33,10 @@ type HTTPProxyServer struct {
 	ln        net.Listener
 	shutCh    chan struct{}
 	closeOnce sync.Once
-	rules     *RuleEngine
-	d         dialer
-	family    IPFamily
+	opener    *Opener
 }
 
-func NewHTTPProxyServer(listen string, rules *RuleEngine, d dialer, family IPFamily) (*HTTPProxyServer, error) {
+func NewHTTPProxyServer(listen string, opener *Opener) (*HTTPProxyServer, error) {
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		return nil, err
@@ -47,9 +44,7 @@ func NewHTTPProxyServer(listen string, rules *RuleEngine, d dialer, family IPFam
 	return &HTTPProxyServer{
 		ln:     ln,
 		shutCh: make(chan struct{}),
-		rules:  rules,
-		d:      d,
-		family: family,
+		opener: opener,
 	}, nil
 }
 
@@ -114,41 +109,13 @@ func statusForDialErr(err error) int {
 	return http.StatusBadGateway
 }
 
-// dialUpstream dials host:port according to the route decided by the rule
-// engine. Tunnel destinations are resolved client-side (same cached resolver
-// as the SOCKS5 path, v4 first with v6 fallback): the VPS sshd would
-// otherwise resolve the FQDN itself, and the dialed IP would stay unknown to
-// the connection tracker.
-func (s *HTTPProxyServer) dialUpstream(ctx context.Context, host string, port int, route Route) (net.Conn, string, error) {
-	if route == RouteDirect {
-		return dialDirect(ctx, host, port, s.family)
-	}
-	dialHost := host
-	if _, err := netip.ParseAddr(dialHost); err != nil {
-		ip, rerr := s.rules.ResolveTunnel(ctx, dialHost)
-		if rerr != nil {
-			return nil, "ssh", rerr
-		}
-		dialHost = ip.String()
-	}
-	conn, err := s.d.DialContext(ctx, "tcp", net.JoinHostPort(dialHost, strconv.Itoa(port)))
-	if err != nil {
-		return nil, "ssh", err
-	}
-	return conn, "ssh", nil
-}
-
-// openUpstream decides the route for host:port, dials the upstream and wraps
-// the connection for access logging. The access log is emitted on dial failure.
+// openUpstream opens the upstream connection through the shared Opener and
+// wraps it for access logging. The access log is emitted on dial failure.
 func (s *HTTPProxyServer) openUpstream(ctx context.Context, src, method, host string, port int) (*logConn, error) {
-	route, reason := s.rules.Decide(ctx, host, port)
-
-	log.Info().Str("proto", "http").Str("method", method).Str("src", src).Str("host", host).Int("port", port).
-		Str("route", route.String()).Str("reason", reason).Msg("request")
+	log.Info().Str("proto", "http").Str("method", method).Str("src", src).Str("host", host).Int("port", port).Msg("request")
 
 	start := time.Now()
-	ctx = ctxWithConnMeta(ctx, ConnMeta{Proto: "http", Src: src, Host: host})
-	upstream, dst, err := s.dialUpstream(ctx, host, port, route)
+	upstream, dst, route, reason, err := s.opener.Open(ctx, src, "http", host, port)
 	dialMS := time.Since(start).Milliseconds()
 
 	if err != nil {
@@ -167,7 +134,7 @@ func (s *HTTPProxyServer) openUpstream(ctx context.Context, src, method, host st
 		dst:    dst,
 		route:  route,
 		reason: reason,
-		family: s.family,
+		family: s.opener.family,
 		dialMS: dialMS,
 	}, nil
 }

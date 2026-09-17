@@ -14,24 +14,21 @@ import (
 	socks5 "github.com/things-go/go-socks5"
 )
 
-// SOCKS5Server wraps things-go/go-socks5 with Rule Engine routing.
+// SOCKS5Server wraps things-go/go-socks5, opening every connection through
+// the shared Opener.
 type SOCKS5Server struct {
 	srv       *socks5.Server
 	ln        net.Listener
 	shutCh    chan struct{}
 	closeOnce sync.Once
-	rules     *RuleEngine
-	d         dialer
-	family    IPFamily
+	opener    *Opener
 }
 
 // NewSOCKS5Server creates a new SOCKS5 server with routing.
-func NewSOCKS5Server(listen string, rules *RuleEngine, d dialer, family IPFamily) (*SOCKS5Server, error) {
+func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 	s := &SOCKS5Server{
 		shutCh: make(chan struct{}),
-		rules:  rules,
-		d:      d,
-		family: family,
+		opener: opener,
 	}
 
 	s.srv = socks5.NewServer(
@@ -50,28 +47,15 @@ func NewSOCKS5Server(listen string, rules *RuleEngine, d dialer, family IPFamily
 
 			src := request.RemoteAddr.String()
 
-			route, reason := s.rules.Decide(ctx, host, portInt)
-
-			log.Info().Str("proto", "socks5").Str("src", src).Str("host", host).Int("port", portInt).
-				Str("route", route.String()).Str("reason", reason).Msg("request")
+			log.Info().Str("proto", "socks5").Str("src", src).Str("host", host).Int("port", portInt).Msg("request")
 
 			start := time.Now()
-			var upstream net.Conn
-			var dst string
-
-			if route == RouteDirect {
-				upstream, dst, err = dialDirect(ctx, host, portInt, s.family)
-			} else {
-				dst = "ssh"
-				ctx = ctxWithConnMeta(ctx, ConnMeta{Proto: "socks5", Src: src, Host: host})
-				upstream, err = s.d.DialContext(ctx, network, addr)
-			}
-
+			upstream, dst, route, reason, err := s.opener.Open(ctx, src, "socks5", host, portInt)
 			dialMS := time.Since(start).Milliseconds()
 
 			if err != nil {
 				log.Info().Str("proto", "socks5").Str("src", src).Str("host", host).Int("port", portInt).
-					Str("route", route.String()).Str("reason", reason).Str("family", s.family.String()).
+					Str("route", route.String()).Str("reason", reason).Str("family", s.opener.family.String()).
 					Str("dst", dst).Int64("dial_ms", dialMS).Err(err).Msg("access")
 				return nil, err
 			}
@@ -89,14 +73,14 @@ func NewSOCKS5Server(listen string, rules *RuleEngine, d dialer, family IPFamily
 				dst:    dst,
 				route:  route,
 				reason: reason,
-				family: s.family,
+				family: s.opener.family,
 				dialMS: dialMS,
 			}, nil
 		}),
-		// FQDNs are resolved through the rule engine's cached resolver
-		// (v4 first, v6 fallback; 5 s lookup timeout, 30 s TTL) instead of
-		// the library default, which is unbounded and uncached.
-		socks5.WithResolver(ruleEngineResolver{rules: rules}),
+		// FQDNs are resolved through the shared Opener (route policy: direct
+		// via local DNS, tunnel via DoH; cached, 5 s lookup timeout) instead
+		// of the library default, which is unbounded and uncached.
+		socks5.WithResolver(openerResolver{opener: s.opener}),
 	)
 
 	ln, err := net.Listen("tcp", listen)
@@ -229,17 +213,19 @@ func (l *logConn) Close() error {
 	return err
 }
 
-// ruleEngineResolver adapts the rule engine's cached resolver (v4 first,
-// v6 fallback) to the go-socks5 NameResolver interface so proxy-level
-// lookups share the rule-matching DNS cache.
-type ruleEngineResolver struct {
-	rules *RuleEngine
+// openerResolver adapts the shared Opener's resolution to the go-socks5
+// NameResolver interface. The SOCKS5 handshake must return an IP before the
+// dial callback runs, so it resolves per the same route policy Open applies:
+// direct hosts through the local resolver, tunnel hosts through DoH.
+type openerResolver struct {
+	opener *Opener
 }
 
-func (r ruleEngineResolver) Resolve(ctx context.Context, host string) (context.Context, net.IP, error) {
-	ip, err := r.rules.ResolveTunnel(ctx, host)
+func (r openerResolver) Resolve(ctx context.Context, host string) (context.Context, net.IP, error) {
+	// Rules do not depend on the port; the interface only carries the name.
+	ip, _, _, err := r.opener.Resolve(ctx, host, 0)
 	if err != nil {
 		return ctx, nil, err
 	}
-	return ctx, ip.AsSlice(), nil
+	return ctx, ip, nil
 }

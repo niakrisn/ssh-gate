@@ -279,12 +279,26 @@ type cacheEntry struct {
 // ResolveAll resolves host to all of its IPv4 and IPv6 addresses. IP
 // literals are returned as-is without touching the resolver or the cache.
 func (c *dnsCache) ResolveAll(ctx context.Context, host string) ([]netip.Addr, error) {
+	return c.cachedLookup(ctx, host, host, c.lookup)
+}
+
+// localResolveAll resolves host through the local resolver only — no DoH,
+// even when a DoH endpoint is configured: direct-routed destinations keep
+// their resolution local. Results are cached under a separate key space so
+// the two policies cannot shadow each other.
+func (c *dnsCache) localResolveAll(ctx context.Context, host string) ([]netip.Addr, error) {
+	return c.cachedLookup(ctx, "local:"+host, host, c.lookupLocal)
+}
+
+// cachedLookup serves key from the cache or runs lookup and stores the
+// result. lookup must return unmapped addresses.
+func (c *dnsCache) cachedLookup(ctx context.Context, key, host string, lookup func(context.Context, string) ([]netip.Addr, error)) ([]netip.Addr, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return []netip.Addr{ip.Unmap()}, nil
 	}
 
 	c.mu.Lock()
-	if entry, ok := c.cache[host]; ok && time.Now().Before(entry.expires) {
+	if entry, ok := c.cache[key]; ok && time.Now().Before(entry.expires) {
 		c.mu.Unlock()
 		return entry.addrs, nil
 	}
@@ -294,8 +308,7 @@ func (c *dnsCache) ResolveAll(ctx context.Context, host string) ([]netip.Addr, e
 	defer cancel()
 	c.lookups.Add(1)
 
-	// Both lookup sources return unmapped addresses.
-	addrs, err := c.lookup(ctx, host)
+	addrs, err := lookup(ctx, host)
 	if err != nil {
 		return nil, NewDNSError(host, err)
 	}
@@ -318,7 +331,7 @@ func (c *dnsCache) ResolveAll(ctx context.Context, host string) ([]netip.Addr, e
 			delete(c.cache, oldestKey)
 		}
 	}
-	c.cache[host] = cacheEntry{addrs: addrs, expires: time.Now().Add(c.ttl)}
+	c.cache[key] = cacheEntry{addrs: addrs, expires: time.Now().Add(c.ttl)}
 	c.mu.Unlock()
 	return addrs, nil
 }
@@ -340,17 +353,30 @@ func (c *dnsCache) lookup(ctx context.Context, host string) ([]netip.Addr, error
 		// warning is the only signal that resolution degraded to local DNS.
 		log.Warn().Str("host", host).Err(err).Msg("DoH lookup failed, falling back to the local resolver")
 	}
+	return c.lookupLocal(ctx, host)
+}
+
+// lookupLocal resolves host through the local resolver. Unlike lookup it
+// never touches DoH: a DoH NXDOMAIN is authoritative for tunnel destinations
+// but must not affect direct ones, whose names are often unknown to public
+// DNS.
+func (c *dnsCache) lookupLocal(ctx context.Context, host string) ([]netip.Addr, error) {
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, err
 	}
+	return toNetip(addrs), nil
+}
+
+// toNetip converts resolver results to unmapped netip addresses.
+func toNetip(addrs []net.IPAddr) []netip.Addr {
 	out := make([]netip.Addr, 0, len(addrs))
 	for _, a := range addrs {
 		if ip, ok := netip.AddrFromSlice(a.IP); ok {
 			out = append(out, ip.Unmap())
 		}
 	}
-	return out, nil
+	return out
 }
 
 // dohResponse is an RFC 8484 dns-json answer subset.
