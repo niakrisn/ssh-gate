@@ -5,7 +5,8 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "127.0.0.1:1080:1080"
+      # LAN access: bound to all host interfaces
+      - "1080:1080"
       # LAN access: bound to all host interfaces
       - "20443:20443"
       # LAN access: bound to all host interfaces
