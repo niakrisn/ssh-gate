@@ -23,7 +23,6 @@ type config struct {
 	dataDir            string
 	proxyModes         []string
 	socks5Addr         string
-	mtprotoAddr        string
 	httpAddr           string
 	directRules        string
 	directIPFamily     IPFamily
@@ -63,16 +62,8 @@ func main() {
 		log.Fatal().Err(err).Msg("ensure SSH key")
 	}
 
-	secret := ""
-	if contains(cfg.proxyModes, "mtproto") {
-		secret, err = EnsureMTProtoSecret(cfg.dataDir)
-		if err != nil {
-			log.Fatal().Err(err).Msg("ensure MTProto secret")
-		}
-	}
-
 	if _, err := os.Stat(filepath.Join(cfg.dataDir, firstRunDoneFile)); os.IsNotExist(err) {
-		printFirstRun(secret, pubKey, cfg)
+		printFirstRun(pubKey, cfg)
 		os.WriteFile(filepath.Join(cfg.dataDir, firstRunDoneFile), nil, 0644)
 	}
 
@@ -127,25 +118,13 @@ func main() {
 		servers = append(servers, server{Name: "HTTP", Shutdown: hp.Shutdown})
 	}
 
-	// Health/ready endpoint + Web UI. Starts before MTProto, whose DoH
-	// bootstrap can take up to a few seconds on a degraded tunnel: the
-	// healthcheck must not wait on it.
+	// Health/ready endpoint + Web UI.
 	hs, err := NewHealthServer(cfg.healthAddr, cfg.sshHost, cfg.sshPort, dialer, tracker)
 	if err != nil {
 		log.Fatal().Err(err).Msg("health server")
 	}
 	hs.Start()
 	servers = append(servers, server{Name: "health", Shutdown: hs.Shutdown})
-
-	if contains(cfg.proxyModes, "mtproto") {
-		dohIP := resolveDohIP(cfg.dohHost, dialer, defaultDohBootstrap)
-		mt, err := newMTProtoServer(cfg.mtprotoAddr, secret, dohIP, dialer.NetworkDialer())
-		if err != nil {
-			log.Fatal().Err(err).Msg("MTProto server")
-		}
-		mt.Start()
-		servers = append(servers, server{Name: "MTProto", Shutdown: mt.Shutdown})
-	}
 
 	// Graceful shutdown on SIGTERM/SIGINT
 	ctx, cancel := context.WithCancel(context.Background())
@@ -238,11 +217,6 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("invalid SOCKS5_LISTEN: %w", err)
 	}
 
-	mtprotoAddr := getEnv("MTPROTO_LISTEN", ":20443")
-	if err := validateHostPort(mtprotoAddr); err != nil {
-		return config{}, fmt.Errorf("invalid MTPROTO_LISTEN: %w", err)
-	}
-
 	httpAddr := getEnv("HTTP_LISTEN", ":3128")
 	if err := validateHostPort(httpAddr); err != nil {
 		return config{}, fmt.Errorf("invalid HTTP_LISTEN: %w", err)
@@ -287,7 +261,6 @@ func loadConfig() (config, error) {
 		dataDir:            dataDir,
 		proxyModes:         modes,
 		socks5Addr:         socks5Addr,
-		mtprotoAddr:        mtprotoAddr,
 		httpAddr:           httpAddr,
 		directRules:        getEnv("DIRECT_RULES", ""),
 		directIPFamily:     directIPFamily,
@@ -299,7 +272,7 @@ func loadConfig() (config, error) {
 }
 
 func parseModes(raw string) ([]string, error) {
-	valid := map[string]bool{"socks5": true, "mtproto": true, "http": true}
+	valid := map[string]bool{"socks5": true, "http": true}
 	var modes []string
 	for _, m := range strings.Split(raw, ",") {
 		m = strings.TrimSpace(strings.ToLower(m))
@@ -307,7 +280,7 @@ func parseModes(raw string) ([]string, error) {
 			continue
 		}
 		if !valid[m] {
-			return nil, fmt.Errorf("unknown proxy mode %q (valid: socks5, mtproto, http)", m)
+			return nil, fmt.Errorf("unknown proxy mode %q (valid: socks5, http)", m)
 		}
 		modes = append(modes, m)
 	}
@@ -375,11 +348,11 @@ func getEnvRequired(key string) (string, error) {
 	return v, nil
 }
 
-func printFirstRun(secret, pubKey string, cfg config) {
+func printFirstRun(pubKey string, cfg config) {
 	fmt.Println()
-	fmt.Println("=== mtproto-ssh first run ===")
+	fmt.Println("=== ssh-gate first run ===")
 	fmt.Println()
-	fmt.Println("1. Add to VPS ~/.ssh/authorized_keys:")
+	fmt.Println("Add to VPS ~/.ssh/authorized_keys:")
 	fmt.Println()
 	fmt.Printf("   command=\"echo 'tunnel only'\",no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc %s\n", pubKey)
 	fmt.Println()
@@ -398,18 +371,6 @@ func printFirstRun(secret, pubKey string, cfg config) {
 			port = "3128"
 		}
 		fmt.Printf("HTTP proxy:  localhost:%s\n", port)
-	}
-
-	if secret != "" {
-		_, port, _ := net.SplitHostPort(cfg.mtprotoAddr)
-		if port == "" {
-			port = "20443"
-		}
-		fmt.Println()
-		fmt.Println("2. Telegram proxy link:")
-		fmt.Printf("   tg://proxy?server=localhost&port=%s&secret=%s\n", port, secret)
-		fmt.Println()
-		fmt.Println("3. Or connect in Settings → Data and Storage → Proxy → Secret Chat (FakeTLS)")
 	}
 	fmt.Println()
 }

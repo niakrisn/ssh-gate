@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -78,6 +80,75 @@ func socks5Connect(t *testing.T, addr, name string, port int) byte {
 		t.Fatalf("connect reply: %v", err)
 	}
 	return reply[1]
+}
+
+type fakeDohRecord struct {
+	Type int    `json:"Type"`
+	Data string `json:"Data"`
+}
+
+// dohAnswer is one fake server response: a dns-json RCODE plus the record
+// lists returned on NOERROR.
+type dohAnswer struct {
+	status int // 0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN
+	a      []string
+	aaaa   []string
+}
+
+// startFakeDoHServer starts an in-process dns-json DoH server; reply picks
+// the answer per question (name and type A/AAAA).
+func startFakeDoHServer(t *testing.T, reply func(name, qtype string) dohAnswer) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
+		name, qtype := r.URL.Query().Get("name"), r.URL.Query().Get("type")
+		ans := reply(name, qtype)
+		var recs []fakeDohRecord
+		if ans.status == 0 {
+			if qtype == "AAAA" {
+				for _, s := range ans.aaaa {
+					recs = append(recs, fakeDohRecord{Type: 28, Data: s})
+				}
+			} else {
+				for _, s := range ans.a {
+					recs = append(recs, fakeDohRecord{Type: 1, Data: s})
+				}
+			}
+		}
+		body, err := json.Marshal(struct {
+			Status int             `json:"Status"`
+			Answer []fakeDohRecord `json:"Answer"`
+		}{Status: ans.status, Answer: recs})
+		if err != nil {
+			t.Errorf("marshal fake answer: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/dns-json")
+		w.Write(body)
+	})
+	srv := httptest.NewTLSServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// dohBootstrap names the DoH endpoint a test points the resolver at, plus
+// the TLS config that trusts the fake server's certificate.
+type dohBootstrap struct {
+	addr string
+	tls  *tls.Config
+}
+
+// setBootstrap returns the dialer and bootstrap that point at the fake
+// server: the testDialer redirects every tunnel dial to it, and the
+// bootstrap trusts its test CA.
+func setBootstrap(t *testing.T, srv *httptest.Server) (testDialer, dohBootstrap) {
+	t.Helper()
+	addr := srv.Listener.Addr().String()
+	return testDialer{Target: addr}, dohBootstrap{
+		addr: addr,
+		tls:  srv.Client().Transport.(*http.Transport).TLSClientConfig,
+	}
 }
 
 // TestSOCKS5ServerResolver: FQDN CONNECT requests are resolved through the

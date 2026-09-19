@@ -18,8 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/9seconds/mtg/v2/essentials"
-	"github.com/9seconds/mtg/v2/network"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/ssh"
 )
@@ -27,7 +25,6 @@ import (
 // dialer abstracts SSH tunnel dialing — allows mocking in tests.
 type dialer interface {
 	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
-	NetworkDialer() network.Dialer
 	Connected() bool
 	stop()
 }
@@ -52,25 +49,6 @@ type sshDialerCfg struct {
 	// the SSH tunnel). A blackholed destination keeps the open request
 	// pending on the VPS sshd side until this deadline cancels it.
 	dialTimeout time.Duration
-}
-
-// netConnToEssentials wraps net.Conn into essentials.Conn (adds CloseRead/CloseWrite).
-type netConnToEssentials struct {
-	net.Conn
-}
-
-func (n netConnToEssentials) CloseRead() error {
-	if cr, ok := n.Conn.(interface{ CloseRead() error }); ok {
-		return cr.CloseRead()
-	}
-	return nil
-}
-
-func (n netConnToEssentials) CloseWrite() error {
-	if cw, ok := n.Conn.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
-	}
-	return nil
 }
 
 func newSSHDialer(cfg sshDialerCfg) (*sshDialer, error) {
@@ -143,8 +121,9 @@ func (d *sshDialer) trackDial(ctx context.Context, network, addr string) (net.Co
 		host = meta.Host
 	}
 	if ok {
-		// SOCKS5 and HTTP resolve FQDNs client-side and MTProto dials IP
-		// literals, so the dial address is an IP whenever it parses as one.
+		// SOCKS5 and HTTP resolve FQDNs client-side, so the dial address is
+		// an IP whenever it parses as one; the original hostname arrives
+		// through meta.Host.
 		if ip, err := netip.ParseAddr(dialHost); err == nil {
 			meta.DstIP = ip.String()
 		}
@@ -202,31 +181,6 @@ func (d *sshDialer) TunnelTCPStats() *tcpStats {
 		return nil
 	}
 	return readTCPStats(rc)
-}
-
-// NetworkDialer returns a dialer compatible with mtg network.Dialer interface.
-func (d *sshDialer) NetworkDialer() network.Dialer {
-	return &networkDialerWrapper{d: d}
-}
-
-type networkDialerWrapper struct {
-	d *sshDialer
-}
-
-func (w *networkDialerWrapper) Dial(network_, addr string) (essentials.Conn, error) {
-	return w.DialContext(context.Background(), network_, addr)
-}
-
-// DialContext marks the dial as MTProto: src is unavailable (the mtg dial
-// does not pass the client address), host is the DC IP that trackDial takes
-// from addr.
-func (w *networkDialerWrapper) DialContext(ctx context.Context, network_, addr string) (essentials.Conn, error) {
-	ctx = ctxWithConnMeta(ctx, ConnMeta{Proto: "mtproto", Src: "-"})
-	conn, err := w.d.DialContext(ctx, network_, addr)
-	if err != nil {
-		return nil, err
-	}
-	return netConnToEssentials{conn}, nil
 }
 
 func (d *sshDialer) monitor() {

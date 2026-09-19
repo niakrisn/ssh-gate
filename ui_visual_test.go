@@ -27,8 +27,6 @@ func TestManualWebUIVisualHold(t *testing.T) {
 		proto string
 		err   string
 	}{
-		{"telegram.org", "mtproto", ""},
-		{"149.154.175.50", "mtproto", ""},
 		{"pypi.org", "socks5", "dial tcp: connection refused"},
 		{"internal.corp", "http", ""},
 		{"mail.example.com", "http", "read: connection reset by peer"},

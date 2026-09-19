@@ -319,9 +319,6 @@ func TestConnTrackerProtoFilter(t *testing.T) {
 	if _, total, _ := tr.List("history", "", "http", 1, 50); total != 1 {
 		t.Fatalf("http: total=%d, want 1", total)
 	}
-	if _, total, _ := tr.List("history", "", "mtproto", 1, 50); total != 0 {
-		t.Fatalf("mtproto: total=%d, want 0", total)
-	}
 }
 
 func TestConnTrackerListValidation(t *testing.T) {

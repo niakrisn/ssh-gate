@@ -82,6 +82,7 @@ func TestParseDialTimeout(t *testing.T) {
 // rejected (TLS is validated against the hostname, and DoH provider certs
 // carry no IP SANs).
 func TestLoadConfigDohHost(t *testing.T) {
+	t.Setenv("PROXY_MODES", "socks5")
 	for _, v := range []string{"", "cloudflare-dns.com", "dns.google:443"} {
 		t.Setenv("SSH_HOST", "h")
 		t.Setenv("SSH_USER", "u")
@@ -110,6 +111,7 @@ func TestLoadConfigDohHost(t *testing.T) {
 // connection-history window — dropStalled moves dialing records out of the
 // active map once they outlive it, so a longer dial could lose its record.
 func TestLoadConfigDialTimeoutCap(t *testing.T) {
+	t.Setenv("PROXY_MODES", "socks5")
 	t.Setenv("SSH_HOST", "h")
 	t.Setenv("SSH_USER", "u")
 	t.Setenv("SSH_DIAL_TIMEOUT", "11m")

@@ -1,13 +1,12 @@
 # ssh-gate
 
-SOCKS5/HTTP/MTProto proxy over SSH tunnel with rule-based routing.
+SOCKS5/HTTP proxy over SSH tunnel with rule-based routing.
 
 ## Architecture
 
 ```
 Client → localhost:1080 → SOCKS5 → SSH tunnel → VPS → Internet
 Client → localhost:3128 → HTTP   → SSH tunnel → VPS → Internet
-Client → localhost:20443 → MTProto → SSH tunnel → VPS → Telegram DC
 
 Direct route:
 Client → localhost:1080 → SOCKS5 → (DIRECT_RULES) → Internet
@@ -28,9 +27,6 @@ docker compose logs
 
 # 4. Copy the SSH public key to VPS ~/.ssh/authorized_keys:
 #    command="echo 'tunnel only'",no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 AAAA...
-
-# 5. If MTProto is enabled, paste the `tg://proxy` link into Telegram to activate the proxy,
-#    or enter the server (localhost) and secret manually in Settings → Data and Storage → Proxy
 ```
 
 ## Configuration
@@ -41,13 +37,12 @@ docker compose logs
 | `SSH_PORT` | no | `22` | SSH port |
 | `SSH_USER` | yes | — | SSH username |
 | `SSH_DIAL_TIMEOUT` | no | `30s` | Max duration of a single destination dial through the tunnel (Go duration, must be positive and below 10m — the connection history window). A dial to a blackholed host fails with a deadline error instead of hanging |
-| `PROXY_MODES` | no | `socks5` | Comma-separated: `socks5`, `mtproto`, `http` |
+| `PROXY_MODES` | no | `socks5` | Comma-separated: `socks5`, `http` |
 | `SOCKS5_LISTEN` | no | `:1080` | SOCKS5 listen address |
 | `HTTP_LISTEN` | no | `:3128` | HTTP proxy listen address (CONNECT + absolute-form requests) |
-| `MTPROTO_LISTEN` | no | `:20443` | MTProto listen address |
 | `DIRECT_RULES` | no | — | Comma-separated rules for direct connections (see below) |
 | `DIRECT_IP_FAMILY` | no | `both` | Address families for direct: `ipv4`, `ipv6`, `both` |
-| `DOH_HOST` | no | `cloudflare-dns.com` | DNS-over-HTTPS endpoint for tunnel destinations, queried through the SSH tunnel; direct destinations keep local DNS. The MTProto proxy resolves this endpoint's IP through the tunnel too (bootstrap DoH via 1.1.1.1, so local DNS poisoning cannot affect it) and uses it for the hourly DC config fetch; if the endpoint lacks IP SANs or is unreachable it falls back to 1.1.1.1. Empty disables |
+| `DOH_HOST` | no | `cloudflare-dns.com` | DNS-over-HTTPS endpoint for tunnel destinations, queried through the SSH tunnel; direct destinations keep local DNS. Definitive DoH answers, including NXDOMAIN, are authoritative; the local resolver is a fallback only while the endpoint is unreachable. Empty disables |
 | `HEALTH_LISTEN` | no | `127.0.0.1:9090` | Health + Web UI listen address (compose sets `0.0.0.0:9090` inside the container and maps it to `127.0.0.1:9090` on the host) |
 | `LOG_LEVEL` | no | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 | `DATA_DIR` | no | `/data` | Directory for keys and secrets |
@@ -78,7 +73,6 @@ API: `GET /api/connections?tab=active|history&q=<substring>&page=<n>&page_size=<
 The `./data` directory (mounted as `/data`) stores:
 
 - `ssh_key` / `ssh_key.pub` — ed25519 keypair (generated on first run)
-- `mtproto_secret` — FakeTLS secret (generated on first run)
 - `ssh_known_hosts` — SSH host key fingerprint (saved on first connection)
 
 ## SSH authorized_keys
@@ -91,7 +85,7 @@ command="echo 'tunnel only'",no-pty,no-agent-forwarding,no-X11-forwarding,no-use
 
 ### Network exposure
 
-The default `docker-compose.yml` binds the HTTP proxy (3128) and MTProto (20443) to all host interfaces for LAN access, without authentication. Keep the host in a trusted network; if LAN access is not needed, bind the ports to `127.0.0.1` instead.
+The default `docker-compose.yml` binds the SOCKS5 proxy (1080) and the HTTP proxy (3128) to all host interfaces for LAN access, without authentication. Keep the host in a trusted network; if LAN access is not needed, bind the ports to `127.0.0.1` instead.
 
 ### Security note: permitopen=
 

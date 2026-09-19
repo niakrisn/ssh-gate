@@ -163,7 +163,7 @@ func (t *ConnTracker) ActiveByProto() map[string]int {
 // List returns a page of connections: "active" (live) or "history"
 // (ring buffer) tab. q is a case-insensitive substring filter on host,
 // dialed IP and source address; proto is an exact protocol filter
-// (socks5, http, mtproto); empty values disable the filters.
+// (socks5, http); empty values disable the filters.
 func (t *ConnTracker) List(tab, q, proto string, page, pageSize int) ([]ConnView, int, error) {
 	if tab != "active" && tab != "history" {
 		return nil, 0, fmt.Errorf("invalid tab %q (active|history)", tab)
@@ -359,8 +359,7 @@ func (c *trackedConn) Close() error {
 	return err
 }
 
-// CloseRead forwards to the base conn if it supports half-close;
-// netConnToEssentials (dialer.go) relies on these methods for MTProto.
+// CloseRead forwards to the base conn if it supports half-close.
 func (c *trackedConn) CloseRead() error {
 	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
 		return cr.CloseRead()
@@ -368,7 +367,8 @@ func (c *trackedConn) CloseRead() error {
 	return nil
 }
 
-// CloseWrite forwards to the base conn if it supports half-close.
+// CloseWrite forwards to the base conn if it supports half-close; go-socks5
+// calls it on the dialed conn after the client->target copy completes.
 func (c *trackedConn) CloseWrite() error {
 	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()

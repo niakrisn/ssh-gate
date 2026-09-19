@@ -9,16 +9,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
-	"github.com/9seconds/mtg/v2/mtglib"
 	"golang.org/x/crypto/ssh"
 )
 
 const (
 	sshKeyFile       = "ssh_key"
-	mtprotoSecretFile = "mtproto_secret"
-	firstRunDoneFile  = ".first_run_done"
+	firstRunDoneFile = ".first_run_done"
 )
 
 // EnsureSSHKeyPair returns SSH public key string.
@@ -76,21 +73,4 @@ func formatPublicKey(key ssh.PublicKey) string {
 	encoder.Close()
 	buf.WriteString(" mtproto-ssh")
 	return buf.String()
-}
-
-func EnsureMTProtoSecret(dataDir string) (string, error) {
-	secretPath := filepath.Join(dataDir, mtprotoSecretFile)
-
-	if data, err := os.ReadFile(secretPath); err == nil {
-		return strings.TrimSpace(string(data)), nil
-	}
-
-	s := mtglib.GenerateSecret("www.youtube.com")
-	secretHex := s.Hex()
-
-	if err := os.WriteFile(secretPath, []byte(secretHex), 0600); err != nil {
-		return "", fmt.Errorf("write mtproto secret: %w", err)
-	}
-
-	return secretHex, nil
 }

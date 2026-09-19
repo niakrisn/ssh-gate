@@ -276,32 +276,6 @@ func TestSSHDialerDialTimeoutSurvivingConn(t *testing.T) {
 	}
 }
 
-func TestNetworkDialerWrapperMeta(t *testing.T) {
-	tr := NewConnTracker(8, time.Minute)
-	d := &sshDialer{cfg: sshDialerCfg{tracker: tr}}
-	w := d.NetworkDialer()
-
-	if _, err := w.DialContext(context.Background(), "tcp", "149.154.175.50:443"); err == nil {
-		t.Fatal("want dial error (no SSH client)")
-	}
-	if _, err := w.Dial("tcp", "149.154.165.22:443"); err == nil {
-		t.Fatal("want dial error (no SSH client)")
-	}
-
-	hist, total, err := tr.List("history", "", "", 1, 50)
-	if err != nil || total != 2 {
-		t.Fatalf("history total=%d err=%v", total, err)
-	}
-	for _, v := range hist {
-		if v.Proto != "mtproto" || v.Src != "-" {
-			t.Fatalf("record: %+v", v)
-		}
-		if v.Port != 443 || (v.Host != "149.154.175.50" && v.Host != "149.154.165.22") {
-			t.Fatalf("record: %+v", v)
-		}
-	}
-}
-
 // TestTunnelTCPStatsAbsent: without a tunnel connection the stats must be
 // nil, not a zero-value struct (the status API reports "tcp": null).
 func TestTunnelTCPStatsAbsent(t *testing.T) {

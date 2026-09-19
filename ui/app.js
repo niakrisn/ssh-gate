@@ -12,7 +12,7 @@ const STATUS_LABEL = {
   error: 'Ошибка',
 };
 
-const PROTO_LABEL = { socks5: 'SOCKS5', http: 'HTTP', mtproto: 'MTProto' };
+const PROTO_LABEL = { socks5: 'SOCKS5', http: 'HTTP' };
 
 const state = { tab: 'active', page: 1, q: '', proto: '' };
 

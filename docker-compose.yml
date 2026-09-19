@@ -8,8 +8,6 @@ services:
       # LAN access: bound to all host interfaces
       - "1080:1080"
       # LAN access: bound to all host interfaces
-      - "20443:20443"
-      # LAN access: bound to all host interfaces
       - "3128:3128"
       # Web UI + health: host loopback only
       - "127.0.0.1:9090:9090"
@@ -23,9 +21,8 @@ services:
       SSH_HOST: "${SSH_HOST}"
       SSH_PORT: "${SSH_PORT:-22}"
       SSH_USER: "${SSH_USER}"
-      PROXY_MODES: "${PROXY_MODES:-socks5,mtproto}"
+      PROXY_MODES: "${PROXY_MODES:-socks5}"
       SOCKS5_LISTEN: "${SOCKS5_LISTEN:-0.0.0.0:1080}"
-      MTPROTO_LISTEN: "${MTPROTO_LISTEN:-0.0.0.0:20443}"
       HTTP_LISTEN: "${HTTP_LISTEN:-0.0.0.0:3128}"
       DIRECT_RULES: "${DIRECT_RULES}"
       DIRECT_IP_FAMILY: "${DIRECT_IP_FAMILY:-ipv4}"

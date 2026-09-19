@@ -13,8 +13,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/9seconds/mtg/v2/network"
 )
 
 // testDialer dials Target (usually a local server); when Target is empty it
@@ -36,9 +34,8 @@ func (td testDialer) DialContext(ctx context.Context, network, addr string) (net
 	return d.DialContext(ctx, network, addr)
 }
 
-func (testDialer) NetworkDialer() network.Dialer { return nil }
-func (testDialer) Connected() bool               { return true }
-func (testDialer) stop()                         {}
+func (testDialer) Connected() bool { return true }
+func (testDialer) stop()           {}
 
 // testDialer implements tcpStatsProvider with fixed values so /api/status
 // can be asserted without a real tunnel connection.
@@ -540,9 +537,8 @@ func (d *captureMetaDialer) DialContext(ctx context.Context, network, addr strin
 	return nil, errors.New("dial blocked")
 }
 
-func (d *captureMetaDialer) NetworkDialer() network.Dialer { return nil }
-func (d *captureMetaDialer) Connected() bool               { return true }
-func (d *captureMetaDialer) stop()                         {}
+func (d *captureMetaDialer) Connected() bool { return true }
+func (d *captureMetaDialer) stop()           {}
 
 // TestHTTPProxyConnMeta checks that openUpstream attaches
 // ConnMeta{http, src, host} to the SSH dial context.
