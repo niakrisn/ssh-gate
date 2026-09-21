@@ -41,6 +41,76 @@ func TestParseKeepalivePeriod(t *testing.T) {
 	}
 }
 
+// TestParseKeepaliveInterval covers the semantics of SSH_KEEPALIVE_INTERVAL:
+// durations become whole seconds for TCP_KEEPINTVL, sub-second values round
+// up to 1 s; empty/0 keep the kernel default (0); negative or unparseable
+// values are hard errors.
+func TestParseKeepaliveInterval(t *testing.T) {
+	valid := map[string]struct {
+		want    int
+		wantErr bool
+	}{
+		"1s":     {want: 1},
+		"10s":    {want: 10},
+		"90s":    {want: 90},
+		"1m":     {want: 60},
+		"1500ms": {want: 1},
+		"0s":     {want: 0},
+		"":       {want: 0},
+		"-1s":    {wantErr: true},
+		"abc":    {wantErr: true},
+	}
+	for raw, want := range valid {
+		got, err := parseKeepaliveInterval(raw)
+		if want.wantErr {
+			if err == nil {
+				t.Errorf("parseKeepaliveInterval(%q): expected error, got nil", raw)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseKeepaliveInterval(%q): unexpected error: %v", raw, err)
+			continue
+		}
+		if got != want.want {
+			t.Errorf("parseKeepaliveInterval(%q) = %d, want %d", raw, got, want.want)
+		}
+	}
+}
+
+// TestParseKeepaliveProbes covers the semantics of SSH_KEEPALIVE_PROBES:
+// non-negative integers pass through; empty/0 keep the kernel default (0);
+// negative or non-integer values are hard errors.
+func TestParseKeepaliveProbes(t *testing.T) {
+	valid := map[string]struct {
+		want    int
+		wantErr bool
+	}{
+		"5":   {want: 5},
+		"9":   {want: 9},
+		"0":   {want: 0},
+		"":    {want: 0},
+		"-1":  {wantErr: true},
+		"abc": {wantErr: true},
+	}
+	for raw, want := range valid {
+		got, err := parseKeepaliveProbes(raw)
+		if want.wantErr {
+			if err == nil {
+				t.Errorf("parseKeepaliveProbes(%q): expected error, got nil", raw)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseKeepaliveProbes(%q): unexpected error: %v", raw, err)
+			continue
+		}
+		if got != want.want {
+			t.Errorf("parseKeepaliveProbes(%q) = %d, want %d", raw, got, want.want)
+		}
+	}
+}
+
 // TestParseDialTimeout covers the semantics of SSH_DIAL_TIMEOUT: valid Go
 // durations pass through; zero/negative/unparseable values are hard errors
 // because an unbounded destination dial can hang forever on a blackholed host.

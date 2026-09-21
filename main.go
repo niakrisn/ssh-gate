@@ -17,19 +17,21 @@ import (
 )
 
 type config struct {
-	sshHost            string
-	sshPort            int
-	sshUser            string
-	dataDir            string
-	proxyModes         []string
-	socks5Addr         string
-	httpAddr           string
-	directRules        string
-	directIPFamily     IPFamily
-	dohHost            string
-	healthAddr         string
-	sshKeepalivePeriod time.Duration
-	dialTimeout        time.Duration
+	sshHost              string
+	sshPort              int
+	sshUser              string
+	dataDir              string
+	proxyModes           []string
+	socks5Addr           string
+	httpAddr             string
+	directRules          string
+	directIPFamily       IPFamily
+	dohHost              string
+	healthAddr           string
+	sshKeepalivePeriod   time.Duration
+	sshKeepaliveInterval int
+	sshKeepaliveProbes   int
+	dialTimeout          time.Duration
 }
 
 type server struct {
@@ -71,13 +73,15 @@ func main() {
 	tracker := NewConnTracker(1000, connHistoryMaxAge)
 
 	dialer, err := newSSHDialer(sshDialerCfg{
-		host:            cfg.sshHost,
-		port:            cfg.sshPort,
-		user:            cfg.sshUser,
-		keyPath:         filepath.Join(cfg.dataDir, sshKeyFile),
-		keepalivePeriod: cfg.sshKeepalivePeriod,
-		tracker:         tracker,
-		dialTimeout:     cfg.dialTimeout,
+		host:              cfg.sshHost,
+		port:              cfg.sshPort,
+		user:              cfg.sshUser,
+		keyPath:           filepath.Join(cfg.dataDir, sshKeyFile),
+		keepalivePeriod:   cfg.sshKeepalivePeriod,
+		keepaliveInterval: cfg.sshKeepaliveInterval,
+		keepaliveProbes:   cfg.sshKeepaliveProbes,
+		tracker:           tracker,
+		dialTimeout:       cfg.dialTimeout,
 	})
 	if err != nil {
 		log.Fatal().Err(err).Msg("SSH dialer")
@@ -197,9 +201,21 @@ func loadConfig() (config, error) {
 	}
 
 	// Validate SSH_KEEPALIVE_PERIOD
-	sshKeepalivePeriod, err := parseKeepalivePeriod(getEnv("SSH_KEEPALIVE_PERIOD", "90s"))
+	sshKeepalivePeriod, err := parseKeepalivePeriod(getEnv("SSH_KEEPALIVE_PERIOD", "10s"))
 	if err != nil {
 		return config{}, fmt.Errorf("invalid SSH_KEEPALIVE_PERIOD: %w", err)
+	}
+
+	// Validate SSH_KEEPALIVE_INTERVAL
+	sshKeepaliveInterval, err := parseKeepaliveInterval(getEnv("SSH_KEEPALIVE_INTERVAL", "1s"))
+	if err != nil {
+		return config{}, fmt.Errorf("invalid SSH_KEEPALIVE_INTERVAL: %w", err)
+	}
+
+	// Validate SSH_KEEPALIVE_PROBES
+	sshKeepaliveProbes, err := parseKeepaliveProbes(getEnv("SSH_KEEPALIVE_PROBES", "5"))
+	if err != nil {
+		return config{}, fmt.Errorf("invalid SSH_KEEPALIVE_PROBES: %w", err)
 	}
 
 	// Validate SSH_DIAL_TIMEOUT
@@ -255,19 +271,21 @@ func loadConfig() (config, error) {
 	}
 
 	return config{
-		sshHost:            sshHost,
-		sshPort:            port,
-		sshUser:            sshUser,
-		dataDir:            dataDir,
-		proxyModes:         modes,
-		socks5Addr:         socks5Addr,
-		httpAddr:           httpAddr,
-		directRules:        getEnv("DIRECT_RULES", ""),
-		directIPFamily:     directIPFamily,
-		dohHost:            dohHost,
-		healthAddr:         healthAddr,
-		sshKeepalivePeriod: sshKeepalivePeriod,
-		dialTimeout:        dialTimeout,
+		sshHost:              sshHost,
+		sshPort:              port,
+		sshUser:              sshUser,
+		dataDir:              dataDir,
+		proxyModes:           modes,
+		socks5Addr:           socks5Addr,
+		httpAddr:             httpAddr,
+		directRules:          getEnv("DIRECT_RULES", ""),
+		directIPFamily:       directIPFamily,
+		dohHost:              dohHost,
+		healthAddr:           healthAddr,
+		sshKeepalivePeriod:   sshKeepalivePeriod,
+		sshKeepaliveInterval: sshKeepaliveInterval,
+		sshKeepaliveProbes:   sshKeepaliveProbes,
+		dialTimeout:          dialTimeout,
 	}, nil
 }
 
@@ -324,6 +342,46 @@ func parseKeepalivePeriod(raw string) (time.Duration, error) {
 		return 0, nil
 	}
 	return d, nil
+}
+
+// parseKeepaliveInterval parses SSH_KEEPALIVE_INTERVAL as a Go duration and
+// returns whole seconds for TCP_KEEPINTVL. Empty or zero keeps the kernel
+// default (returned as 0); sub-second values round up to 1 s.
+func parseKeepaliveInterval(raw string) (int, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid SSH_KEEPALIVE_INTERVAL %q (Go duration, e.g. 1s): %w", raw, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("SSH_KEEPALIVE_INTERVAL must be non-negative, got %s", raw)
+	}
+	if d == 0 {
+		return 0, nil
+	}
+	s := int(d / time.Second)
+	if s < 1 {
+		s = 1
+	}
+	return s, nil
+}
+
+// parseKeepaliveProbes parses SSH_KEEPALIVE_PROBES as an integer for
+// TCP_KEEPCNT. Empty or zero keeps the kernel default (returned as 0).
+func parseKeepaliveProbes(raw string) (int, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid SSH_KEEPALIVE_PROBES %q (integer, e.g. 5): %w", raw, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("SSH_KEEPALIVE_PROBES must be non-negative, got %d", n)
+	}
+	return n, nil
 }
 
 // parseDialTimeout parses SSH_DIAL_TIMEOUT as a Go duration.

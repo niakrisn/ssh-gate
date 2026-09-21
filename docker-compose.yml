@@ -29,7 +29,9 @@ services:
       DOH_HOST: "${DOH_HOST:-cloudflare-dns.com}"
       HEALTH_LISTEN: "${HEALTH_LISTEN:-0.0.0.0:9090}"
       LOG_LEVEL: "${LOG_LEVEL:-warn}"
-      SSH_KEEPALIVE_PERIOD: "${SSH_KEEPALIVE_PERIOD:-90s}"
+      SSH_KEEPALIVE_PERIOD: "${SSH_KEEPALIVE_PERIOD:-10s}"
+      SSH_KEEPALIVE_INTERVAL: "${SSH_KEEPALIVE_INTERVAL:-1s}"
+      SSH_KEEPALIVE_PROBES: "${SSH_KEEPALIVE_PROBES:-5}"
       SSH_DIAL_TIMEOUT: "${SSH_DIAL_TIMEOUT:-30s}"
     security_opt:
       - no-new-privileges:true

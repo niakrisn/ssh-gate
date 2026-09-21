@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/sys/unix"
 )
 
 // startTestSSHServer starts an in-process SSH server. It accepts any
@@ -334,6 +335,82 @@ func TestConnectSSHCapturesRawConn(t *testing.T) {
 	}
 	if raw == nil {
 		t.Fatal("RawConn nil, want the captured tunnel fd handle")
+	}
+}
+
+// TestConnectSSHKeepaliveProbeOpts: connectSSH must apply the configured
+// keepalive retransmission parameters to the tunnel socket — Go's net
+// package exposes only the idle period, so a regression here would silently
+// fall back to the kernel's 75 s / 9 probes.
+func TestConnectSSHKeepaliveProbeOpts(t *testing.T) {
+	addr, _ := startTestSSHServer(t, false)
+
+	_, clientPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("client key: %v", err)
+	}
+	keyBlock, err := ssh.MarshalPrivateKey(clientPriv, "test")
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "id_ed25519")
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(keyBlock), 0600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("port: %v", err)
+	}
+
+	client, _, raw, err := connectSSH(sshDialerCfg{
+		host:              host,
+		port:              port,
+		user:              "test",
+		keyPath:           keyPath,
+		keepalivePeriod:   10 * time.Second,
+		keepaliveInterval: 1,
+		keepaliveProbes:   5,
+	})
+	if err != nil {
+		t.Fatalf("connectSSH: %v", err)
+	}
+	defer client.Close()
+
+	if raw == nil {
+		t.Fatal("RawConn nil, want the captured tunnel fd handle")
+	}
+	var interval, probes int
+	var getErr error
+	err = raw.Control(func(fd uintptr) {
+		i, e := unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_KEEPINTVL)
+		if e != nil {
+			getErr = e
+			return
+		}
+		interval = i
+		p, e := unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_KEEPCNT)
+		if e != nil {
+			getErr = e
+			return
+		}
+		probes = p
+	})
+	if err != nil || getErr != nil {
+		t.Fatalf("read back keepalive options: %v %v", err, getErr)
+	}
+	// The raw option value uses the platform unit (seconds on Linux,
+	// milliseconds on macOS); convert to seconds before comparing.
+	if got := time.Duration(interval) * keepaliveIntervalUnit(); got != time.Second {
+		t.Errorf("TCP_KEEPINTVL = %v, want 1s", got)
+	}
+	if probes != 5 {
+		t.Errorf("TCP_KEEPCNT = %d, want 5", probes)
 	}
 }
 

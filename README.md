@@ -37,6 +37,9 @@ docker compose logs
 | `SSH_PORT` | no | `22` | SSH port |
 | `SSH_USER` | yes | — | SSH username |
 | `SSH_DIAL_TIMEOUT` | no | `30s` | Max duration of a single destination dial through the tunnel (Go duration, must be positive and below 10m — the connection history window). A dial to a blackholed host fails with a deadline error instead of hanging |
+| `SSH_KEEPALIVE_PERIOD` | no | `10s` | OS TCP keepalive idle period for the SSH tunnel connection (Go duration); detects silent (half-open) dead paths. `0` disables |
+| `SSH_KEEPALIVE_INTERVAL` | no | `1s` | Keepalive probe retransmission interval (Go duration, rounded to whole seconds). `0` keeps the kernel default |
+| `SSH_KEEPALIVE_PROBES` | no | `5` | Unanswered keepalive probes before the connection is declared dead. `0` keeps the kernel default. Worst-case silent-death detection = `PERIOD + INTERVAL x PROBES` (defaults: 15 s) |
 | `PROXY_MODES` | no | `socks5` | Comma-separated: `socks5`, `http` |
 | `SOCKS5_LISTEN` | no | `:1080` | SOCKS5 listen address |
 | `HTTP_LISTEN` | no | `:3128` | HTTP proxy listen address (CONNECT + absolute-form requests) |

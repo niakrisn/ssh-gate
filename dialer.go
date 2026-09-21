@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/sys/unix"
 )
 
 // dialer abstracts SSH tunnel dialing — allows mocking in tests.
@@ -44,7 +46,12 @@ type sshDialerCfg struct {
 	keyPath         string
 	fingerprint     string
 	keepalivePeriod time.Duration
-	tracker         *ConnTracker
+	// keepaliveInterval / keepaliveProbes set TCP_KEEPINTVL / TCP_KEEPCNT
+	// (whole seconds) — Go does not expose them; 0 keeps the kernel
+	// defaults.
+	keepaliveInterval int
+	keepaliveProbes   int
+	tracker           *ConnTracker
 	// dialTimeout bounds a single destination dial (channel open through
 	// the SSH tunnel). A blackholed destination keeps the open request
 	// pending on the VPS sshd side until this deadline cancels it.
@@ -314,6 +321,9 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) 
 		if cfg.keepalivePeriod > 0 {
 			_ = tc.SetKeepAlive(true)
 			_ = tc.SetKeepAlivePeriod(cfg.keepalivePeriod)
+			if err := setKeepaliveProbeOpts(raw, cfg.keepaliveInterval, cfg.keepaliveProbes); err != nil {
+				log.Warn().Err(err).Msg("set TCP keepalive probe parameters")
+			}
 		} else {
 			_ = tc.SetKeepAlive(false)
 		}
@@ -338,6 +348,45 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) 
 	}
 
 	return client, "", raw, nil
+}
+
+// keepaliveIntervalUnit is the unit of the TCP_KEEPINTVL socket option
+// value: seconds on Linux, milliseconds on macOS.
+func keepaliveIntervalUnit() time.Duration {
+	if runtime.GOOS == "darwin" {
+		return time.Millisecond
+	}
+	return time.Second
+}
+
+// setKeepaliveProbeOpts sets the keepalive retransmission parameters
+// (TCP_KEEPINTVL / TCP_KEEPCNT) that Go's net package does not expose.
+// The kernel defaults (75 s / 9 probes) extend silent-death detection to
+// tens of minutes; a zero argument leaves that parameter at the kernel
+// default. intervalSecs is in seconds; the platform unit of TCP_KEEPINTVL
+// is applied internally (it takes milliseconds on macOS).
+func setKeepaliveProbeOpts(raw syscall.RawConn, intervalSecs, probes int) error {
+	if intervalSecs == 0 && probes == 0 {
+		return nil
+	}
+	var firstErr error
+	setErr := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if err := raw.Control(func(fd uintptr) {
+		if intervalSecs > 0 {
+			value := int(time.Duration(intervalSecs) * time.Second / keepaliveIntervalUnit())
+			setErr(unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, value))
+		}
+		if probes > 0 {
+			setErr(unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_KEEPCNT, probes))
+		}
+	}); err != nil {
+		return err
+	}
+	return firstErr
 }
 
 func sshFingerprint(key ssh.PublicKey) string {
