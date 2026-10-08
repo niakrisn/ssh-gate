@@ -1,0 +1,43 @@
+[Unit]
+Description=ssh-gate SSH tunnel with SOCKS5 and HTTP proxy
+Documentation=https://github.com/niakrisn/ssh-gate
+Wants=network-online.target
+After=network-online.target
+# No start rate limit: the app exits only on missing/invalid SSH_HOST,
+# SSH_PORT or SSH_USER (it retries unreachable VPS links on its own), and
+# each restart re-reads EnvironmentFile, so the unit recovers by itself
+# once the config is filled in.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh-gate
+# Declared before EnvironmentFile so that /etc/default/ssh-gate wins if the
+# user sets DATA_DIR there.
+Environment=DATA_DIR=/var/lib/ssh-gate
+EnvironmentFile=-/etc/default/ssh-gate
+DynamicUser=yes
+StateDirectory=ssh-gate
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+DevicePolicy=closed
+UMask=0077
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target

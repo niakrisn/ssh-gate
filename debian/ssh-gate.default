@@ -1,0 +1,51 @@
+# ssh-gate configuration, read by systemd through EnvironmentFile.
+#
+# This file is NOT a shell script: only KEY=value lines, no "export", no
+# command substitution. Apply changes with: systemctl restart ssh-gate
+
+# VPS access. Required: the service refuses to start while SSH_HOST or
+# SSH_USER is empty.
+SSH_HOST=
+SSH_PORT=22
+SSH_USER=
+
+# Max duration of a single destination dial through the tunnel (Go duration,
+# must be positive and below 10m - the connection history window). A dial to
+# a blackholed host fails with a deadline error instead of hanging.
+SSH_DIAL_TIMEOUT=30s
+
+# Proxy modes: socks5, http (comma-separated)
+PROXY_MODES=socks5
+
+# Listen addresses. Loopback by default; set 0.0.0.0 to serve the whole
+# network. The Web UI and /healthz are served on HEALTH_LISTEN.
+SOCKS5_LISTEN=127.0.0.1:1080
+HTTP_LISTEN=127.0.0.1:3128
+HEALTH_LISTEN=127.0.0.1:9090
+
+# Directory for the generated SSH key pair and known_hosts. The unit already
+# sets it to /var/lib/ssh-gate, which systemd creates and owns; uncomment only
+# to point somewhere else, and make sure the service can write there.
+#DATA_DIR=/var/lib/ssh-gate
+
+# Direct routing rules (optional, comma-separated). Example:
+# DIRECT_RULES=ip:10.0.0.0/8,internal.local
+DIRECT_RULES=
+
+# Direct dial IP family: ipv4, ipv6, both
+DIRECT_IP_FAMILY=ipv4
+
+# DNS-over-HTTPS endpoint for tunnel destinations, queried through the SSH
+# tunnel (direct destinations keep using local DNS). Empty disables DoH.
+# Hostname only, port 443 only.
+DOH_HOST=cloudflare-dns.com
+
+# Log level: debug, info, warn, error
+LOG_LEVEL=warn
+
+# TCP keepalive for the SSH tunnel (Go duration). 0 disables OS keepalive.
+# Worst-case dead-path detection = SSH_KEEPALIVE_PERIOD +
+# SSH_KEEPALIVE_INTERVAL x SSH_KEEPALIVE_PROBES.
+SSH_KEEPALIVE_PERIOD=10s
+SSH_KEEPALIVE_INTERVAL=1s
+SSH_KEEPALIVE_PROBES=5

@@ -1,0 +1,19 @@
+#!/bin/sh
+# Without this file nothing stops the daemon: debhelper only generates stop
+# snippets for the actions it performs itself, and the start side is disabled in
+# debian/rules. Stopping before the files are replaced also makes the postinst
+# restart reliable, because the unit is always inactive when the new binary
+# lands.
+set -e
+
+#DEBHELPER#
+
+case "$1" in
+	remove | upgrade | deconfigure)
+		if [ -d /run/systemd/system ]; then
+			deb-systemd-invoke stop ssh-gate.service >/dev/null || true
+		fi
+		;;
+esac
+
+exit 0

@@ -1,0 +1,25 @@
+Source: ssh-gate
+Section: net
+Priority: optional
+Maintainer: Nikita Kozlov <niakrisn@gmail.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/niakrisn/ssh-gate
+Vcs-Git: https://github.com/niakrisn/ssh-gate.git
+Vcs-Browser: https://github.com/niakrisn/ssh-gate
+# The Go toolchain is intentionally not a Build-Depends: Debian 12 and Ubuntu
+# 22.04 ship a Go older than the "go" directive in go.mod requires, so the
+# builder must provide its own (see debian/rules and packaging/build-debs.sh).
+
+Package: ssh-gate
+Architecture: any
+# No ${shlibs:Depends}: the binary is linked with CGO_ENABLED=0 and has no
+# shared library dependencies. init-system-helpers is Essential, so the
+# deb-systemd-helper calls in the generated snippets need no dependency either.
+Depends: ${misc:Depends}, ca-certificates
+Description: SSH tunnel with SOCKS5 and HTTP proxy
+ ssh-gate opens a single SSH connection to a gateway host and exposes local
+ SOCKS5 and HTTP proxies over it. Per-destination direct routing rules decide
+ which traffic bypasses the tunnel, and hostname resolution for tunnelled
+ destinations goes through DNS-over-HTTPS queried over the same connection.

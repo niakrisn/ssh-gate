@@ -1,0 +1,7 @@
+ssh-gate (0.1.1-1) unstable; urgency=medium
+
+  * Self-heal dead SSH links, correct routing, bounded shutdown.
+  * Ship the config as /etc/default/ssh-gate and migrate the old
+    /etc/defaults/ssh-gate on upgrade.
+
+ -- Nikita Kozlov <niakrisn@gmail.com>  Thu, 08 Oct 2026 11:47:39 +0300

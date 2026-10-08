@@ -1,0 +1,55 @@
+#!/usr/bin/make -f
+# Build the package the way the distribution does: dpkg-buildpackage drives dh
+# (debhelper), which installs the unit file, the /etc/default config and the
+# systemd maintainer snippets.
+#
+# Only the compile step is overridden. It uses the Go toolchain from the build
+# environment because the golang packages in the target distributions are older
+# than the "go" directive in go.mod. Override with make -e GO=/path/to/go.
+
+include /usr/share/dpkg/default.mk
+
+GO ?= go
+# dpkg and Go agree on amd64 and arm64 spellings, so the host arch passes through.
+GOARCH ?= $(DEB_HOST_ARCH)
+export GO GOARCH
+export CGO_ENABLED := 0
+export GOFLAGS := -buildvcs=false
+
+%:
+	dh $@
+
+# Fail here with a clear message instead of deep inside the build.
+# THIRD-PARTY-NOTICES is committed so that the build needs no extra network
+# access; the check keeps it from drifting away from go.mod unnoticed.
+execute_before_dh_auto_configure:
+	$(GO) version
+	$(GO) mod verify
+	sh packaging/gen-notices.sh /tmp/notices.check
+	cmp /tmp/notices.check THIRD-PARTY-NOTICES || { \
+		echo "THIRD-PARTY-NOTICES is out of date; run: bash packaging/gen-notices.sh"; \
+		false; }
+
+override_dh_auto_build:
+	$(GO) build -trimpath -ldflags="-s -w" -o bin/ssh-gate .
+
+override_dh_auto_test:
+	$(GO) test ./...
+
+override_dh_auto_install:
+	install -D -m 0755 bin/ssh-gate debian/tmp/usr/bin/ssh-gate
+
+override_dh_auto_clean:
+	rm -rf bin
+
+# The binary is linked with -s -w, so there is no debug info for dwz to
+# compress and nothing for dh_strip to collect.
+override_dh_dwz:
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
+
+# --no-start: a fresh install must not start a daemon that has no SSH_HOST yet.
+# Bringing the service back after an upgrade is debian/ssh-gate.postinst's job.
+override_dh_installsystemd:
+	dh_installsystemd --no-start

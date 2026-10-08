@@ -1,0 +1,15 @@
+#!/bin/sh
+# Disabling the unit and dropping its systemd state come from the debhelper
+# section that the token line below expands to.
+set -e
+
+#DEBHELPER#
+
+# /var/lib/ssh-gate is kept on purpose: it holds the key pair whose public half
+# is registered on the SSH server.
+if [ "$1" = purge ] && [ -d /var/lib/ssh-gate ]; then
+	echo "ssh-gate: /var/lib/ssh-gate kept; remove it with:"
+	echo "ssh-gate:   rm -rf /var/lib/ssh-gate"
+fi
+
+exit 0

@@ -1,0 +1,10 @@
+# The binary is built with CGO_ENABLED=0 on purpose. ssh-gate is distributed
+# outside the archive and one static binary is installed on every supported
+# release, so it must not carry a dependency on the build host's libc.
+#
+# Debian's own Go helper avoids this tag by forcing CGO_ENABLED=1 (see
+# /usr/share/perl5/Debian/Debhelper/Buildsystem/golang.pm), which needs the
+# distro Go toolchain: 1.19 in Debian 12 and 1.18 in Ubuntu 22.04, both older
+# than the "go" directive in go.mod. That build system is therefore not usable
+# here; see the note in debian/control.
+statically-linked-binary [usr/bin/ssh-gate]

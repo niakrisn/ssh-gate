@@ -1,0 +1,42 @@
+#!/bin/sh
+# Only the config migration and the upgrade restart are written by hand here;
+# enabling the unit and its systemd state come from the debhelper section that
+# the token line below expands to.
+set -e
+
+case "$1" in
+	configure)
+		# Packages up to 0.1.0 shipped the config as /etc/defaults/ssh-gate
+		# (non-standard). Carry a configured file over to /etc/default.
+		if [ -f /etc/defaults/ssh-gate ] && ! grep -Eqs '^SSH_HOST=.+' /etc/default/ssh-gate; then
+			cp -p /etc/defaults/ssh-gate /etc/default/ssh-gate
+			echo "ssh-gate: moved config from /etc/defaults/ssh-gate to /etc/default/ssh-gate"
+		fi
+		rm -rf /etc/defaults
+		;;
+esac
+
+#DEBHELPER#
+
+if [ "$1" != configure ]; then
+	exit 0
+fi
+
+if [ -d /run/systemd/system ]; then
+	systemctl --system daemon-reload >/dev/null || true
+	# A non-empty second argument means upgrade. Restart, not try-restart: the
+	# 0.1.0 package stopped the service in its prerm, so the unit is already
+	# inactive here even though it has to come back up on the new binary. While
+	# the config is still empty the daemon would only exit again and systemd
+	# would retry it every few seconds, so leave it stopped and print the hint.
+	if [ -n "$2" ] && grep -Eqs '^SSH_HOST=.+' /etc/default/ssh-gate; then
+		deb-systemd-invoke restart ssh-gate.service >/dev/null || true
+	fi
+fi
+
+if ! grep -Eqs '^SSH_HOST=.+' /etc/default/ssh-gate; then
+	echo "ssh-gate: set SSH_HOST and SSH_USER in /etc/default/ssh-gate,"
+	echo "ssh-gate: then run: systemctl restart ssh-gate"
+fi
+
+exit 0

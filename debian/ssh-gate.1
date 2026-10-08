@@ -1,0 +1,256 @@
+.TH SSH-GATE 1 "October 2026" "ssh-gate" "User Commands"
+.SH NAME
+ssh-gate \- expose SOCKS5 and HTTP proxies over one SSH tunnel
+.SH SYNOPSIS
+.B ssh-gate
+.SH DESCRIPTION
+.I ssh-gate
+opens a single SSH connection to a gateway host and serves local proxies over
+it: SOCKS5 by default, an HTTP CONNECT proxy when asked for. Every destination
+is dialed either through the tunnel or directly from the local network,
+depending on the rules in
+.BR DIRECT_RULES .
+Hostnames routed through the tunnel are resolved with DNS-over-HTTPS queried
+over the tunnel itself, so a local resolver never sees them; direct
+destinations are resolved locally.
+.PP
+Authentication uses an Ed25519 key pair generated on first start. The public
+half has to be present in the gateway's
+.IR authorized_keys .
+The server host key is trusted on first use and pinned in
+.IR ssh_known_hosts
+inside the data directory; a different key afterwards aborts every connection
+attempt until that file is deleted.
+.PP
+Losing the SSH connection is not fatal. The proxies keep serving direct
+destinations, dialing is retried with jittered backoff capped at 60 seconds,
+and the readiness endpoint reports not ready until the tunnel is back up. The
+process exits only on a fatal startup error, most often an invalid
+configuration.
+.PP
+On SIGTERM or SIGINT the listeners close and running relays get 5 seconds to
+finish.
+.SH OPTIONS
+No command-line options. All configuration is read from the environment: a
+variable that is set and non-empty is used as given, otherwise the default
+below applies. In the packaged form the variables live in
+.IR /etc/default/ssh-gate ,
+which systemd reads as an
+.BR EnvironmentFile .
+That file is not a shell script: only
+.I KEY = value
+lines, no
+.BR export ,
+no command substitution. Apply changes with
+.BR "systemctl restart ssh-gate" .
+.TP
+.BI "SSH_HOST=" host
+Gateway address. Required.
+.TP
+.BI "SSH_PORT=" port
+Gateway SSH port. Default
+.BR 22 .
+.TP
+.BI "SSH_USER=" user
+Gateway account. Required.
+.TP
+.BI "PROXY_MODES=" modes
+Comma-separated list of proxies to serve:
+.BR socks5 ", " http .
+Default
+.BR socks5 .
+.TP
+.BI "SOCKS5_LISTEN=" addr
+SOCKS5 listen address. Default
+.BR 127.0.0.1:1080 .
+.TP
+.BI "HTTP_LISTEN=" addr
+HTTP proxy listen address. Default
+.BR 127.0.0.1:3128 .
+.TP
+.BI "HEALTH_LISTEN=" addr
+Health endpoints and web UI. Default
+.BR 127.0.0.1:9090 .
+.TP
+.BI "DATA_DIR=" dir
+Directory holding
+.IR ssh_key ,
+.IR ssh_key.pub
+and
+.IR ssh_known_hosts .
+Default
+.BR /data ;
+the systemd unit sets
+.BR /var/lib/ssh-gate ,
+which systemd creates and owns.
+.TP
+.BI "DIRECT_RULES=" rules
+Comma-separated destinations that bypass the tunnel, see
+.BR "DIRECT RULES" .
+Empty by default, which sends everything through the tunnel.
+.TP
+.BI "DIRECT_IP_FAMILY=" family
+Address family used when dialing direct destinations:
+.BR ipv4 ", " ipv6 ", " both .
+Default
+.BR ipv4 .
+.TP
+.BI "DOH_HOST=" host
+DNS-over-HTTPS server for tunnel destinations, reached over HTTPS on port 443
+through the tunnel. Default
+.BR cloudflare-dns.com .
+Empty disables DNS-over-HTTPS and leaves resolution to the local resolver.
+.TP
+.BI "SSH_DIAL_TIMEOUT=" dur
+Deadline for dialing one destination through the tunnel. Must be positive
+and under 10m, which is the size of the in-memory connection history window.
+Default
+.BR 30s .
+.TP
+.BI "SSH_KEEPALIVE_PERIOD=" dur
+Idle time before keepalive probes start. Drives both the OS-level TCP
+keepalive and the SSH-layer
+.I keepalive@openssh.com
+probe that drops a transport which is alive at TCP level but stuck.
+.B 0
+disables both. Default
+.BR 10s .
+.TP
+.BI "SSH_KEEPALIVE_INTERVAL=" dur
+Keepalive probe retransmission interval, rounded to whole seconds;
+.B 0
+keeps the kernel default of 75s. Default
+.BR 1s .
+.TP
+.BI "SSH_KEEPALIVE_PROBES=" n
+Unanswered probes before the connection is declared dead;
+.B 0
+keeps the kernel default of 9. Default
+.BR 5 .
+.PP
+Worst case time to notice a dead path on the OS side is
+.I period
+plus
+.I interval
+times
+.IR probes
+.
+With the defaults that is 15 seconds; an unanswered SSH-layer probe drops the
+tunnel within about two periods.
+.TP
+.BI "LOG_LEVEL=" level
+One of
+.BR debug ", " info ", " warn ", " error .
+Default
+.BR info .
+Structured JSON lines on standard error.
+.SH "DIRECT RULES"
+A rule names a destination that is dialed from the local network instead of
+the tunnel. Three forms are accepted:
+.TP
+.BI ip: cidr
+Matches a destination whose resolved address falls in
+.IR cidr .
+The address is looked up locally.
+.TP
+.BI re: regex
+Matches the destination host name against a Go regular expression. An empty
+pattern is rejected rather than treated as match-all.
+.TP
+.I domain
+Matches the name itself and any name below it, so
+.I internal.local
+covers
+.IR db.internal.local .
+.PP
+Host names are compared in their canonical form: case-insensitively and
+without a trailing dot. The value is not shell-quoted, so one backslash in
+.I DIRECT_RULES
+is one backslash: write
+.IR re:\e.ru$ .
+.SH "HTTP INTERFACES"
+All served on
+.BR HEALTH_LISTEN .
+.TP
+.B /healthz
+Process is up.
+.TP
+.B /readyz
+Tunnel is connected; answers 503 while it is down.
+.TP
+.B /api/status
+Tunnel and configuration state as JSON.
+.TP
+.B /api/connections
+Recent connections as JSON: the last 1000 entries within 10 minutes, kept in
+memory only.
+.TP
+.B /
+Web UI over the same data.
+.SH FILES
+.TP
+.B /usr/bin/ssh-gate
+The daemon.
+.TP
+.B /lib/systemd/system/ssh-gate.service
+Unit shipped by the package. It runs the daemon as a dynamic user with the
+filesystem read-only except for the data directory.
+.TP
+.B /etc/default/ssh-gate
+Configuration, a conffile: local edits are kept across upgrades.
+.TP
+.B /var/lib/ssh-gate
+Data directory:
+.IR ssh_key ,
+.IR ssh_key.pub ,
+.IR ssh_known_hosts .
+Kept on purge because the public half of the key pair is registered on the
+gateway.
+.SH "EXIT STATUS"
+.TP
+.B 0
+Clean shutdown after SIGTERM or SIGINT.
+.TP
+.B 1
+Fatal startup error:
+.BR SSH_HOST ", " SSH_USER
+empty,
+.B SSH_PORT
+not a port, an unparsable
+.BR PROXY_MODES ", " DIRECT_RULES ", " DIRECT_IP_FAMILY
+or duration value, the data directory not writable, or a listen address
+already in use. Under systemd such an exit is retried according to
+.BR Restart .
+.SH EXAMPLES
+Serve the whole LAN instead of loopback only, then restart:
+.PP
+.EX
+sed -i 's/^SOCKS5_LISTEN=.*/SOCKS5_LISTEN=0.0.0.0:1080/' /etc/default/ssh-gate
+systemctl restart ssh-gate
+.EE
+.PP
+Route traffic through the proxy:
+.PP
+.EX
+curl --socks5-hostname 127.0.0.1:1080 https://example.com
+curl -x http://127.0.0.1:3128 https://example.com
+.EE
+.PP
+Check whether the tunnel is up:
+.PP
+.EX
+curl -fsS http://127.0.0.1:9090/readyz
+.EE
+.PP
+The public key to put in the gateway's
+.IR authorized_keys :
+.PP
+.EX
+cat /var/lib/ssh-gate/ssh_key.pub
+.EE
+.SH "SEE ALSO"
+.BR ssh (1),
+.BR systemctl (1),
+.BR proxy (7),
+.IR /usr/share/doc/ssh-gate/README.md ,
+.IR /usr/share/doc/ssh-gate/THIRD-PARTY-NOTICES
