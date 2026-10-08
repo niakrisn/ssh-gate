@@ -1,4 +1,7 @@
 data/
+build/
+dist/
+packaging/
 .git/
 .qwen/
 *.test

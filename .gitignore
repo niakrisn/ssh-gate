@@ -3,6 +3,9 @@ data/
 .qwen/tmp/
 ssh-gate
 .env
+# Packaging output
+build/
+dist/
 # Planning artifacts
 plan.md
 review.md
