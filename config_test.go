@@ -1,13 +1,15 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
 
 // TestParseKeepalivePeriod covers the semantics of SSH_KEEPALIVE_PERIOD:
-// valid Go durations pass through; empty/0/0s disable keepalive (0);
-// an unparseable value is a hard error so the container fails loud on bad input.
+// valid Go durations pass through; 0/0s disable keepalive (0); empty or
+// unparseable input is a hard error so the container fails loud on bad
+// input (loadConfig always supplies a non-empty default).
 func TestParseKeepalivePeriod(t *testing.T) {
 	valid := map[string]struct {
 		want    float64 // seconds, 0 = disabled
@@ -18,7 +20,7 @@ func TestParseKeepalivePeriod(t *testing.T) {
 		"1h":  {want: 3600},
 		"0s":  {want: 0},
 		"0":   {want: 0},
-		"":    {want: 0},
+		"":    {wantErr: true},
 		"abc": {wantErr: true},
 		"10x": {wantErr: true},
 	}
@@ -43,8 +45,8 @@ func TestParseKeepalivePeriod(t *testing.T) {
 
 // TestParseKeepaliveInterval covers the semantics of SSH_KEEPALIVE_INTERVAL:
 // durations become whole seconds for TCP_KEEPINTVL, sub-second values round
-// up to 1 s; empty/0 keep the kernel default (0); negative or unparseable
-// values are hard errors.
+// up to 1 s; 0 keeps the kernel default (0); empty, negative or unparseable
+// input are hard errors.
 func TestParseKeepaliveInterval(t *testing.T) {
 	valid := map[string]struct {
 		want    int
@@ -56,7 +58,7 @@ func TestParseKeepaliveInterval(t *testing.T) {
 		"1m":     {want: 60},
 		"1500ms": {want: 1},
 		"0s":     {want: 0},
-		"":       {want: 0},
+		"":       {wantErr: true},
 		"-1s":    {wantErr: true},
 		"abc":    {wantErr: true},
 	}
@@ -79,8 +81,8 @@ func TestParseKeepaliveInterval(t *testing.T) {
 }
 
 // TestParseKeepaliveProbes covers the semantics of SSH_KEEPALIVE_PROBES:
-// non-negative integers pass through; empty/0 keep the kernel default (0);
-// negative or non-integer values are hard errors.
+// non-negative integers pass through; 0 keeps the kernel default (0); empty,
+// negative or non-integer input are hard errors.
 func TestParseKeepaliveProbes(t *testing.T) {
 	valid := map[string]struct {
 		want    int
@@ -89,7 +91,7 @@ func TestParseKeepaliveProbes(t *testing.T) {
 		"5":   {want: 5},
 		"9":   {want: 9},
 		"0":   {want: 0},
-		"":    {want: 0},
+		"":    {wantErr: true},
 		"-1":  {wantErr: true},
 		"abc": {wantErr: true},
 	}
@@ -191,5 +193,33 @@ func TestLoadConfigDialTimeoutCap(t *testing.T) {
 	t.Setenv("SSH_DIAL_TIMEOUT", "9m")
 	if _, err := loadConfig(); err != nil {
 		t.Fatalf("9m should be valid: %v", err)
+	}
+}
+
+// TestLoadConfigDohHostEmptyDisables: DOH_HOST is read strictly — unset
+// falls back to the default endpoint, set-but-empty disables DoH as the
+// documentation promises. The old getEnv path collapsed empty to the
+// default, making the documented "empty disables DoH" unreachable.
+func TestLoadConfigDohHostEmptyDisables(t *testing.T) {
+	t.Setenv("PROXY_MODES", "socks5")
+	t.Setenv("SSH_HOST", "h")
+	t.Setenv("SSH_USER", "u")
+
+	t.Setenv("DOH_HOST", "")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf(`DOH_HOST="": %v`, err)
+	}
+	if cfg.dohHost != "" {
+		t.Fatalf(`DOH_HOST="" → dohHost = %q, want "" (empty must disable DoH)`, cfg.dohHost)
+	}
+
+	os.Unsetenv("DOH_HOST")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatalf("unset DOH_HOST: %v", err)
+	}
+	if cfg.dohHost != "cloudflare-dns.com" {
+		t.Fatalf("unset DOH_HOST → dohHost = %q, want cloudflare-dns.com", cfg.dohHost)
 	}
 }

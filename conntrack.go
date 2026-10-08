@@ -29,8 +29,10 @@ type ConnMeta struct {
 	Src   string
 	Host  string
 	// DstIP is the IP the tunnel is actually dialed to (filled by trackDial
-	// when the dial address is an IP literal); empty when the destination is
-	// an FQDN resolved on the VPS side.
+	// when the dial address is an IP literal). The opener resolves names
+	// before dialing, so production tunnel dials always carry an IP
+	// literal; an empty DstIP only appears if a caller hands the dialer a
+	// hostname directly.
 	DstIP string
 }
 

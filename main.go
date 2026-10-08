@@ -143,7 +143,13 @@ func main() {
 
 	<-ctx.Done()
 	log.Info().Msg("shutting down...")
-	shutdownServers(ctx, servers)
+	// The signal ctx is already canceled; passing it to the servers would
+	// skip the relay drain entirely. Give the drain its own deadline,
+	// comfortably below compose's stop_grace_period (10 s).
+	const shutdownDrainTimeout = 5 * time.Second
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+	defer cancelDrain()
+	shutdownServers(drainCtx, servers)
 	rules.Stop()
 	dialer.stop()
 }
@@ -176,22 +182,16 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("invalid PROXY_MODES: %w", err)
 	}
 
-	// Validate SSH_HOST
+	// Validate SSH_HOST (getEnvRequired already rejects an empty value)
 	sshHost, err := getEnvRequired("SSH_HOST")
 	if err != nil {
 		return config{}, fmt.Errorf("configuration error: %w", err)
-	}
-	if sshHost == "" {
-		return config{}, fmt.Errorf("SSH_HOST cannot be empty")
 	}
 
 	// Validate SSH_USER
 	sshUser, err := getEnvRequired("SSH_USER")
 	if err != nil {
 		return config{}, fmt.Errorf("configuration error: %w", err)
-	}
-	if sshUser == "" {
-		return config{}, fmt.Errorf("SSH_USER cannot be empty")
 	}
 
 	// Validate DIRECT_IP_FAMILY
@@ -251,7 +251,17 @@ func loadConfig() (config, error) {
 
 	// Validate DOH_HOST: a hostname (optionally with port 443) for the
 	// DNS-over-HTTPS endpoint that tunnel destinations resolve through.
-	dohHost := getEnv("DOH_HOST", "cloudflare-dns.com")
+	// Read strictly: unset falls back to the default endpoint, set-but-empty
+	// disables DoH (main wires SetDOH only for a non-empty host), as
+	// .env.example documents. getEnv would collapse empty to the default and
+	// make that promise unreachable. Note compose interpolates
+	// ${DOH_HOST:-cloudflare-dns.com}, so an empty value there still becomes
+	// the default — under compose disable DoH by not setting the variable
+	// (deb/systemd: just omit it).
+	dohHost, ok := os.LookupEnv("DOH_HOST")
+	if !ok {
+		dohHost = "cloudflare-dns.com"
+	}
 	if dohHost != "" {
 		if strings.Contains(dohHost, "/") {
 			return config{}, fmt.Errorf("invalid DOH_HOST %q: use a hostname, e.g. cloudflare-dns.com", dohHost)
@@ -329,11 +339,10 @@ func getEnv(key, fallback string) string {
 }
 
 // parseKeepalivePeriod parses SSH_KEEPALIVE_PERIOD as a Go duration.
-// Empty or non-positive values disable OS keepalive (returned as 0).
+// Non-positive values disable OS keepalive (returned as 0). Empty input is
+// a hard error: loadConfig always supplies a non-empty default, so an empty
+// raw value here would mean a caller bug, not a configuration choice.
 func parseKeepalivePeriod(raw string) (time.Duration, error) {
-	if raw == "" {
-		return 0, nil
-	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
 		return 0, fmt.Errorf("invalid SSH_KEEPALIVE_PERIOD %q (Go duration, e.g. 90s): %w", raw, err)
@@ -345,12 +354,10 @@ func parseKeepalivePeriod(raw string) (time.Duration, error) {
 }
 
 // parseKeepaliveInterval parses SSH_KEEPALIVE_INTERVAL as a Go duration and
-// returns whole seconds for TCP_KEEPINTVL. Empty or zero keeps the kernel
-// default (returned as 0); sub-second values round up to 1 s.
+// returns whole seconds for TCP_KEEPINTVL. Zero keeps the kernel default
+// (returned as 0); sub-second values round up to 1 s. Empty input is a hard
+// error: loadConfig always supplies a non-empty default.
 func parseKeepaliveInterval(raw string) (int, error) {
-	if raw == "" {
-		return 0, nil
-	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
 		return 0, fmt.Errorf("invalid SSH_KEEPALIVE_INTERVAL %q (Go duration, e.g. 1s): %w", raw, err)
@@ -369,11 +376,9 @@ func parseKeepaliveInterval(raw string) (int, error) {
 }
 
 // parseKeepaliveProbes parses SSH_KEEPALIVE_PROBES as an integer for
-// TCP_KEEPCNT. Empty or zero keeps the kernel default (returned as 0).
+// TCP_KEEPCNT. Zero keeps the kernel default (returned as 0). Empty input is
+// a hard error: loadConfig always supplies a non-empty default.
 func parseKeepaliveProbes(raw string) (int, error) {
-	if raw == "" {
-		return 0, nil
-	}
 	n, err := strconv.Atoi(raw)
 	if err != nil {
 		return 0, fmt.Errorf("invalid SSH_KEEPALIVE_PROBES %q (integer, e.g. 5): %w", raw, err)

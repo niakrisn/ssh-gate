@@ -18,7 +18,8 @@ Single Go process in a Docker container. No extra dependencies.
 ## Quick start
 
 ```bash
-# 1. Edit docker-compose.yml with your VPS credentials
+# 1. Create .env from the example and fill in your VPS credentials
+cp .env.example .env && $EDITOR .env
 # 2. Build and start
 docker compose up -d --build
 
@@ -29,6 +30,11 @@ docker compose logs
 #    command="echo 'tunnel only'",no-pty,no-agent-forwarding,no-X11-forwarding,no-user-rc ssh-ed25519 AAAA...
 ```
 
+An SSH connection failure is never fatal: if the VPS is unreachable at
+startup, the proxies, health endpoints and Web UI still come up (readyz
+reports 503, the UI shows the tunnel as disconnected) and the dialer retries
+in the background until the tunnel comes up.
+
 ## Configuration
 
 | Variable | Required | Default | Description |
@@ -37,17 +43,17 @@ docker compose logs
 | `SSH_PORT` | no | `22` | SSH port |
 | `SSH_USER` | yes | — | SSH username |
 | `SSH_DIAL_TIMEOUT` | no | `30s` | Max duration of a single destination dial through the tunnel (Go duration, must be positive and below 10m — the connection history window). A dial to a blackholed host fails with a deadline error instead of hanging |
-| `SSH_KEEPALIVE_PERIOD` | no | `10s` | OS TCP keepalive idle period for the SSH tunnel connection (Go duration); detects silent (half-open) dead paths. `0` disables |
+| `SSH_KEEPALIVE_PERIOD` | no | `10s` | Tunnel liveness period (Go duration): OS TCP keepalive idle period plus the SSH-layer `keepalive@openssh.com` probe interval that drops a stuck-but-TCP-alive transport (unanswered probe closes the tunnel within ~2 x period; the monitor reconnects). `0` disables both |
 | `SSH_KEEPALIVE_INTERVAL` | no | `1s` | Keepalive probe retransmission interval (Go duration, rounded to whole seconds). `0` keeps the kernel default |
 | `SSH_KEEPALIVE_PROBES` | no | `5` | Unanswered keepalive probes before the connection is declared dead. `0` keeps the kernel default. Worst-case silent-death detection = `PERIOD + INTERVAL x PROBES` (defaults: 15 s) |
 | `PROXY_MODES` | no | `socks5` | Comma-separated: `socks5`, `http` |
 | `SOCKS5_LISTEN` | no | `:1080` | SOCKS5 listen address |
 | `HTTP_LISTEN` | no | `:3128` | HTTP proxy listen address (CONNECT + absolute-form requests) |
 | `DIRECT_RULES` | no | — | Comma-separated rules for direct connections (see below) |
-| `DIRECT_IP_FAMILY` | no | `both` | Address families for direct: `ipv4`, `ipv6`, `both` |
-| `DOH_HOST` | no | `cloudflare-dns.com` | DNS-over-HTTPS endpoint for tunnel destinations, queried through the SSH tunnel; direct destinations keep local DNS. Definitive DoH answers, including NXDOMAIN, are authoritative; the local resolver is a fallback only while the endpoint is unreachable. Empty disables |
+| `DIRECT_IP_FAMILY` | no | `both` | Address families for direct: `ipv4`, `ipv6`, `both` (compose sets `ipv4`) |
+| `DOH_HOST` | no | `cloudflare-dns.com` | DNS-over-HTTPS endpoint for tunnel destinations, queried through the SSH tunnel; direct destinations keep local DNS. Definitive DoH answers, including NXDOMAIN, are authoritative; the local resolver is a fallback only while the endpoint is unreachable. An empty value disables DoH; under compose interpolation (`${DOH_HOST:-cloudflare-dns.com}`) an empty value becomes the default, so remove the variable to disable it there |
 | `HEALTH_LISTEN` | no | `127.0.0.1:9090` | Health + Web UI listen address (compose sets `0.0.0.0:9090` inside the container and maps it to `127.0.0.1:9090` on the host) |
-| `LOG_LEVEL` | no | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `LOG_LEVEL` | no | `info` | Log level (`debug`, `info`, `warn`, `error`) (compose sets `warn`) |
 | `DATA_DIR` | no | `/data` | Directory for keys and secrets |
 
 ### DIRECT_RULES format
@@ -56,9 +62,9 @@ Rules are checked in order. First match wins. Unmatched traffic goes through the
 
 - `ip:1.2.3.0/24` — match CIDR
 - `re:.*\.ru$` — match domain regex
-- `example.com` — match domain (and subdomains)
+- `example.com` — match domain (and subdomains); matching is case- and trailing-dot-insensitive
 
-Example: `DIRECT_RULES="re:\\.ru$,ip:10.0.0.0/8,internal.local"`
+Example: `DIRECT_RULES="re:\.ru$,ip:10.0.0.0/8,internal.local"` (one backslash — a doubled `re:\\.ru$` would match a literal backslash and never fire)
 
 ## Web UI
 
@@ -77,6 +83,18 @@ The `./data` directory (mounted as `/data`) stores:
 
 - `ssh_key` / `ssh_key.pub` — ed25519 keypair (generated on first run)
 - `ssh_known_hosts` — SSH host key fingerprint (saved on first connection)
+
+The container runs as uid/gid `10001`. A bind mount keeps the host directory
+ownership (it does not inherit ownership from the image), so prepare the
+directory before the first `docker compose up`:
+
+```bash
+mkdir -p data && sudo chown 10001:10001 data && chmod 700 data
+```
+
+Upgrading from earlier images: `sudo chown -R 10001:10001 data` — key files
+are `0600` and unreadable under the old uid; the app would silently generate
+a new key and desync the VPS `authorized_keys`.
 
 ## SSH authorized_keys
 

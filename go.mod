@@ -1,11 +1,12 @@
 module ssh-gate
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/rs/zerolog v1.35.0
 	github.com/things-go/go-socks5 v0.1.3
 	golang.org/x/crypto v0.49.0
+	golang.org/x/sync v0.23.0
 	golang.org/x/sys v0.42.0
 )
 

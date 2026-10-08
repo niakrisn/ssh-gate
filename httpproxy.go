@@ -21,10 +21,11 @@ import (
 // upload and response download). CONNECT tunnels stay unbounded on purpose.
 const requestTimeout = 5 * time.Minute
 
-// maxReframedBody bounds bodies that must be re-framed with Content-Length
-// (chunked or close-delimited). The VPS sshd closes the direct-tcpip channel
-// on EOF, so an EOF after a body loses the response; such bodies are buffered
-// and re-framed instead.
+// maxReframedBody bounds the buffer for bodies that must be re-framed with
+// Content-Length (chunked or close-delimited): forwarding them requires
+// reading the whole body into memory first, so the limit caps the memory a
+// single request can make the proxy hold. Larger bodies are rejected with
+// 413 rather than buffered unboundedly.
 const maxReframedBody = 32 << 20
 
 // HTTPProxyServer is a minimal HTTP forward proxy: CONNECT tunneling plus
@@ -33,6 +34,7 @@ type HTTPProxyServer struct {
 	ln        net.Listener
 	shutCh    chan struct{}
 	closeOnce sync.Once
+	wg        sync.WaitGroup // in-flight handleConn goroutines
 	opener    *Opener
 }
 
@@ -42,7 +44,11 @@ func NewHTTPProxyServer(listen string, opener *Opener) (*HTTPProxyServer, error)
 		return nil, err
 	}
 	return &HTTPProxyServer{
-		ln:     ln,
+		// keepalive on accepted sockets bounds the lifetime of a
+		// half-dead CONNECT relay (see keepAliveListener); the resilient
+		// wrapper keeps the accept loop alive through transient errors,
+		// so an error here only ever means shutdown.
+		ln:     &resilientListener{Listener: keepAliveListener{Listener: ln}},
 		shutCh: make(chan struct{}),
 		opener: opener,
 	}, nil
@@ -63,25 +69,58 @@ func (s *HTTPProxyServer) Start() {
 					return
 				}
 			}
+			s.wg.Add(1)
 			go s.handleConn(conn)
 		}
 	}()
 }
 
+// Shutdown stops accepting, then waits (bounded by ctx) for in-flight
+// connections to finish proxying. The listener close runs once; the drain
+// wait runs on every call, so a Shutdown that timed out can be retried to
+// confirm the remaining relays have finished (nil) or wait again (ctx.Err()).
+// Stuck relays left behind at timeout are killed when the SSH dialer stops.
 func (s *HTTPProxyServer) Shutdown(ctx context.Context) error {
 	var err error
 	s.closeOnce.Do(func() {
 		close(s.shutCh)
 		err = s.ln.Close()
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// With the shared drain deadline already spent on an earlier
+		// server, a server drained at the same instant must report
+		// success, not a spurious timeout.
+		select {
+		case <-done:
+			return nil
+		default:
+			return ctx.Err()
+		}
+	}
 }
 
 func (s *HTTPProxyServer) handleConn(client net.Conn) {
+	defer s.wg.Done()
 	defer client.Close()
 
+	// One reader for the whole connection: ReadRequest buffers a whole
+	// socket segment, so payload pipelined behind the headers (TLS
+	// ClientHello right after CONNECT, GET body) lives in this buffer and
+	// must be drained by the same reader the relay copies from.
+	br := bufio.NewReader(client)
 	_ = client.SetReadDeadline(time.Now().Add(30 * time.Second))
-	req, err := http.ReadRequest(bufio.NewReader(client))
+	req, err := http.ReadRequest(br)
 	if err != nil {
 		log.Warn().Str("client", client.RemoteAddr().String()).Err(err).Msg("http: bad request")
 		writeHTTPErr(client, http.StatusBadRequest, "Bad Request")
@@ -91,7 +130,7 @@ func (s *HTTPProxyServer) handleConn(client net.Conn) {
 
 	switch {
 	case req.Method == http.MethodConnect:
-		s.handleConnect(client, req)
+		s.handleConnect(client, br, req)
 	case req.URL != nil && req.URL.IsAbs() && req.URL.Scheme == "http":
 		s.handleHTTP(client, req)
 	default:
@@ -139,7 +178,12 @@ func (s *HTTPProxyServer) openUpstream(ctx context.Context, src, method, host st
 	}, nil
 }
 
-func (s *HTTPProxyServer) handleConnect(client net.Conn, req *http.Request) {
+// handleConnect relays raw bytes between client and upstream. src is the
+// buffered reader the request headers were parsed from: bytes pipelined
+// behind them are already in its buffer and would be lost if the relay
+// read the raw socket. Writes toward the client still go to client
+// directly.
+func (s *HTTPProxyServer) handleConnect(client net.Conn, src io.Reader, req *http.Request) {
 	host, port, err := net.SplitHostPort(req.URL.Host)
 	if err != nil {
 		writeHTTPErr(client, http.StatusBadRequest, "Bad CONNECT target")
@@ -159,7 +203,7 @@ func (s *HTTPProxyServer) handleConnect(client net.Conn, req *http.Request) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		io.Copy(lc, client)
+		io.Copy(lc, src)
 		lc.CloseWrite()
 	}()
 	go func() {
@@ -203,11 +247,14 @@ func (s *HTTPProxyServer) handleHTTP(client net.Conn, req *http.Request) {
 	// Rewrite the request to origin form. One request per connection: force
 	// Connection: close so the upstream closes after replying and the
 	// response relay terminates cleanly.
-	// req.Header never contains Transfer-Encoding or Connection (ReadRequest
-	// moves them into Request fields), so body presence is taken from there.
-	// Bodies without Content-Length (chunked, close-delimited) are de-framed
-	// and re-sent with Content-Length: never send EOF after a body, the VPS
-	// sshd drops the direct-tcpip channel on EOF and the response is lost.
+	// ReadRequest removes Transfer-Encoding (and Content-Length when the
+	// body is chunked) from req.Header; for requests it leaves Connection
+	// in place (shouldClose only strips it on the response path) — the
+	// header loop below skips whatever remains of those names anyway.
+	// Bodies without Content-Length (chunked, close-delimited) are
+	// de-framed and re-sent with Content-Length: the forwarded request
+	// stays self-delimiting without chunk re-encoding or close-delimited
+	// framing on a channel we keep open for the response.
 	chunked := len(req.TransferEncoding) > 0
 	closeDelimited := req.ContentLength < 0 // body until connection close
 	hasBody := req.ContentLength != 0

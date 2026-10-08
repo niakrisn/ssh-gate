@@ -585,3 +585,157 @@ func TestHTTPProxyConnMeta(t *testing.T) {
 		t.Fatalf("GET meta: %+v", m)
 	}
 }
+
+// TestHTTPProxyShutdownDrains: Shutdown must wait (bounded by its ctx) for
+// in-flight CONNECT relays to finish instead of returning while bytes may
+// still be in flight. A held-open idle tunnel makes Shutdown with a 50 ms
+// deadline return context.DeadlineExceeded only after the deadline; once the
+// client closes, a repeat Shutdown returns nil immediately. A server with no
+// connections shuts down without waiting.
+func TestHTTPProxyShutdownDrains(t *testing.T) {
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listener: %v", err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(c)
+		}
+	}()
+
+	s := startTestProxy(t, "")
+
+	c, err := net.Dial("tcp", proxyAddr(s))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echo.Addr().String(), echo.Addr().String())
+	r := bufio.NewReader(c)
+	expectStatus(t, r, "200")
+	if _, err := r.ReadSlice('\n'); err != nil {
+		t.Fatalf("read CONNECT end: %v", err)
+	}
+	// The tunnel is established and idle: the relay pair is alive.
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = s.Shutdown(ctx)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown with live relay = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed < 45*time.Millisecond {
+		t.Fatalf("Shutdown returned after %v, want the full 50 ms deadline", elapsed)
+	}
+
+	// Closing the client ends the relay; the repeat Shutdown must then
+	// return nil promptly (it drains the finished connection).
+	c.Close()
+	start = time.Now()
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("repeat Shutdown after client close = %v, want nil", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("repeat Shutdown took %v, want prompt drain", elapsed)
+	}
+}
+
+// TestHTTPProxyShutdownEmptyImmediate: no in-flight connections means
+// Shutdown must not consume the ctx deadline.
+func TestHTTPProxyShutdownEmptyImmediate(t *testing.T) {
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	s, err := NewHTTPProxyServer("127.0.0.1:0", newTestOpener(rules, testDialer{}))
+	if err != nil {
+		t.Fatalf("NewHTTPProxyServer: %v", err)
+	}
+	s.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown on idle server = %v, want nil", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 45*time.Millisecond {
+		t.Fatalf("idle Shutdown took %v, want immediate", elapsed)
+	}
+}
+
+// TestConnectRelaysBufferedPipeline: a client may pipeline payload bytes
+// behind the CONNECT request in one segment (e.g. a TLS ClientHello sent
+// without waiting for 200). ReadRequest buffers them; the relay must read
+// from that same buffered reader, not from the raw socket, or the tail of
+// the segment is lost. On v0.1.0 the reader died after the headers and the
+// echo only ever saw "MORE".
+func TestConnectRelaysBufferedPipeline(t *testing.T) {
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				io.Copy(c, c)
+			}()
+		}
+	}()
+
+	s := startTestProxy(t, "")
+
+	c, err := net.Dial("tcp", proxyAddr(s))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+
+	// Headers and payload in a single Write: one socket read on the proxy
+	// side swallows PAYLOAD into the request reader's buffer. The echo
+	// address is a private IP literal, so the route is direct with no DNS.
+	echoAddr := echo.Addr().(*net.TCPAddr)
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\nPAYLOAD",
+		echoAddr.String(), echoAddr.String())
+	if _, err := c.Write([]byte(connectReq)); err != nil {
+		t.Fatalf("write connect+payload: %v", err)
+	}
+
+	br := bufio.NewReader(c)
+	if status := readStatus(t, br); !strings.Contains(status, "200") {
+		t.Fatalf("status = %q, want 200", status)
+	}
+	// Drain the blank line terminating the 200 response.
+	if _, err := br.ReadSlice('\n'); err != nil {
+		t.Fatalf("read blank line: %v", err)
+	}
+
+	if _, err := c.Write([]byte("MORE")); err != nil {
+		t.Fatalf("write more: %v", err)
+	}
+
+	buf := make([]byte, len("PAYLOADMORE"))
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(c, buf); err != nil {
+		t.Fatalf("read echo: %v (got %q)", err, buf)
+	}
+	if got := string(buf); got != "PAYLOADMORE" {
+		t.Fatalf("echo = %q, want %q", got, "PAYLOADMORE")
+	}
+}

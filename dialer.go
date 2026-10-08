@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -37,6 +38,11 @@ type sshDialer struct {
 	rawConn syscall.RawConn
 	cfg     sshDialerCfg
 	done    atomic.Bool
+	// connect establishes one tunnel connection; the monitor calls it
+	// instead of connectSSH directly so tests can observe and control
+	// reconnect rounds. The constructor sets connectSSH; a nil value (test
+	// literals built by hand) falls back to connectSSH in the monitor.
+	connect func(sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error)
 }
 
 type sshDialerCfg struct {
@@ -53,33 +59,61 @@ type sshDialerCfg struct {
 	keepaliveProbes   int
 	tracker           *ConnTracker
 	// dialTimeout bounds a single destination dial (channel open through
-	// the SSH tunnel). A blackholed destination keeps the open request
-	// pending on the VPS sshd side until this deadline cancels it.
+	// the SSH tunnel). It bounds only OUR wait for the channel-open reply:
+	// there is no wire cancellation for direct-tcpip, so a blackholed
+	// destination keeps sshd on the VPS busy connecting until its own
+	// timeout, and the pending request plus its channel live on until the
+	// transport dies.
 	dialTimeout time.Duration
+	// handshakeTimeout bounds the TCP dial plus the SSH handshake (version
+	// exchange and KEX). x/crypto applies Config.Timeout to the dial only,
+	// so the handshake gets an explicit socket deadline. <= 0 uses 10 s.
+	handshakeTimeout time.Duration
 }
 
+// newSSHDialer builds the dialer and starts the connection lifecycle in the
+// background. The start is deliberately lazy: a VPS that is down at process
+// start must not take the proxies, the Web UI or readyz down with it (a
+// fatal exit under `restart: unless-stopped` loops the container and buries
+// the first-run key output in the restart noise). The monitor dials
+// immediately on its first pass, then retries with backoff; Connected()
+// reports liveness and only connect/known_hosts config errors can fail the
+// constructor.
 func newSSHDialer(cfg sshDialerCfg) (*sshDialer, error) {
-	knownHostsPath := filepath.Join(filepath.Dir(cfg.keyPath), sshKnownHostsFile)
-	if data, err := os.ReadFile(knownHostsPath); err == nil {
-		cfg.fingerprint = string(data)
-	}
-
-	client, fp, raw, err := connectSSH(cfg)
+	fp, err := readKnownHostFingerprint(filepath.Dir(cfg.keyPath))
 	if err != nil {
-		return nil, NewSSHError("connection", cfg.host, cfg.port, err)
+		return nil, err
+	}
+	if fp != "" {
+		cfg.fingerprint = fp
 	}
 
-	log.Info().Str("host", cfg.host).Int("port", cfg.port).Str("fingerprint", fp).Msg("SSH connected")
-
-	cfg.fingerprint = fp
-	d := &sshDialer{
-		client:  client,
-		rawConn: raw,
-		cfg:     cfg,
-	}
-
+	d := &sshDialer{cfg: cfg, connect: connectSSH}
 	go d.monitor()
 	return d, nil
+}
+
+// readKnownHostFingerprint returns the stored SSH host key fingerprint from
+// dir/ssh_known_hosts. A missing file is a first run: ("", nil) leaves TOFU
+// to connectSSH. Surrounding whitespace is trimmed (hand-edited files get
+// trailing newlines; an untrimmed fingerprint would never match). An
+// existing file that is empty after trimming is a config error, not a
+// first run: a blank fingerprint accepts any host key and silently re-does
+// TOFU — the exact downgrade known_hosts prevents — so the operator must
+// delete the file to re-trust deliberately.
+func readKnownHostFingerprint(dir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, sshKnownHostsFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read %s: %w", sshKnownHostsFile, err)
+	}
+	fp := strings.TrimSpace(string(data))
+	if fp == "" {
+		return "", fmt.Errorf("%s exists but is empty — delete the file to re-trust the host key", sshKnownHostsFile)
+	}
+	return fp, nil
 }
 
 func (d *sshDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -190,18 +224,45 @@ func (d *sshDialer) TunnelTCPStats() *tcpStats {
 	return readTCPStats(rc)
 }
 
+// reconnectDelay is the monitor's backoff base for a retry attempt:
+// baseDelay doubled per attempt, capped at maxDelay. The shift is capped
+// first (1s << 6 = 64s already exceeds maxDelay) because an uncapped shift
+// overflows int64 from attempt 34 on and the delay turns negative, which
+// makes the monitor spin with no wait at all. Jitter is added by the caller
+// so this stays a pure, testable step.
+func reconnectDelay(attempt int) time.Duration {
+	const (
+		baseDelay = time.Second
+		maxDelay  = 60 * time.Second
+	)
+	shift := attempt
+	if shift > 6 {
+		shift = 6
+	}
+	delay := baseDelay << uint(shift)
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	return delay
+}
+
 func (d *sshDialer) monitor() {
 	attempt := 0
-	baseDelay := time.Second
-	maxDelay := 60 * time.Second
+	connect := d.connect
+	if connect == nil {
+		connect = connectSSH
+	}
 
 	for {
+		// Capture the client under the lock and wait on the local: after a
+		// failed reconnect d.client is nil, and d.client.Conn would then
+		// dereference nil and crash the process.
 		d.mu.Lock()
-		conn := d.client.Conn
+		client := d.client
 		d.mu.Unlock()
 
-		if conn != nil {
-			conn.Wait()
+		if client != nil {
+			client.Wait() // the reconnect log below reports the loss
 
 			if d.done.Load() {
 				return
@@ -212,24 +273,33 @@ func (d *sshDialer) monitor() {
 			d.mu.Unlock()
 		}
 
-		delay := baseDelay
+		// The first pass dials immediately (the constructor is lazy, a
+		// startup delay would only slow the healthy path); backoff and
+		// jitter apply from the first retry on.
+		var delay time.Duration
 		if attempt > 0 {
-			delay = baseDelay << uint(attempt)
-			if delay > maxDelay {
-				delay = maxDelay
-			}
+			delay = reconnectDelay(attempt) + time.Duration(rand.Intn(500))*time.Millisecond
 		}
-		jitter := time.Duration(rand.Intn(500)) * time.Millisecond
-		delay += jitter
 
-		log.Warn().Int("attempt", attempt+1).Dur("delay", delay).Msg("SSH connection lost, reconnecting...")
+		log.Warn().Int("attempt", attempt+1).Dur("delay", delay).Msg("SSH not connected, dialing...")
 		time.Sleep(delay)
+		if d.done.Load() {
+			// stop() landed during the sleep: the process is leaving, a
+			// fresh SSH connection now would be an orphan.
+			return
+		}
 
-		newClient, fp, newRaw, err := connectSSH(d.cfg)
+		newClient, fp, newRaw, err := connect(d.cfg)
 		if err != nil {
-			log.Error().Err(err).Int("attempt", attempt+1).Msg("SSH reconnect failed")
+			log.Error().Err(err).Int("attempt", attempt+1).Msg("SSH connect failed")
 			attempt++
 			continue
+		}
+		if d.done.Load() {
+			// stop() landed while dialing: never publish a client that
+			// nothing will close — drop it and retire.
+			newClient.Close()
+			return
 		}
 
 		d.mu.Lock()
@@ -241,8 +311,53 @@ func (d *sshDialer) monitor() {
 		if oldClient != nil {
 			oldClient.Close()
 		}
+		if d.cfg.keepalivePeriod > 0 {
+			go d.keepalive(newClient)
+		}
 		attempt = 0
-		log.Info().Str("fingerprint", fp).Msg("SSH reconnected")
+		log.Info().Str("host", d.cfg.host).Int("port", d.cfg.port).Str("fingerprint", fp).Msg("SSH connected")
+	}
+}
+
+// keepalive probes tunnel liveness at the SSH layer for the whole life of
+// one client. OS TCP keepalive only detects dead TCP (and with kernel
+// defaults, after ~2 hours); a half-dead transport (live TCP, stuck
+// peer) would keep Connected()/readyz green forever while every dial times
+// out. x/crypto sends no client keepalive, so the probe is ours: a global
+// request with wantReply - any reply (accept or reject) proves liveness, no
+// reply within one period means the peer is stuck; drop the transport and
+// let the monitor reconnect. Loops until its client is replaced or the
+// dialer stops, so old goroutines self-retire after a reconnect.
+func (d *sshDialer) keepalive(client *ssh.Client) {
+	period := d.cfg.keepalivePeriod
+	defer func() {
+		log.Debug().Msg("SSH keepalive loop stopped")
+	}()
+	for tick := time.NewTicker(period); ; {
+		<-tick.C // first probe one period after (re)connect
+		d.mu.Lock()
+		cur := d.client
+		d.mu.Unlock()
+		if cur != client || d.done.Load() {
+			tick.Stop()
+			return
+		}
+		alive := make(chan bool, 1)
+		go func() {
+			_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+			alive <- err == nil
+		}()
+		select {
+		case ok := <-alive:
+			if ok {
+				continue
+			}
+		case <-time.After(period): // stuck peer: no reply in one period
+		}
+		log.Warn().Msg("SSH keepalive unanswered, dropping tunnel")
+		tick.Stop()
+		client.Close() // unblocks the probe goroutine and conn.Wait
+		return
 	}
 }
 
@@ -293,11 +408,16 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) 
 		return nil
 	}
 
+	hs := cfg.handshakeTimeout
+	if hs <= 0 {
+		hs = 10 * time.Second
+	}
+
 	sshConfig := &ssh.ClientConfig{
 		User:            cfg.user,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: callback,
-		Timeout:         10 * time.Second,
+		Timeout:         hs,
 	}
 
 	// VPS access is IPv4-only by design; destination IPv6 is resolved on the VPS side.
@@ -305,7 +425,7 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) 
 	// Control captures the fd's RawConn; it is called for the exact
 	// connection that is returned, so it stays valid for the connection's life.
 	dl := net.Dialer{
-		Timeout: sshConfig.Timeout,
+		Timeout: hs,
 		Control: func(_, _ string, c syscall.RawConn) error {
 			raw = c
 			return nil
@@ -330,10 +450,22 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) 
 	} else {
 		log.Warn().Str("type", fmt.Sprintf("%T", rawConn)).Msg("raw TCPConn unavailable; OS keepalive skipped")
 	}
+	// x/crypto applies Config.Timeout to the TCP dial only; bound the
+	// handshake itself on the established socket, then clear the deadline
+	// so the live transport is not killed by it (OS keepalive and the
+	// app-level probe own transport liveness from here on).
+	if err := rawConn.SetDeadline(time.Now().Add(hs)); err != nil {
+		rawConn.Close()
+		return nil, "", nil, fmt.Errorf("SSH handshake deadline to %s: %w", addr, err)
+	}
 	sshConn, chans, reqs, err := ssh.NewClientConn(rawConn, addr, sshConfig)
 	if err != nil {
 		rawConn.Close()
 		return nil, "", nil, fmt.Errorf("SSH handshake to %s: %w", addr, err)
+	}
+	if err := rawConn.SetDeadline(time.Time{}); err != nil {
+		rawConn.Close()
+		return nil, "", nil, fmt.Errorf("clear SSH handshake deadline on %s: %w", addr, err)
 	}
 	client := ssh.NewClient(sshConn, chans, reqs)
 

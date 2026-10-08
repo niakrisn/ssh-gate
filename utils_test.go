@@ -6,10 +6,10 @@ import (
 
 func TestContains(t *testing.T) {
 	tests := []struct {
-		name     string
-		slice    []string
-		s        string
-		want     bool
+		name  string
+		slice []string
+		s     string
+		want  bool
 	}{
 		{
 			name:  "empty slice",
@@ -48,34 +48,34 @@ func TestContains(t *testing.T) {
 
 func TestContainsAny(t *testing.T) {
 	tests := []struct {
-		name      string
+		name     string
 		haystack []string
 		needles  []string
-		want      bool
+		want     bool
 	}{
 		{
-			name:      "empty haystack",
+			name:     "empty haystack",
 			haystack: []string{},
 			needles:  []string{"a"},
-			want:      false,
+			want:     false,
 		},
 		{
-			name:      "empty needles",
+			name:     "empty needles",
 			haystack: []string{"a", "b"},
 			needles:  []string{},
-			want:      false,
+			want:     false,
 		},
 		{
-			name:      "found",
+			name:     "found",
 			haystack: []string{"a", "b", "c"},
 			needles:  []string{"b", "d"},
-			want:      true,
+			want:     true,
 		},
 		{
-			name:      "not found",
+			name:     "not found",
 			haystack: []string{"a", "b", "c"},
 			needles:  []string{"d", "e"},
-			want:      false,
+			want:     false,
 		},
 	}
 
@@ -138,29 +138,29 @@ func TestValidatePort(t *testing.T) {
 
 func TestValidateHostPort(t *testing.T) {
 	tests := []struct {
-		name    string
+		name     string
 		hostPort string
-		wantErr bool
+		wantErr  bool
 	}{
 		{
-			name:    "valid host:port",
+			name:     "valid host:port",
 			hostPort: "localhost:8080",
-			wantErr: false,
+			wantErr:  false,
 		},
 		{
-			name:    "valid :port",
+			name:     "valid :port",
 			hostPort: ":8080",
-			wantErr: false,
+			wantErr:  false,
 		},
 		{
-			name:    "empty",
+			name:     "empty",
 			hostPort: "",
-			wantErr: true,
+			wantErr:  true,
 		},
 		{
-			name:    "no colon",
+			name:     "no colon",
 			hostPort: "localhost",
-			wantErr: true,
+			wantErr:  true,
 		},
 	}
 
@@ -176,29 +176,29 @@ func TestValidateHostPort(t *testing.T) {
 
 func TestFirstNonEmpty(t *testing.T) {
 	tests := []struct {
-		name     string
-		strings  []string
-		want     string
+		name    string
+		strings []string
+		want    string
 	}{
 		{
-			name:     "first non-empty",
-			strings:  []string{"", "", "test", "other"},
-			want:     "test",
+			name:    "first non-empty",
+			strings: []string{"", "", "test", "other"},
+			want:    "test",
 		},
 		{
-			name:     "all empty",
-			strings:  []string{"", "", ""},
-			want:     "",
+			name:    "all empty",
+			strings: []string{"", "", ""},
+			want:    "",
 		},
 		{
-			name:     "first is non-empty",
-			strings:  []string{"first", "second"},
-			want:     "first",
+			name:    "first is non-empty",
+			strings: []string{"first", "second"},
+			want:    "first",
 		},
 		{
-			name:     "empty list",
-			strings:  []string{},
-			want:     "",
+			name:    "empty list",
+			strings: []string{},
+			want:    "",
 		},
 	}
 

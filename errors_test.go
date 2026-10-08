@@ -7,11 +7,11 @@ import (
 
 func TestConfigurationError(t *testing.T) {
 	tests := []struct {
-		name     string
-		field    string
-		value    string
-		message  string
-		want     string
+		name    string
+		field   string
+		value   string
+		message string
+		want    string
 	}{
 		{
 			name:    "with message",

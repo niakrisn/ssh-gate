@@ -28,6 +28,7 @@ services:
       DIRECT_IP_FAMILY: "${DIRECT_IP_FAMILY:-ipv4}"
       DOH_HOST: "${DOH_HOST:-cloudflare-dns.com}"
       HEALTH_LISTEN: "${HEALTH_LISTEN:-0.0.0.0:9090}"
+      DATA_DIR: "${DATA_DIR:-/data}"
       LOG_LEVEL: "${LOG_LEVEL:-warn}"
       SSH_KEEPALIVE_PERIOD: "${SSH_KEEPALIVE_PERIOD:-10s}"
       SSH_KEEPALIVE_INTERVAL: "${SSH_KEEPALIVE_INTERVAL:-1s}"

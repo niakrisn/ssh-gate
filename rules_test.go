@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestRuleEngineStopConcurrent guards against double-close of the DNS cache
@@ -528,6 +529,37 @@ func TestResolveAllDOHServerFallback(t *testing.T) {
 	}
 }
 
+// TestIPRuleMatchesViaLocalResolver: ip: rules are matched through the same
+// local resolver the direct dial uses. A public DoH NXDOMAIN must not push a
+// host with a legitimate direct rule into the tunnel (split-horizon names
+// live in local DNS), and deciding "direct" must not cost tunnel traffic.
+func TestIPRuleMatchesViaLocalResolver(t *testing.T) {
+	var reqs atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, _ *http.Request) {
+		reqs.Add(1)
+		w.Header().Set("Content-Type", "application/dns-json")
+		io.WriteString(w, `{"Status":3,"Answer":[]}`) // NXDOMAIN for every name
+	})
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	rules, err := NewRuleEngine("ip:127.0.0.0/8")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	rules.SetDOH(srv.Listener.Addr().String(), testDialer{Target: srv.Listener.Addr().String()})
+	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig
+
+	route, reason := rules.Decide(context.Background(), "localhost", 443)
+	if route != RouteDirect || reason != "direct:ip:127.0.0.0/8" {
+		t.Fatalf("Decide(localhost) = %s (%s), want direct (direct:ip:127.0.0.0/8)", route, reason)
+	}
+	if n := reqs.Load(); n != 0 {
+		t.Fatalf("DoH requests = %d, want 0: an ip: rule must resolve locally", n)
+	}
+}
+
 // TestResolveAllDOHFallback: when the DoH endpoint is unreachable, cached
 // resolution falls back to the local resolver.
 func TestResolveAllDOHFallback(t *testing.T) {
@@ -546,5 +578,274 @@ func TestResolveAllDOHFallback(t *testing.T) {
 	rules.SetDOH(closed, testDialer{})
 	if _, err := rules.ResolveAll(context.Background(), "example.com"); err != nil {
 		t.Skipf("local resolver unavailable: %v", err)
+	}
+}
+
+// TestLocalFallbackNotCached: a local-resolver answer used while the DoH
+// endpoint is down must NOT be cached under the tunnel key — the cached
+// local address would then steer tunnel-routed connections for the whole
+// TTL (route policy silently replaced by home DNS). Degraded answers must
+// be returned but re-attempted per connection; authoritative DoH answers
+// keep caching normally.
+func TestLocalFallbackNotCached(t *testing.T) {
+	t.Run("fallback answer is not cached", func(t *testing.T) {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listener: %v", err)
+		}
+		closed := l.Addr().String()
+		l.Close()
+
+		rules, err := NewRuleEngine("")
+		if err != nil {
+			t.Fatalf("NewRuleEngine: %v", err)
+		}
+		rules.SetDOH(closed, testDialer{})
+
+		addrs, err := rules.dns.ResolveAll(context.Background(), "localhost")
+		if err != nil || len(addrs) == 0 {
+			t.Skipf("local resolver unavailable: %v", err)
+		}
+		if got := rules.dns.lookups.Load(); got != 1 {
+			t.Fatalf("lookups after fallback = %d, want 1", got)
+		}
+
+		if _, err := rules.dns.ResolveAll(context.Background(), "localhost"); err != nil {
+			t.Fatalf("repeat ResolveAll: %v", err)
+		}
+		if got := rules.dns.lookups.Load(); got != 2 {
+			t.Fatalf("lookups after repeat = %d, want 2 (a fallback answer must not be cached)", got)
+		}
+		rules.dns.mu.Lock()
+		n := len(rules.dns.cache)
+		rules.dns.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("cache size = %d, want 0: non-authoritative answer stored", n)
+		}
+	})
+
+	t.Run("authoritative answer is cached", func(t *testing.T) {
+		fake := startFakeDoHServer(t, func(name, qtype string) dohAnswer {
+			if name == "cached.example" && qtype == "A" {
+				return dohAnswer{status: 0, a: []string{"93.184.216.34"}}
+			}
+			return dohAnswer{status: 0}
+		})
+		rules, err := NewRuleEngine("")
+		if err != nil {
+			t.Fatalf("NewRuleEngine: %v", err)
+		}
+		d, b := setBootstrap(t, fake)
+		rules.SetDOH(b.addr, d)
+		rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
+
+		for i := 0; i < 2; i++ {
+			addrs, err := rules.dns.ResolveAll(context.Background(), "cached.example")
+			if err != nil || len(addrs) != 1 || addrs[0].String() != "93.184.216.34" {
+				t.Fatalf("ResolveAll #%d = (%v, %v)", i+1, addrs, err)
+			}
+		}
+		if got := rules.dns.lookups.Load(); got != 1 {
+			t.Fatalf("lookups = %d, want 1 (authoritative answer must be cached)", got)
+		}
+	})
+}
+
+// TestConcurrentMissSingleLookup: ten parallel ResolveAll calls for one
+// uncached name must share a single resolver round-trip (singleflight), not
+// fan out into ten DoH queries. The fake endpoint blocks until released, so
+// the cache is provably empty for every caller while they pile up.
+func TestConcurrentMissSingleLookup(t *testing.T) {
+	release := make(chan struct{})
+	var reqs atomic.Int64
+	fake := startFakeDoHServer(t, func(name, qtype string) dohAnswer {
+		if name == "slow.example" {
+			reqs.Add(1)
+			<-release
+			return dohAnswer{status: 0, a: []string{"198.51.100.7"}}
+		}
+		return dohAnswer{status: 0}
+	})
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	d, b := setBootstrap(t, fake)
+	rules.SetDOH(b.addr, d)
+	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
+
+	const n = 10
+	results := make([][]netip.Addr, n)
+	errs := make([]error, n)
+	var started, wg sync.WaitGroup
+	started.Add(n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			started.Done()
+			results[i], errs[i] = rules.dns.ResolveAll(context.Background(), "slow.example")
+		}(i)
+	}
+	started.Wait()
+
+	// Wait until the first request reaches the blocked endpoint (the cache
+	// cannot be filled before the release), then give the remaining
+	// goroutines time to pile onto the same miss.
+	deadline := time.Now().Add(2 * time.Second)
+	for reqs.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if reqs.Load() == 0 {
+		t.Fatal("fake DoH server received no request")
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := rules.dns.lookups.Load(); got != 1 {
+		t.Fatalf("lookups = %d, want 1: concurrent misses must share one lookup", got)
+	}
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("caller %d: %v", i, errs[i])
+		}
+		if len(results[i]) != 1 || results[i][0].String() != "198.51.100.7" {
+			t.Fatalf("caller %d: addrs = %v, want [198.51.100.7]", i, results[i])
+		}
+	}
+}
+
+// TestHostNormalization: DNS names are case-insensitive and a trailing dot
+// is cosmetic, but clients send all four spellings. Rule matching and the
+// DNS cache must see one canonical name — otherwise a direct rule silently
+// misses for EXAMPLE.COM or example.com. and one host keeps two cache
+// entries and two DoH cycles.
+func TestHostNormalization(t *testing.T) {
+	t.Run("rules match every spelling", func(t *testing.T) {
+		rules, err := NewRuleEngine("example.com")
+		if err != nil {
+			t.Fatalf("NewRuleEngine: %v", err)
+		}
+		for _, host := range []string{"example.com", "EXAMPLE.COM", "example.com.", "Example.Com."} {
+			route, reason := rules.Decide(context.Background(), host, 443)
+			if route != RouteDirect || reason != "direct:example.com" {
+				t.Fatalf("Decide(%q) = %s (%s), want direct (direct:example.com)", host, route, reason)
+			}
+		}
+	})
+
+	t.Run("spellings share one cache entry", func(t *testing.T) {
+		fake := startFakeDoHServer(t, func(name, qtype string) dohAnswer {
+			if name == "cache.example" && qtype == "A" {
+				return dohAnswer{status: 0, a: []string{"93.184.216.34"}}
+			}
+			return dohAnswer{status: 0}
+		})
+		rules, err := NewRuleEngine("")
+		if err != nil {
+			t.Fatalf("NewRuleEngine: %v", err)
+		}
+		d, b := setBootstrap(t, fake)
+		rules.SetDOH(b.addr, d)
+		rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
+
+		for _, host := range []string{"Cache.Example", "cache.example."} {
+			addrs, err := rules.dns.ResolveAll(context.Background(), host)
+			if err != nil || len(addrs) != 1 || addrs[0].String() != "93.184.216.34" {
+				t.Fatalf("ResolveAll(%q) = (%v, %v)", host, addrs, err)
+			}
+		}
+		if got := rules.dns.lookups.Load(); got != 1 {
+			t.Fatalf("lookups = %d, want 1: two spellings must share one cache entry", got)
+		}
+	})
+}
+
+// TestNegativeCaching: an authoritative NXDOMAIN must be cached for a short
+// negative TTL — a dead name on a hot path (update checks, dead CDN
+// backends) would otherwise pay a full DoH round-trip per connection. After
+// the negative window the name is probed again.
+func TestNegativeCaching(t *testing.T) {
+	var reqs atomic.Int64
+	fake := startFakeDoHServer(t, func(name, _ string) dohAnswer {
+		if name == "dead.example" {
+			reqs.Add(1)
+			return dohAnswer{status: 3} // NXDOMAIN
+		}
+		return dohAnswer{status: 0}
+	})
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	d, b := setBootstrap(t, fake)
+	rules.SetDOH(b.addr, d)
+	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
+	rules.dns.negativeTTL = 100 * time.Millisecond // test-visible window
+
+	if _, err := rules.dns.ResolveAll(context.Background(), "dead.example"); err == nil {
+		t.Fatal("ResolveAll(dead.example): want NXDOMAIN error")
+	}
+	first := reqs.Load()
+	if first == 0 {
+		t.Fatal("fake DoH server saw no request")
+	}
+
+	// The repeat must be served from the negative cache: same error, no
+	// new network request.
+	if _, err := rules.dns.ResolveAll(context.Background(), "dead.example"); err == nil {
+		t.Fatal("cached NXDOMAIN: want error")
+	}
+	if got := reqs.Load(); got != first {
+		t.Fatalf("requests = %d -> %d: a negative answer must be cached", first, got)
+	}
+
+	// After the negative TTL the name is queried again.
+	time.Sleep(150 * time.Millisecond)
+	if _, err := rules.dns.ResolveAll(context.Background(), "dead.example"); err == nil {
+		t.Fatal("after negative TTL: want NXDOMAIN error")
+	}
+	if got := reqs.Load(); got <= first {
+		t.Fatalf("requests = %d after TTL window, want > %d: negative entries must expire", first, got)
+	}
+}
+
+// TestDomainRuleCaseInsensitive: a domain rule from DIRECT_RULES meets the
+// same normalization the request path applies (normalizeHost). DNS names
+// are case-insensitive and the trailing root dot is cosmetic, so an
+// operator writing "Example.COM." means the name the traffic carries as
+// "example.com" - without parse-side normalization the rule silently never
+// matches and traffic the operator believes is direct goes through the
+// tunnel.
+func TestDomainRuleCaseInsensitive(t *testing.T) {
+	rules, err := NewRuleEngine("Example.COM., Other.Local")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	ctx := context.Background()
+	for _, tc := range []struct{ rule, host string }{
+		{"Example.COM.", "example.com"},
+		{"Example.COM.", "EXAMPLE.com"},
+		{"Example.COM.", "www.example.com"},
+		{"Other.Local", "other.local"},
+	} {
+		if got := rules.Route(ctx, tc.host, 443); got != RouteDirect {
+			t.Errorf("Route(%q) with rule %q = %v, want direct", tc.host, tc.rule, got)
+		}
+	}
+}
+
+// TestRuleEntryParseErrors: rule entries must mean what they look like.
+// An empty "re:" pattern compiles to the match-anything regex (a silent
+// global direct bypass, splitting-horizon split for all traffic), and a
+// bare "." normalizes to the empty domain (a rule that can never fire).
+// Both are operator mistakes; loadConfig should reject them at startup,
+// not install them as policies.
+func TestRuleEntryParseErrors(t *testing.T) {
+	for _, raw := range []string{"re:", "."} {
+		if _, err := NewRuleEngine(raw); err == nil {
+			t.Errorf("NewRuleEngine(%q): want parse error, got none", raw)
+		}
 	}
 }

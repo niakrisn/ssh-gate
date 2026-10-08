@@ -14,8 +14,9 @@ import (
 )
 
 // probeInterval is how often the SSH server port is probed in the
-// background; probeTimeout bounds a single probe dial. 30 s keeps a dead
-// SSH endpoint from spamming the access log once per ten seconds.
+// background; probeTimeout bounds a single probe dial. Probes only refresh
+// the cached /api/status reachability result and log nothing; 30 s keeps a
+// dead SSH endpoint from being dialed every few seconds.
 const (
 	probeInterval = 30 * time.Second
 	probeTimeout  = 3 * time.Second

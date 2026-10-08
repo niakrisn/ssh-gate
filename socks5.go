@@ -12,6 +12,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	socks5 "github.com/things-go/go-socks5"
+	"github.com/things-go/go-socks5/statute"
 )
 
 // SOCKS5Server wraps things-go/go-socks5, opening every connection through
@@ -21,6 +22,7 @@ type SOCKS5Server struct {
 	ln        net.Listener
 	shutCh    chan struct{}
 	closeOnce sync.Once
+	conns     sync.WaitGroup // CONNECT relays: one logConn per dial
 	opener    *Opener
 }
 
@@ -63,31 +65,50 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 			log.Debug().Str("host", host).Int("port", portInt).Str("dst", dst).Int64("dial_ms", dialMS).Msg("dial done")
 			log.Debug().Str("proto", "socks5").Str("host", host).Int("port", portInt).Msg("handshake")
 
+			// The library closes the returned conn when its relay ends,
+			// so counting here tracks in-flight relays exactly (UDP
+			// ASSOCIATE is rejected, so every logConn is a CONNECT relay).
+			s.conns.Add(1)
 			return &logConn{
-				Conn:   upstream,
-				proto:  "socks5",
-				t0:     time.Now(),
-				src:    src,
-				host:   host,
-				port:   portInt,
-				dst:    dst,
-				route:  route,
-				reason: reason,
-				family: s.opener.family,
-				dialMS: dialMS,
+				Conn:    upstream,
+				onClose: s.conns.Done,
+				proto:   "socks5",
+				t0:      time.Now(),
+				src:     src,
+				host:    host,
+				port:    portInt,
+				dst:     dst,
+				route:   route,
+				reason:  reason,
+				family:  s.opener.family,
+				dialMS:  dialMS,
 			}, nil
 		}),
 		// FQDNs are resolved through the shared Opener (route policy: direct
 		// via local DNS, tunnel via DoH; cached, 5 s lookup timeout) instead
 		// of the library default, which is unbounded and uncached.
 		socks5.WithResolver(openerResolver{opener: s.opener}),
+		// The library default for ASSOCIATE dials the target with plain
+		// net.Dial (it never consults the dial-with-request or resolver
+		// hooks), i.e. a direct UDP relay that bypasses the route rules,
+		// conntrack and the access log. The direct-tcpip SSH transport
+		// cannot carry UDP, so the only honest behavior is rejection.
+		socks5.WithAssociateHandle(func(_ context.Context, writer io.Writer, req *socks5.Request) error {
+			log.Info().Str("proto", "socks5").Str("src", req.RemoteAddr.String()).
+				Str("host", req.RawDestAddr.String()).Msg("udp associate rejected")
+			return socks5.SendReply(writer, statute.RepCommandNotSupported, nil)
+		}),
 	)
 
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		return nil, err
 	}
-	s.ln = ln
+	// keepAliveListener bounds the lifetime of a half-dead relay; the
+	// resilient wrapper absorbs transient accept errors that would end
+	// Serve for good, and its idempotent Close swallows the library's
+	// deferred Close after our Shutdown closed the listener.
+	s.ln = &resilientListener{Listener: keepAliveListener{Listener: ln}}
 
 	return s, nil
 }
@@ -96,6 +117,8 @@ func (s *SOCKS5Server) Start() {
 	log.Info().Str("listen", s.ln.Addr().String()).Msg("SOCKS5 server starting")
 
 	go func() {
+		// s.ln already carries keepAliveListener + resilientListener
+		// (see NewSOCKS5Server).
 		if err := s.srv.Serve(s.ln); err != nil {
 			select {
 			case <-s.shutCh:
@@ -106,29 +129,59 @@ func (s *SOCKS5Server) Start() {
 	}()
 }
 
+// Shutdown stops the library's accept loop, then waits (bounded by ctx) for
+// in-flight CONNECT relays to finish. The listener close runs once; the
+// drain wait runs on every call, mirroring HTTPProxyServer.Shutdown. Stuck
+// relays left behind at timeout are killed when the SSH dialer stops.
 func (s *SOCKS5Server) Shutdown(ctx context.Context) error {
 	var err error
 	s.closeOnce.Do(func() {
 		close(s.shutCh)
 		err = s.ln.Close()
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	go func() {
+		s.conns.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// With the shared drain deadline already spent on an earlier
+		// server, a server drained at the same instant must report
+		// success, not a spurious timeout.
+		select {
+		case <-done:
+			return nil
+		default:
+			return ctx.Err()
+		}
+	}
 }
 
 // logConn wraps upstream conn to count bytes and emit access log on close.
 type logConn struct {
 	net.Conn
 	mu       sync.Mutex
-	up, down int64  // client→upstream / upstream→client
-	firstErr error  // first non-EOF error from Read/Write
+	up, down int64 // client→upstream / upstream→client
+	firstErr error // first non-EOF error from Read/Write
 	t0       time.Time
 	closed   atomic.Bool
+	// onClose runs exactly once, after the first Close (successful or not —
+	// a failed Close still retires the relay, otherwise the shutdown drain
+	// could wait forever on a dead transport). The SOCKS5 server uses it to
+	// retire an in-flight relay from its shutdown drain counter.
+	onClose func()
 	// access fields
 	proto, src, host, dst, reason string
-	port   int
-	route  Route
-	family IPFamily
-	dialMS int64
+	port                          int
+	route                         Route
+	family                        IPFamily
+	dialMS                        int64
 }
 
 func (l *logConn) Read(p []byte) (int, error) {
@@ -182,6 +235,9 @@ func (l *logConn) Close() error {
 	}
 
 	err := l.Conn.Close()
+	if l.onClose != nil {
+		l.onClose()
+	}
 
 	l.mu.Lock()
 	up := l.up
