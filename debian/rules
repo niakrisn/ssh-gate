@@ -51,5 +51,16 @@ override_dh_strip:
 
 # --no-start: a fresh install must not start a daemon that has no SSH_HOST yet.
 # Bringing the service back after an upgrade is debian/ssh-gate.postinst's job.
+#
+# The move after dh_installsystemd: debhelper installs a unit found in
+# debian/*.service under /lib with no option for the destination (see
+# $tmpdir/lib/systemd/system in dh_installsystemd), and on the merged-usr targets
+# lintian reports that path as aliased-location. Moving it once the maintainer
+# snippets are generated keeps the canonical path; the snippets name units rather
+# than paths, and deb-systemd-helper searches /usr/lib/systemd/system itself.
 override_dh_installsystemd:
 	dh_installsystemd --no-start
+	mkdir -p debian/ssh-gate/usr/lib/systemd/system
+	mv debian/ssh-gate/lib/systemd/system/*.service \
+		debian/ssh-gate/usr/lib/systemd/system/
+	rmdir --ignore-fail-on-non-empty -p debian/ssh-gate/lib/systemd/system
