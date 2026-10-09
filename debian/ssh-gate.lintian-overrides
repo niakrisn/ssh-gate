@@ -4,7 +4,7 @@
 #
 # Debian's own Go helper avoids this tag by forcing CGO_ENABLED=1 (see
 # /usr/share/perl5/Debian/Debhelper/Buildsystem/golang.pm), which needs the
-# distro Go toolchain: 1.19 in Debian 12 and 1.18 in Ubuntu 22.04, both older
-# than the "go" directive in go.mod. That build system is therefore not usable
-# here; see the note in debian/control.
+# distro Go toolchain: 1.19 in Debian 12, 1.24 in Debian 13 and 1.18 in
+# Ubuntu 22.04, all older than the "go" directive in go.mod. That build system is
+# therefore not usable here; see the note in debian/control.
 statically-linked-binary [usr/bin/ssh-gate]

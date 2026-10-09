@@ -8,9 +8,10 @@ Rules-Requires-Root: no
 Homepage: https://github.com/niakrisn/ssh-gate
 Vcs-Git: https://github.com/niakrisn/ssh-gate.git
 Vcs-Browser: https://github.com/niakrisn/ssh-gate
-# The Go toolchain is intentionally not a Build-Depends: Debian 12 and Ubuntu
-# 22.04 ship a Go older than the "go" directive in go.mod requires, so the
-# builder must provide its own (see debian/rules and packaging/build-debs.sh).
+# The Go toolchain is intentionally not a Build-Depends: Debian 12, Debian 13 and
+# Ubuntu 22.04 ship Go 1.19, 1.24 and 1.18 respectively, all older than the "go"
+# directive in go.mod requires, so the builder must provide its own (see
+# debian/rules and packaging/build-debs.sh).
 
 Package: ssh-gate
 Architecture: any

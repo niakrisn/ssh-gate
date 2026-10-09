@@ -13,9 +13,10 @@
 # rewrite. The stage comes from the working tree, not from HEAD, so uncommitted
 # packaging changes can be tested.
 #
-# Results land in dist/: the binary .deb plus .changes and .buildinfo provenance.
+# Results land in dist/: the binary .deb plus .changes and .buildinfo provenance,
+# each package verified inside the release it is built for.
 # Override the version with VERSION=..., the builder base with BASE_IMAGE=...,
-# the target list with REVISIONS="1~deb12u1 1~ubuntu22.04u1".
+# the target list with REVISIONS="1~deb12u1 1~deb13u1 1~ubuntu22.04u1".
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -24,7 +25,22 @@ PLATFORM="${PLATFORM:-linux/amd64}"
 BASE_IMAGE="${BASE_IMAGE:-golang:1.26-bookworm}"
 VERSION="${VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')}"
 VERSION="${VERSION:-0.0.0}"
-read -r -a REVISIONS <<<"${REVISIONS:-1~deb12u1 1~ubuntu22.04u1}"
+read -r -a REVISIONS <<<"${REVISIONS:-1~deb12u1 1~deb13u1 1~ubuntu22.04u1}"
+
+# A revision says which release it targets, and that release is the environment
+# the package gets checked in. Fail rather than verify a Debian 13 package with
+# Debian 12 tools.
+container_for_revision() {
+	case $1 in
+		*~deb12u*) echo debian:12 ;;
+		*~deb13u*) echo debian:13 ;;
+		*~ubuntu22.04u*) echo ubuntu:22.04 ;;
+		*)
+			echo "no container image mapped to revision $1" >&2
+			return 1
+			;;
+	esac
+}
 
 STAGE=build/src
 SRC="ssh-gate-$VERSION"
@@ -58,10 +74,13 @@ for rev in "${REVISIONS[@]}"; do
 done
 
 echo "== verify"
-for deb in dist/ssh-gate_*_amd64.deb; do
+for rev in "${REVISIONS[@]}"; do
+	deb="dist/ssh-gate_${VERSION}-${rev}_amd64.deb"
+	image=$(container_for_revision "$rev")
+	echo "-- $rev in $image"
 	docker run --rm --platform "$PLATFORM" \
 		-v "$PWD/dist":/out:ro -e DEB="/out/$(basename "$deb")" \
-		debian:12 sh -c '
+		"$image" sh -c '
 			dpkg-deb -I "$DEB" >/dev/null
 			dpkg-deb -f "$DEB" Package Version Architecture Depends
 			dpkg-deb -e "$DEB" /tmp/ctl
