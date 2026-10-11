@@ -14,7 +14,10 @@
 # packaging changes can be tested.
 #
 # Results land in dist/: the binary .deb plus .changes and .buildinfo provenance,
-# each package verified inside the release it is built for.
+# each package verified inside the release it is built for, and SHA256SUMS.txt
+# holding the checksums of those packages under the names a release host serves
+# (GitHub rewrites "~" to "." in asset names), so the file verifies next to the
+# downloaded packages rather than in dist/.
 # Override the version with VERSION=..., the builder base with BASE_IMAGE=...,
 # the target list with REVISIONS="1~deb12u1 1~deb13u1 1~ubuntu22.04u1".
 set -euo pipefail
@@ -42,6 +45,16 @@ container_for_revision() {
 	esac
 }
 
+# coreutils and current macOS name the tool sha256sum, the BSDs ship shasum.
+# Both print "<hash>  <name>", so the caller can take the first field either way.
+sha256_of() {
+	if command -v sha256sum >/dev/null; then
+		sha256sum "$1" | awk '{print $1}'
+	else
+		shasum -a 256 "$1" | awk '{print $1}'
+	fi
+}
+
 STAGE=build/src
 SRC="ssh-gate-$VERSION"
 BUILDER_IMAGE="ssh-gate-builder:${BASE_IMAGE#*:}"
@@ -53,7 +66,7 @@ docker build --platform "$PLATFORM" -t "$BUILDER_IMAGE" \
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/$SRC" dist
-rm -f dist/ssh-gate_*
+rm -f dist/ssh-gate_* dist/SHA256SUMS.txt
 
 echo "== stage $SRC"
 rsync -a --exclude .git/ --exclude .qwen/ --exclude build/ --exclude dist/ \
@@ -88,5 +101,22 @@ for rev in "${REVISIONS[@]}"; do
 			cat /tmp/ctl/conffiles 2>/dev/null || echo none
 			dpkg-deb -c "$DEB" | awk "{print \$NF}" | grep -v "^\./$"'
 done
+
+# One line per package: "<hash>  <name>". The names are the ones the release host
+# serves, with "~" replaced by ".", because that is what the reader has next to
+# the file after downloading. No comment lines: sha256sum -c reports them as
+# improperly formatted.
+echo "== checksums"
+{
+	for rev in "${REVISIONS[@]}"; do
+		deb="dist/ssh-gate_${VERSION}-${rev}_amd64.deb"
+		if [ ! -f "$deb" ]; then
+			echo "missing $deb, refusing to write checksums" >&2
+			exit 1
+		fi
+		printf '%s  %s\n' "$(sha256_of "$deb")" "$(basename "$deb" | tr '~' '.')"
+	done
+} > dist/SHA256SUMS.txt
+cat dist/SHA256SUMS.txt
 
 ls -l dist/
