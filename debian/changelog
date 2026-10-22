@@ -1,3 +1,13 @@
+ssh-gate (0.2.0-1) unstable; urgency=medium
+
+  * Support multiple listen addresses for the SOCKS5 and HTTP proxies:
+    SOCKS5_LISTEN and HTTP_LISTEN now accept a comma-separated list,
+    one proxy server per address.
+  * Reject listen addresses without a port: an empty port made
+    net.Listen bind to a random ephemeral port.
+
+ -- Nikita Kozlov <niakrisn@gmail.com>  Thu, 22 Oct 2026 10:06:41 +0300
+
 ssh-gate (0.1.1-1) unstable; urgency=medium
 
   * Self-heal dead SSH links, correct routing, bounded shutdown.

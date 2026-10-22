@@ -60,12 +60,14 @@ Comma-separated list of proxies to serve:
 Default
 .BR socks5 .
 .TP
-.BI "SOCKS5_LISTEN=" addr
-SOCKS5 listen address. Default
+.BI "SOCKS5_LISTEN=" addrs
+Comma-separated list of SOCKS5 listen addresses, one proxy server per
+address. Default
 .BR 127.0.0.1:1080 .
 .TP
-.BI "HTTP_LISTEN=" addr
-HTTP proxy listen address. Default
+.BI "HTTP_LISTEN=" addrs
+Comma-separated list of HTTP proxy listen addresses, one proxy server per
+address. Default
 .BR 127.0.0.1:3128 .
 .TP
 .BI "HEALTH_LISTEN=" addr

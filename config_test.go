@@ -196,6 +196,82 @@ func TestLoadConfigDialTimeoutCap(t *testing.T) {
 	}
 }
 
+// TestParseListenList covers comma-separated listen-address lists: items are
+// trimmed, empty items skipped, each item must be host:port, at least one
+// address is required.
+func TestParseListenList(t *testing.T) {
+	cases := []struct {
+		raw     string
+		want    []string
+		wantErr bool
+	}{
+		{raw: ":1080", want: []string{":1080"}},
+		{raw: "0.0.0.0:1080,127.0.0.1:1081", want: []string{"0.0.0.0:1080", "127.0.0.1:1081"}},
+		{raw: " :1080 , :1081 ,", want: []string{":1080", ":1081"}},
+		{raw: ",,:", want: nil, wantErr: true},
+		{raw: ":1080,bad", want: nil, wantErr: true},
+		{raw: "1080", want: nil, wantErr: true},
+	}
+	for _, c := range cases {
+		got, err := parseListenList("TEST_LISTEN", c.raw)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("parseListenList(%q): expected error, got nil", c.raw)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseListenList(%q): unexpected error: %v", c.raw, err)
+			continue
+		}
+		if len(got) != len(c.want) {
+			t.Errorf("parseListenList(%q) = %v, want %v", c.raw, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("parseListenList(%q) = %v, want %v", c.raw, got, c.want)
+			}
+		}
+	}
+}
+
+// TestLoadConfigListenLists: SOCKS5_LISTEN / HTTP_LISTEN accept a single
+// address (backward compatible) and a comma-separated list.
+func TestLoadConfigListenLists(t *testing.T) {
+	t.Setenv("PROXY_MODES", "socks5,http")
+	t.Setenv("SSH_HOST", "h")
+	t.Setenv("SSH_USER", "u")
+
+	t.Setenv("SOCKS5_LISTEN", ":1080")
+	t.Setenv("HTTP_LISTEN", ":3128")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("single addresses: %v", err)
+	}
+	if len(cfg.socks5Addrs) != 1 || cfg.socks5Addrs[0] != ":1080" ||
+		len(cfg.httpAddrs) != 1 || cfg.httpAddrs[0] != ":3128" {
+		t.Fatalf("single addresses: got socks5=%v http=%v", cfg.socks5Addrs, cfg.httpAddrs)
+	}
+
+	t.Setenv("SOCKS5_LISTEN", ":1080,127.0.0.1:1081")
+	t.Setenv("HTTP_LISTEN", "0.0.0.0:3128, [::]:3128 ")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatalf("lists: %v", err)
+	}
+	wantSocks5 := []string{":1080", "127.0.0.1:1081"}
+	wantHTTP := []string{"0.0.0.0:3128", "[::]:3128"}
+	if len(cfg.socks5Addrs) != len(wantSocks5) || len(cfg.httpAddrs) != len(wantHTTP) {
+		t.Fatalf("lists: got socks5=%v http=%v", cfg.socks5Addrs, cfg.httpAddrs)
+	}
+	for i := range wantSocks5 {
+		if cfg.socks5Addrs[i] != wantSocks5[i] || cfg.httpAddrs[i] != wantHTTP[i] {
+			t.Fatalf("lists: got socks5=%v http=%v", cfg.socks5Addrs, cfg.httpAddrs)
+		}
+	}
+}
+
 // TestLoadConfigDohHostEmptyDisables: DOH_HOST is read strictly — unset
 // falls back to the default endpoint, set-but-empty disables DoH as the
 // documentation promises. The old getEnv path collapsed empty to the

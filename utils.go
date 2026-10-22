@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"strings"
+	"net"
 )
 
 // contains checks if a string is present in a slice.
@@ -36,13 +36,14 @@ func validatePort(port int) error {
 	return nil
 }
 
-// validateHostPort validates a host:port string.
+// validateHostPort validates a host:port string. An empty port is rejected:
+// net.Listen would treat it as an ephemeral port, which is never intended.
 func validateHostPort(hostPort string) error {
 	if hostPort == "" {
 		return fmt.Errorf("empty host:port")
 	}
-	// Basic validation - more comprehensive validation happens at runtime
-	if !strings.Contains(hostPort, ":") && hostPort != "" {
+	_, port, err := net.SplitHostPort(hostPort)
+	if err != nil || port == "" {
 		return fmt.Errorf("invalid host:port format: %s (expected host:port)", hostPort)
 	}
 	return nil

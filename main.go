@@ -22,8 +22,8 @@ type config struct {
 	sshUser              string
 	dataDir              string
 	proxyModes           []string
-	socks5Addr           string
-	httpAddr             string
+	socks5Addrs          []string
+	httpAddrs            []string
 	directRules          string
 	directIPFamily       IPFamily
 	dohHost              string
@@ -104,22 +104,28 @@ func main() {
 
 	var servers []server
 
+	// One server instance per listen address; all instances share the
+	// Opener (route policy, DNS, SSH dialer).
 	if contains(cfg.proxyModes, "socks5") {
-		s5, err := NewSOCKS5Server(cfg.socks5Addr, opener)
-		if err != nil {
-			log.Fatal().Err(err).Msg("SOCKS5 server")
+		for _, addr := range cfg.socks5Addrs {
+			s5, err := NewSOCKS5Server(addr, opener)
+			if err != nil {
+				log.Fatal().Err(err).Str("listen", addr).Msg("SOCKS5 server")
+			}
+			s5.Start()
+			servers = append(servers, server{Name: "SOCKS5 " + addr, Shutdown: s5.Shutdown})
 		}
-		s5.Start()
-		servers = append(servers, server{Name: "SOCKS5", Shutdown: s5.Shutdown})
 	}
 
 	if contains(cfg.proxyModes, "http") {
-		hp, err := NewHTTPProxyServer(cfg.httpAddr, opener)
-		if err != nil {
-			log.Fatal().Err(err).Msg("HTTP proxy")
+		for _, addr := range cfg.httpAddrs {
+			hp, err := NewHTTPProxyServer(addr, opener)
+			if err != nil {
+				log.Fatal().Err(err).Str("listen", addr).Msg("HTTP proxy")
+			}
+			hp.Start()
+			servers = append(servers, server{Name: "HTTP " + addr, Shutdown: hp.Shutdown})
 		}
-		hp.Start()
-		servers = append(servers, server{Name: "HTTP", Shutdown: hp.Shutdown})
 	}
 
 	// Health/ready endpoint + Web UI.
@@ -227,15 +233,16 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("invalid SSH_DIAL_TIMEOUT %s: must be below %s (connection history window)", dialTimeout, connHistoryMaxAge)
 	}
 
-	// Validate listen addresses
-	socks5Addr := getEnv("SOCKS5_LISTEN", ":1080")
-	if err := validateHostPort(socks5Addr); err != nil {
-		return config{}, fmt.Errorf("invalid SOCKS5_LISTEN: %w", err)
+	// Validate listen addresses (comma-separated lists; one server per
+	// address).
+	socks5Addrs, err := parseListenList("SOCKS5_LISTEN", getEnv("SOCKS5_LISTEN", ":1080"))
+	if err != nil {
+		return config{}, err
 	}
 
-	httpAddr := getEnv("HTTP_LISTEN", ":3128")
-	if err := validateHostPort(httpAddr); err != nil {
-		return config{}, fmt.Errorf("invalid HTTP_LISTEN: %w", err)
+	httpAddrs, err := parseListenList("HTTP_LISTEN", getEnv("HTTP_LISTEN", ":3128"))
+	if err != nil {
+		return config{}, err
 	}
 
 	healthAddr := getEnv("HEALTH_LISTEN", "127.0.0.1:9090")
@@ -286,8 +293,8 @@ func loadConfig() (config, error) {
 		sshUser:              sshUser,
 		dataDir:              dataDir,
 		proxyModes:           modes,
-		socks5Addr:           socks5Addr,
-		httpAddr:             httpAddr,
+		socks5Addrs:          socks5Addrs,
+		httpAddrs:            httpAddrs,
 		directRules:          getEnv("DIRECT_RULES", ""),
 		directIPFamily:       directIPFamily,
 		dohHost:              dohHost,
@@ -316,6 +323,27 @@ func parseModes(raw string) ([]string, error) {
 		return []string{"socks5"}, nil
 	}
 	return modes, nil
+}
+
+// parseListenList parses a comma-separated list of host:port listen
+// addresses (one proxy server per address). Whitespace around items is
+// ignored, empty items are skipped, at least one address is required.
+func parseListenList(name, raw string) ([]string, error) {
+	var addrs []string
+	for _, addr := range strings.Split(raw, ",") {
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			continue
+		}
+		if err := validateHostPort(addr); err != nil {
+			return nil, fmt.Errorf("invalid %s address %q: %w", name, addr, err)
+		}
+		addrs = append(addrs, addr)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("invalid %s %q: no listen addresses", name, raw)
+	}
+	return addrs, nil
 }
 
 func setLogLevel(level string) {
@@ -411,6 +439,25 @@ func getEnvRequired(key string) (string, error) {
 	return v, nil
 }
 
+// firstRunPorts returns the unique ports of the listen addresses in order,
+// so the first-run hint lists each reachable port once. An address without
+// a parseable port falls back to the protocol default.
+func firstRunPorts(addrs []string, defaultPort string) []string {
+	seen := map[string]bool{}
+	var ports []string
+	for _, addr := range addrs {
+		_, port, _ := net.SplitHostPort(addr)
+		if port == "" {
+			port = defaultPort
+		}
+		if !seen[port] {
+			seen[port] = true
+			ports = append(ports, port)
+		}
+	}
+	return ports
+}
+
 func printFirstRun(pubKey string, cfg config) {
 	fmt.Println()
 	fmt.Println("=== ssh-gate first run ===")
@@ -421,19 +468,15 @@ func printFirstRun(pubKey string, cfg config) {
 	fmt.Println()
 
 	if contains(cfg.proxyModes, "socks5") {
-		_, port, _ := net.SplitHostPort(cfg.socks5Addr)
-		if port == "" {
-			port = "1080"
+		for _, port := range firstRunPorts(cfg.socks5Addrs, "1080") {
+			fmt.Printf("SOCKS5 proxy: localhost:%s\n", port)
 		}
-		fmt.Printf("SOCKS5 proxy: localhost:%s\n", port)
 	}
 
 	if contains(cfg.proxyModes, "http") {
-		_, port, _ := net.SplitHostPort(cfg.httpAddr)
-		if port == "" {
-			port = "3128"
+		for _, port := range firstRunPorts(cfg.httpAddrs, "3128") {
+			fmt.Printf("HTTP proxy:  localhost:%s\n", port)
 		}
-		fmt.Printf("HTTP proxy:  localhost:%s\n", port)
 	}
 	fmt.Println()
 }

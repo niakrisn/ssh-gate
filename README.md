@@ -47,8 +47,8 @@ in the background until the tunnel comes up.
 | `SSH_KEEPALIVE_INTERVAL` | no | `1s` | Keepalive probe retransmission interval (Go duration, rounded to whole seconds). `0` keeps the kernel default |
 | `SSH_KEEPALIVE_PROBES` | no | `5` | Unanswered keepalive probes before the connection is declared dead. `0` keeps the kernel default. Worst-case silent-death detection = `PERIOD + INTERVAL x PROBES` (defaults: 15 s) |
 | `PROXY_MODES` | no | `socks5` | Comma-separated: `socks5`, `http` |
-| `SOCKS5_LISTEN` | no | `:1080` | SOCKS5 listen address |
-| `HTTP_LISTEN` | no | `:3128` | HTTP proxy listen address (CONNECT + absolute-form requests) |
+| `SOCKS5_LISTEN` | no | `:1080` | SOCKS5 listen address(es), comma-separated for several |
+| `HTTP_LISTEN` | no | `:3128` | HTTP proxy listen address(es) (CONNECT + absolute-form requests), comma-separated for several |
 | `DIRECT_RULES` | no | — | Comma-separated rules for direct connections (see below) |
 | `DIRECT_IP_FAMILY` | no | `both` | Address families for direct: `ipv4`, `ipv6`, `both` (compose sets `ipv4`) |
 | `DOH_HOST` | no | `cloudflare-dns.com` | DNS-over-HTTPS endpoint for tunnel destinations, queried through the SSH tunnel; direct destinations keep local DNS. Definitive DoH answers, including NXDOMAIN, are authoritative; the local resolver is a fallback only while the endpoint is unreachable. An empty value disables DoH; under compose interpolation (`${DOH_HOST:-cloudflare-dns.com}`) an empty value becomes the default, so remove the variable to disable it there |

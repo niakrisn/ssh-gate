@@ -162,6 +162,21 @@ func TestValidateHostPort(t *testing.T) {
 			hostPort: "localhost",
 			wantErr:  true,
 		},
+		{
+			name:     "empty port",
+			hostPort: ":",
+			wantErr:  true,
+		},
+		{
+			name:     "empty host port",
+			hostPort: "localhost:",
+			wantErr:  true,
+		},
+		{
+			name:     "valid ipv6 literal",
+			hostPort: "[::1]:8080",
+			wantErr:  false,
+		},
 	}
 
 	for _, tt := range tests {

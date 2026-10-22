@@ -18,7 +18,9 @@ SSH_DIAL_TIMEOUT=30s
 PROXY_MODES=socks5
 
 # Listen addresses. Loopback by default; set 0.0.0.0 to serve the whole
-# network. The Web UI and /healthz are served on HEALTH_LISTEN.
+# network. Comma-separated for several, e.g. 127.0.0.1:1080,0.0.0.0:1081 -
+# one proxy server per address. The Web UI and /healthz are served on
+# HEALTH_LISTEN.
 SOCKS5_LISTEN=127.0.0.1:1080
 HTTP_LISTEN=127.0.0.1:3128
 HEALTH_LISTEN=127.0.0.1:9090
