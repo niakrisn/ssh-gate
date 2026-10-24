@@ -13,13 +13,14 @@
 # rewrite. The stage comes from the working tree, not from HEAD, so uncommitted
 # packaging changes can be tested.
 #
-# Results land in dist/: the binary .deb plus .changes and .buildinfo provenance,
-# each package verified inside the release it is built for, and SHA256SUMS.txt
-# holding the checksums of those packages under the names a release host serves
-# (GitHub rewrites "~" to "." in asset names), so the file verifies next to the
-# downloaded packages rather than in dist/.
+# Results land in dist/: the binary .deb plus .changes and .buildinfo
+# provenance, each package verified inside the release it is built for, and
+# SHA256SUMS.txt holding the checksums of those packages under the names a
+# release host serves (GitHub rewrites "~" to "." in asset names), so the file
+# verifies next to the downloaded packages rather than in dist/.
 # Override the version with VERSION=..., the builder base with BASE_IMAGE=...,
-# the target list with REVISIONS="1~deb12u1 1~deb13u1 1~ubuntu22.04u1 1~ubuntu24.04u1".
+# the target list with REVISIONS=... (default below). A new target needs no
+# other change: the release image and its codename come from the revision.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -30,20 +31,25 @@ VERSION="${VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
 VERSION="${VERSION:-0.0.0}"
 read -r -a REVISIONS <<<"${REVISIONS:-1~deb12u1 1~deb13u1 1~ubuntu22.04u1 1~ubuntu24.04u1}"
 
-# A revision says which release it targets, and that release is the environment
-# the package gets checked in. Fail rather than verify a Debian 13 package with
-# Debian 12 tools.
+# A revision says which release it targets (~debN, ~ubuntuX.Y), and that
+# release is the environment the package gets checked in. Fail rather than
+# verify a Debian 13 package with Debian 12 tools.
 container_for_revision() {
-	case $1 in
-		*~deb12u*) echo debian:12 ;;
-		*~deb13u*) echo debian:13 ;;
-		*~ubuntu22.04u*) echo ubuntu:22.04 ;;
-		*~ubuntu24.04u*) echo ubuntu:24.04 ;;
-		*)
-			echo "no container image mapped to revision $1" >&2
-			return 1
-			;;
-	esac
+	if [[ $1 =~ ~deb([0-9]+)u[0-9]+$ ]]; then
+		echo "debian:${BASH_REMATCH[1]}"
+	elif [[ $1 =~ ~ubuntu([0-9]+\.[0-9]+)u[0-9]+$ ]]; then
+		echo "ubuntu:${BASH_REMATCH[1]}"
+	else
+		echo "no release image for revision $1 (want ~debN or ~ubuntuX.Y)" >&2
+		return 1
+	fi
+}
+
+# The codename of a release image (bookworm, noble), for the Distribution
+# field of the .changes and .buildinfo files.
+codename_of() {
+	docker run --rm --platform "$PLATFORM" "$1" \
+		sh -c '. /etc/os-release && echo "$VERSION_CODENAME"'
 }
 
 # coreutils and current macOS name the tool sha256sum, the BSDs ship shasum.
@@ -66,6 +72,20 @@ docker build --platform "$PLATFORM" -t "$BUILDER_IMAGE" \
 	--build-arg BASE_IMAGE="$BASE_IMAGE" \
 	-f packaging/Dockerfile.builder packaging
 
+# Map every revision before building: a typo fails here, not after all builds.
+# DISTS[i] is the codename for REVISIONS[i] (an indexed array: macOS ships
+# bash 3.2, which has no associative ones).
+DISTS=()
+for rev in "${REVISIONS[@]}"; do
+	image=$(container_for_revision "$rev")
+	dist=$(codename_of "$image")
+	if [ -z "$dist" ]; then
+		echo "no VERSION_CODENAME in $image" >&2
+		exit 1
+	fi
+	DISTS+=("$dist")
+done
+
 rm -rf "$STAGE"
 mkdir -p "$STAGE/$SRC" dist
 rm -f dist/ssh-gate_* dist/SHA256SUMS.txt
@@ -74,13 +94,18 @@ echo "== stage $SRC"
 rsync -a --exclude .git/ --exclude .qwen/ --exclude build/ --exclude dist/ \
 	--exclude '*.deb' ./ "$STAGE/$SRC/"
 
-for rev in "${REVISIONS[@]}"; do
-	echo "== build $VERSION-$rev"
+# The Go build cache lives in a volume: the binary is the same for every
+# revision, so only the first build compiles and runs the tests in full. An
+# explicit GOCACHE, because debhelper points HOME elsewhere.
+for i in "${!REVISIONS[@]}"; do
+	rev=${REVISIONS[$i]}
+	echo "== build $VERSION-$rev (${DISTS[$i]})"
 	docker run --rm --platform "$PLATFORM" \
 		-v "$PWD/$STAGE":/w \
 		-v "$PWD/dist":/out \
 		-v ssh-gate-gomod:/go/pkg/mod \
-		-e DEB_VERSION="$VERSION-$rev" -e SRC="$SRC" \
+		-v ssh-gate-gocache:/gocache -e GOCACHE=/gocache \
+		-e DEB_VERSION="$VERSION-$rev" -e DIST="${DISTS[$i]}" -e SRC="$SRC" \
 		-e OWNER="$(id -u):$(id -g)" \
 		"$BUILDER_IMAGE" bash -eu -c '
 			# The build runs as root; hand the stage and the results back
@@ -88,7 +113,7 @@ for rev in "${REVISIONS[@]}"; do
 			# them up.
 			trap "chown -R \"\$OWNER\" /w /out" EXIT
 			cd "/w/$SRC"
-			sed -i "1s/(.*)/($DEB_VERSION)/" debian/changelog
+			sed -i "1s/(.*) [^;]*;/($DEB_VERSION) $DIST;/" debian/changelog
 			dpkg-buildpackage -b -us -uc
 			mv ../*.deb ../*.changes ../*.buildinfo /out/'
 done
