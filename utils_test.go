@@ -46,48 +46,6 @@ func TestContains(t *testing.T) {
 	}
 }
 
-func TestContainsAny(t *testing.T) {
-	tests := []struct {
-		name     string
-		haystack []string
-		needles  []string
-		want     bool
-	}{
-		{
-			name:     "empty haystack",
-			haystack: []string{},
-			needles:  []string{"a"},
-			want:     false,
-		},
-		{
-			name:     "empty needles",
-			haystack: []string{"a", "b"},
-			needles:  []string{},
-			want:     false,
-		},
-		{
-			name:     "found",
-			haystack: []string{"a", "b", "c"},
-			needles:  []string{"b", "d"},
-			want:     true,
-		},
-		{
-			name:     "not found",
-			haystack: []string{"a", "b", "c"},
-			needles:  []string{"d", "e"},
-			want:     false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := containsAny(tt.haystack, tt.needles); got != tt.want {
-				t.Errorf("containsAny(%v, %v) = %v, want %v", tt.haystack, tt.needles, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestValidatePort(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -184,43 +142,6 @@ func TestValidateHostPort(t *testing.T) {
 			err := validateHostPort(tt.hostPort)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateHostPort(%q) error = %v, wantErr %v", tt.hostPort, err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestFirstNonEmpty(t *testing.T) {
-	tests := []struct {
-		name    string
-		strings []string
-		want    string
-	}{
-		{
-			name:    "first non-empty",
-			strings: []string{"", "", "test", "other"},
-			want:    "test",
-		},
-		{
-			name:    "all empty",
-			strings: []string{"", "", ""},
-			want:    "",
-		},
-		{
-			name:    "first is non-empty",
-			strings: []string{"first", "second"},
-			want:    "first",
-		},
-		{
-			name:    "empty list",
-			strings: []string{},
-			want:    "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := firstNonEmpty(tt.strings...); got != tt.want {
-				t.Errorf("firstNonEmpty(%v) = %q, want %q", tt.strings, got, tt.want)
 			}
 		})
 	}

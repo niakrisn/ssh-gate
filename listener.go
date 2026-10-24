@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -39,9 +40,8 @@ func (l keepAliveListener) Accept() (net.Conn, error) {
 // closes the listener, and the HTTP accept-loop exits on error - either way
 // a temporary failure would leave the port open but unserved until restart,
 // while net/http would simply retry. So the only terminal state is "closed";
-// everything else backs off 5 ms..1 s and keeps trying. Close is idempotent
-// because the SOCKS5 shutdown closes the listener twice (library defer plus
-// our Shutdown).
+// everything else backs off 5 ms..1 s and keeps trying. Close is idempotent,
+// so a repeated Close from a shutdown path is harmless.
 type resilientListener struct {
 	net.Listener
 	closed atomic.Bool
@@ -81,4 +81,96 @@ func (l *resilientListener) Accept() (net.Conn, error) {
 			delay = time.Second
 		}
 	}
+}
+
+// connLimiter caps concurrent client connections shared by all proxy
+// listeners: each proxied connection holds at least one file descriptor
+// and a goroutine, so an unbounded burst from the network exhausts both.
+// A nil limiter means no limit.
+type connLimiter struct {
+	slots chan struct{}
+}
+
+// newConnLimiter returns a limiter for n connections, or nil (no limit)
+// for n <= 0.
+func newConnLimiter(n int) *connLimiter {
+	if n <= 0 {
+		return nil
+	}
+	return &connLimiter{slots: make(chan struct{}, n)}
+}
+
+func (l *connLimiter) tryAcquire() bool {
+	select {
+	case l.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *connLimiter) release() { <-l.slots }
+
+// limitListener refuses connections over the limit: it accepts and closes
+// them at once, so the client gets an immediate error instead of waiting
+// in the kernel backlog. The slot is released when the connection closes.
+type limitListener struct {
+	net.Listener
+	limit   *connLimiter
+	refused atomic.Bool // in a refusal burst: Warn once, then Debug
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if l.limit.tryAcquire() {
+			l.refused.Store(false)
+			return &limitedConn{Conn: c, limit: l.limit}, nil
+		}
+		ev := log.Debug()
+		if !l.refused.Swap(true) {
+			ev = log.Warn()
+		}
+		ev.Str("src", c.RemoteAddr().String()).Int("limit", cap(l.limit.slots)).Msg("connection limit reached, connection refused")
+		c.Close()
+	}
+}
+
+// limitedConn returns its slot on the first Close. Half-close is forwarded:
+// both proxies half-close the client side at the end of a relay.
+type limitedConn struct {
+	net.Conn
+	limit *connLimiter
+	once  sync.Once
+}
+
+func (c *limitedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.limit.release)
+	return err
+}
+
+func (c *limitedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func (c *limitedConn) CloseRead() error {
+	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
+
+// limitConns wraps ln with limit; a nil limit returns ln unchanged.
+func limitConns(ln net.Listener, limit *connLimiter) net.Listener {
+	if limit == nil {
+		return ln
+	}
+	return &limitListener{Listener: ln, limit: limit}
 }

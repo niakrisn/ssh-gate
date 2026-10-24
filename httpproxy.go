@@ -7,19 +7,27 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
 )
 
-// requestTimeout bounds a stalled client in absolute-form mode (request body
-// upload and response download). CONNECT tunnels stay unbounded on purpose.
-const requestTimeout = 5 * time.Minute
+// httpIdleTimeout ends an absolute-form request once no byte has moved in
+// either direction for this long (stalled client or stalled upstream). It
+// is an idle bound, not a total one: a long download that keeps moving is
+// never cut. CONNECT tunnels stay unbounded on purpose. A var so tests can
+// shorten it; a server copies it when created.
+var httpIdleTimeout = 5 * time.Minute
+
+// headerReadTimeout bounds reading the request line and headers.
+const headerReadTimeout = 30 * time.Second
 
 // maxReframedBody bounds the buffer for bodies that must be re-framed with
 // Content-Length (chunked or close-delimited): forwarding them requires
@@ -36,6 +44,8 @@ type HTTPProxyServer struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup // in-flight handleConn goroutines
 	opener    *Opener
+	// idleTimeout is httpIdleTimeout at construction.
+	idleTimeout time.Duration
 }
 
 func NewHTTPProxyServer(listen string, opener *Opener) (*HTTPProxyServer, error) {
@@ -48,10 +58,16 @@ func NewHTTPProxyServer(listen string, opener *Opener) (*HTTPProxyServer, error)
 		// half-dead CONNECT relay (see keepAliveListener); the resilient
 		// wrapper keeps the accept loop alive through transient errors,
 		// so an error here only ever means shutdown.
-		ln:     &resilientListener{Listener: keepAliveListener{Listener: ln}},
-		shutCh: make(chan struct{}),
-		opener: opener,
+		ln:          &resilientListener{Listener: keepAliveListener{Listener: ln}},
+		shutCh:      make(chan struct{}),
+		opener:      opener,
+		idleTimeout: httpIdleTimeout,
 	}, nil
+}
+
+// SetConnLimit applies the shared connection limit. Call before Start.
+func (s *HTTPProxyServer) SetConnLimit(l *connLimiter) {
+	s.ln = limitConns(s.ln, l)
 }
 
 func (s *HTTPProxyServer) Start() {
@@ -118,14 +134,25 @@ func (s *HTTPProxyServer) handleConn(client net.Conn) {
 	// socket segment, so payload pipelined behind the headers (TLS
 	// ClientHello right after CONNECT, GET body) lives in this buffer and
 	// must be drained by the same reader the relay copies from.
-	br := bufio.NewReader(client)
-	_ = client.SetReadDeadline(time.Now().Add(30 * time.Second))
+	// http.ReadRequest has no header size limit (http.Server adds one
+	// through MaxHeaderBytes), so the limited reader caps what a client
+	// can make us buffer within the read deadline; the limit is lifted
+	// once the headers are parsed, the body and the CONNECT relay read
+	// through the same reader.
+	lr := &io.LimitedReader{R: client, N: http.DefaultMaxHeaderBytes}
+	br := bufio.NewReader(lr)
+	_ = client.SetReadDeadline(time.Now().Add(headerReadTimeout))
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		log.Warn().Str("client", client.RemoteAddr().String()).Err(err).Msg("http: bad request")
+		if lr.N <= 0 {
+			writeHTTPErr(client, http.StatusRequestHeaderFieldsTooLarge, "Request Header Fields Too Large")
+			return
+		}
 		writeHTTPErr(client, http.StatusBadRequest, "Bad Request")
 		return
 	}
+	lr.N = math.MaxInt64
 	_ = client.SetReadDeadline(time.Time{})
 
 	switch {
@@ -189,7 +216,11 @@ func (s *HTTPProxyServer) handleConnect(client net.Conn, src io.Reader, req *htt
 		writeHTTPErr(client, http.StatusBadRequest, "Bad CONNECT target")
 		return
 	}
-	portInt, _ := strconv.Atoi(port)
+	portInt, err := strconv.Atoi(port)
+	if err != nil || validatePort(portInt) != nil {
+		writeHTTPErr(client, http.StatusBadRequest, "Bad CONNECT target port")
+		return
+	}
 
 	lc, err := s.openUpstream(context.Background(), client.RemoteAddr().String(), "CONNECT", host, portInt)
 	if err != nil {
@@ -222,7 +253,12 @@ func (s *HTTPProxyServer) handleHTTP(client net.Conn, req *http.Request) {
 	host := u.Hostname()
 	port := 80
 	if p := u.Port(); p != "" {
-		port, _ = strconv.Atoi(p)
+		var err error
+		port, err = strconv.Atoi(p)
+		if err != nil || validatePort(port) != nil {
+			writeHTTPErr(client, http.StatusBadRequest, "Bad target port")
+			return
+		}
 	}
 
 	// Only plain "chunked" is re-framable; any other Transfer-Encoding
@@ -240,9 +276,18 @@ func (s *HTTPProxyServer) handleHTTP(client net.Conn, req *http.Request) {
 	}
 	defer lc.Close()
 
-	// One request per connection; bound the stalled-client window.
-	_ = client.SetReadDeadline(time.Now().Add(requestTimeout))
-	_ = client.SetWriteDeadline(time.Now().Add(requestTimeout))
+	// One request per connection. The SSH channel has no deadlines, so a
+	// watchdog closes both sides after idleTimeout without progress.
+	raw := client
+	g := newIdleGuard(s.idleTimeout, func() {
+		log.Info().Str("src", raw.RemoteAddr().String()).Str("host", host).Msg("http: idle timeout")
+		raw.Close()
+		lc.Close()
+	})
+	defer g.stop()
+	client = &guardedConn{Conn: client, g: g}
+	upstream := &guardedConn{Conn: lc, g: g}
+	reqBody := &guardedReader{r: req.Body, g: g}
 
 	// Rewrite the request to origin form. One request per connection: force
 	// Connection: close so the upstream closes after replying and the
@@ -261,7 +306,7 @@ func (s *HTTPProxyServer) handleHTTP(client net.Conn, req *http.Request) {
 
 	var body []byte
 	if hasBody && (chunked || closeDelimited) {
-		b, err := io.ReadAll(io.LimitReader(req.Body, maxReframedBody+1))
+		b, err := io.ReadAll(io.LimitReader(reqBody, maxReframedBody+1))
 		if err != nil {
 			writeHTTPErr(client, http.StatusRequestEntityTooLarge, "Body read failed")
 			return
@@ -293,25 +338,100 @@ func (s *HTTPProxyServer) handleHTTP(client net.Conn, req *http.Request) {
 		}
 	}
 	io.WriteString(head, "Connection: close\r\n\r\n")
-	io.WriteString(lc, head.String())
+	io.WriteString(upstream, head.String())
 
 	if body != nil {
-		if _, err := lc.Write(body); err != nil {
+		if _, err := upstream.Write(body); err != nil {
 			writeHTTPErr(client, http.StatusBadGateway, "Body transfer failed")
 			return
 		}
 	} else if hasBody {
-		if _, err := io.Copy(lc, req.Body); err != nil {
+		if _, err := io.Copy(upstream, reqBody); err != nil {
 			writeHTTPErr(client, http.StatusBadGateway, "Body transfer failed")
 			return
 		}
 	}
 
-	io.Copy(client, lc)
+	io.Copy(client, upstream)
 }
 
 func writeHTTPErr(w io.Writer, code int, msg string) {
 	body := msg + "\r\n"
 	fmt.Fprintf(w, "HTTP/1.1 %d %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
 		code, http.StatusText(code), len(body), body)
+}
+
+// idleGuard runs onIdle once no I/O went through its guarded conns for
+// timeout. Progress is an atomic timestamp checked by one goroutine, so the
+// relay hot path costs one atomic store per call.
+type idleGuard struct {
+	last atomic.Int64 // unix nanos of the last progress
+	done chan struct{}
+	once sync.Once
+}
+
+func newIdleGuard(timeout time.Duration, onIdle func()) *idleGuard {
+	g := &idleGuard{done: make(chan struct{})}
+	g.touch()
+	check := timeout / 10
+	if check > time.Second {
+		check = time.Second
+	}
+	go func() {
+		t := time.NewTicker(check)
+		defer t.Stop()
+		for {
+			select {
+			case <-g.done:
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, g.last.Load())) >= timeout {
+					onIdle()
+					return
+				}
+			}
+		}
+	}()
+	return g
+}
+
+func (g *idleGuard) touch() { g.last.Store(time.Now().UnixNano()) }
+
+func (g *idleGuard) stop() { g.once.Do(func() { close(g.done) }) }
+
+// guardedConn reports every byte moved to its idleGuard.
+type guardedConn struct {
+	net.Conn
+	g *idleGuard
+}
+
+func (c *guardedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.g.touch()
+	}
+	return n, err
+}
+
+func (c *guardedConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.g.touch()
+	}
+	return n, err
+}
+
+// guardedReader reports every byte read to its idleGuard; the request body
+// is read through the header reader, not through guardedConn.
+type guardedReader struct {
+	r io.Reader
+	g *idleGuard
+}
+
+func (r *guardedReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.g.touch()
+	}
+	return n, err
 }

@@ -7,8 +7,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -265,7 +267,8 @@ func TestWebUIStatusAPIUnreachable(t *testing.T) {
 		t.Fatalf("port: %v", err)
 	}
 
-	addr := startTestHealth(t, testDialer{}, nil, deadHost, deadPort)
+	// Disconnected: with a live session the probe does not dial at all.
+	addr := startTestHealth(t, disconnectedDialer{}, nil, deadHost, deadPort)
 
 	var out struct {
 		SSH struct {
@@ -369,5 +372,143 @@ func TestWebUIStaticAndHealth(t *testing.T) {
 	code, body := getAPI(t, base+"/api/connections?tab=history")
 	if code != http.StatusOK || body.Total != 0 || len(body.Items) != 0 {
 		t.Fatalf("nil tracker: code=%d body=%+v", code, body)
+	}
+}
+
+// getWithHost sends GET path to addr with the given Host header.
+func getWithHost(t *testing.T, addr, path, host string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+path, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Host = host
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s (Host %s): %v", path, host, err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp
+}
+
+// TestWebUIHostGuard: the UI and the API answer only to allowed Host names.
+// Without the check a page in a local browser could rebind its own name to
+// 127.0.0.1 and read the connection history same-origin. Health probes stay
+// open to any Host.
+func TestWebUIHostGuard(t *testing.T) {
+	tr := NewConnTracker(10, time.Minute)
+	h, err := NewHealthServer("127.0.0.1:0", "127.0.0.1", 22, testDialer{}, tr)
+	if err != nil {
+		t.Fatalf("NewHealthServer: %v", err)
+	}
+	h.AllowHosts([]string{"gate.lan"})
+	h.Start()
+	t.Cleanup(func() { h.Shutdown(context.Background()) })
+	addr := h.ln.Addr().String()
+	_, port, _ := net.SplitHostPort(addr)
+
+	for _, path := range []string{"/", "/app.js", "/api/connections", "/api/status"} {
+		if resp := getWithHost(t, addr, path, "evil.example:"+port); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("GET %s with foreign Host = %d, want 403", path, resp.StatusCode)
+		}
+	}
+	for _, host := range []string{"127.0.0.1:" + port, "localhost:" + port, "LocalHost", "[::1]:" + port, "gate.lan", "GATE.LAN.:" + port} {
+		resp := getWithHost(t, addr, "/api/status", host)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET /api/status with Host %s = %d, want 200", host, resp.StatusCode)
+			continue
+		}
+		if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+		}
+		if got := resp.Header.Get("Content-Security-Policy"); !strings.Contains(got, "default-src 'self'") {
+			t.Errorf("Content-Security-Policy = %q, want default-src 'self'", got)
+		}
+	}
+	for _, path := range []string{"/healthz", "/readyz"} {
+		if resp := getWithHost(t, addr, path, "10.0.0.7:"+port); resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s with any Host = %d, want 200", path, resp.StatusCode)
+		}
+	}
+}
+
+// TestWebUIHostGuardListenHost: a specific listen address is an allowed
+// name; an unspecified one is not.
+func TestWebUIHostGuardListenHost(t *testing.T) {
+	h, err := NewHealthServer("0.0.0.0:0", "127.0.0.1", 22, testDialer{}, nil)
+	if err != nil {
+		t.Fatalf("NewHealthServer: %v", err)
+	}
+	defer h.ln.Close()
+	if h.allowedHosts["0.0.0.0"] {
+		t.Fatal("unspecified listen host 0.0.0.0 allowed as a Host name")
+	}
+	h2, err := NewHealthServer("127.0.0.2:0", "127.0.0.1", 22, testDialer{}, nil)
+	if err != nil {
+		t.Skipf("127.0.0.2 not bindable: %v", err)
+	}
+	defer h2.ln.Close()
+	if !h2.allowedHosts["127.0.0.2"] {
+		t.Fatal("specific listen host 127.0.0.2 not allowed")
+	}
+}
+
+// disconnectedDialer is a testDialer whose SSH session is down.
+type disconnectedDialer struct{ testDialer }
+
+func (disconnectedDialer) Connected() bool { return false }
+
+// TestHealthProbeSkipsDialWhileConnected: with a live session reporting
+// tcp_info the probe must not open connections to sshd (each one is a
+// [preauth] log line on the server); reachability and RTT come from the
+// session.
+func TestHealthProbeSkipsDialWhileConnected(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	defer l.Close()
+	var accepts atomic.Int64
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			accepts.Add(1)
+			c.Close()
+		}
+	}()
+	host, portStr, _ := net.SplitHostPort(l.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	h, err := NewHealthServer("127.0.0.1:0", host, port, testDialer{}, nil)
+	if err != nil {
+		t.Fatalf("NewHealthServer: %v", err)
+	}
+	defer h.ln.Close()
+	h.runProbe()
+	rec := httptest.NewRecorder()
+	h.statusHandler(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	var out struct {
+		SSH struct {
+			Reachable bool  `json:"reachable"`
+			RttMs     int64 `json:"rtt_ms"`
+		} `json:"ssh"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !out.SSH.Reachable || out.SSH.RttMs != 42 {
+		t.Fatalf("status = reachable %v rtt %d, want true and the session RTT 42", out.SSH.Reachable, out.SSH.RttMs)
+	}
+
+	// Disconnected: the probe dials.
+	h.dialer = disconnectedDialer{}
+	h.runProbe()
+	time.Sleep(100 * time.Millisecond)
+	if n := accepts.Load(); n != 1 {
+		t.Fatalf("probe connections = %d, want 1 (none while connected, one when down)", n)
 	}
 }

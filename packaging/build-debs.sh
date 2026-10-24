@@ -25,7 +25,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 PLATFORM="${PLATFORM:-linux/amd64}"
-BASE_IMAGE="${BASE_IMAGE:-golang:1.26-bookworm}"
+BASE_IMAGE="${BASE_IMAGE:-golang:1.26.10-bookworm}"
 VERSION="${VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')}"
 VERSION="${VERSION:-0.0.0}"
 read -r -a REVISIONS <<<"${REVISIONS:-1~deb12u1 1~deb13u1 1~ubuntu22.04u1}"
@@ -62,6 +62,7 @@ BUILDER_IMAGE="ssh-gate-builder:${BASE_IMAGE#*:}"
 # Always run the build: docker reuses the cached layers, so an unchanged
 # Dockerfile costs milliseconds and a changed one cannot be silently ignored.
 docker build --platform "$PLATFORM" -t "$BUILDER_IMAGE" \
+	--build-arg BASE_IMAGE="$BASE_IMAGE" \
 	-f packaging/Dockerfile.builder packaging
 
 rm -rf "$STAGE"
@@ -79,7 +80,12 @@ for rev in "${REVISIONS[@]}"; do
 		-v "$PWD/dist":/out \
 		-v ssh-gate-gomod:/go/pkg/mod \
 		-e DEB_VERSION="$VERSION-$rev" -e SRC="$SRC" \
+		-e OWNER="$(id -u):$(id -g)" \
 		"$BUILDER_IMAGE" bash -eu -c '
+			# The build runs as root; hand the stage and the results back
+			# to the caller even on failure, or the next run cannot clean
+			# them up.
+			trap "chown -R \"\$OWNER\" /w /out" EXIT
 			cd "/w/$SRC"
 			sed -i "1s/(.*)/($DEB_VERSION)/" debian/changelog
 			dpkg-buildpackage -b -us -uc
@@ -94,12 +100,20 @@ for rev in "${REVISIONS[@]}"; do
 	docker run --rm --platform "$PLATFORM" \
 		-v "$PWD/dist":/out:ro -e DEB="/out/$(basename "$deb")" \
 		"$image" sh -c '
+			set -e
 			dpkg-deb -I "$DEB" >/dev/null
 			dpkg-deb -f "$DEB" Package Version Architecture Depends
 			dpkg-deb -e "$DEB" /tmp/ctl
 			printf "conffiles: "
 			cat /tmp/ctl/conffiles 2>/dev/null || echo none
-			dpkg-deb -c "$DEB" | awk "{print \$NF}" | grep -v "^\./$"'
+			dpkg-deb -c "$DEB" | awk "{print \$NF}" | grep -v "^\./$"
+			# The maintainer scripts must leave files they do not own alone.
+			# --force-depends: the check needs no network for ca-certificates.
+			mkdir -p /etc/defaults
+			echo keep >/etc/defaults/other
+			dpkg -i --force-depends "$DEB" >/dev/null
+			test -f /etc/defaults/other || { echo "postinst removed /etc/defaults/other" >&2; exit 1; }
+			echo "install: ok"'
 done
 
 # One line per package: "<hash>  <name>". The names are the ones the release host

@@ -25,8 +25,8 @@ export GOFLAGS := -buildvcs=false
 execute_before_dh_auto_configure:
 	$(GO) version
 	$(GO) mod verify
-	sh packaging/gen-notices.sh /tmp/notices.check
-	cmp /tmp/notices.check THIRD-PARTY-NOTICES || { \
+	sh packaging/gen-notices.sh debian/notices.check
+	cmp debian/notices.check THIRD-PARTY-NOTICES || { \
 		echo "THIRD-PARTY-NOTICES is out of date; run: bash packaging/gen-notices.sh"; \
 		false; }
 
@@ -40,7 +40,7 @@ override_dh_auto_install:
 	install -D -m 0755 bin/ssh-gate debian/tmp/usr/bin/ssh-gate
 
 override_dh_auto_clean:
-	rm -rf bin
+	rm -rf bin debian/notices.check
 
 # The binary is linked with -s -w, so there is no debug info for dwz to
 # compress and nothing for dh_strip to collect.

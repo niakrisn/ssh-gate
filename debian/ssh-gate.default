@@ -4,7 +4,8 @@
 # command substitution. Apply changes with: systemctl restart ssh-gate
 
 # VPS access. Required: the service refuses to start while SSH_HOST or
-# SSH_USER is empty.
+# SSH_USER is empty. SSH_HOST: IPv4 address or a name with an A record (the
+# tunnel connects over IPv4 only).
 SSH_HOST=
 SSH_PORT=22
 SSH_USER=
@@ -25,12 +26,24 @@ SOCKS5_LISTEN=127.0.0.1:1080
 HTTP_LISTEN=127.0.0.1:3128
 HEALTH_LISTEN=127.0.0.1:9090
 
+# Extra Host names for the Web UI and API (comma-separated, no port), needed
+# when HEALTH_LISTEN serves the network and the UI is opened under a LAN name
+# or address. localhost, 127.0.0.1, ::1 and the HEALTH_LISTEN host are always
+# allowed; other Host headers get 403 (DNS rebinding guard).
+UI_ALLOWED_HOSTS=
+
+# Limit of concurrent client connections over all proxy listeners. 0 disables
+# the limit.
+MAX_CONNECTIONS=4096
+
 # Directory for the generated SSH key pair and known_hosts. The unit already
 # sets it to /var/lib/ssh-gate, which systemd creates and owns; uncomment only
 # to point somewhere else, and make sure the service can write there.
 #DATA_DIR=/var/lib/ssh-gate
 
-# Direct routing rules (optional, comma-separated). Example:
+# Direct routing rules (optional, comma-separated). ip: rules are matched on
+# the DoH answer, so intranet names unknown to public DNS need a domain rule.
+# Tunnel names that resolve only to private addresses are refused. Example:
 # DIRECT_RULES=ip:10.0.0.0/8,internal.local
 DIRECT_RULES=
 

@@ -497,7 +497,7 @@ func TestHTTPProxyTunnelResolveFailure(t *testing.T) {
 	// If the resolver answers for .invalid, the request would dial instead of
 	// failing resolution — skip instead (same premise as
 	// TestSOCKS5UnresolvableHost).
-	if _, err := rules.ResolveTunnel(context.Background(), "no-such-host.invalid"); err == nil {
+	if _, err := rules.ResolveAll(context.Background(), "no-such-host.invalid"); err == nil {
 		t.Skip("resolver answered for .invalid (hijacked DNS?), skipping")
 	}
 	s, err := NewHTTPProxyServer("127.0.0.1:0", newTestOpener(rules, testDialer{}))
@@ -730,12 +730,141 @@ func TestConnectRelaysBufferedPipeline(t *testing.T) {
 		t.Fatalf("write more: %v", err)
 	}
 
+	// Read through br: the echoed PAYLOAD can arrive in the same segment as
+	// the 200 response and already sit in br's buffer.
 	buf := make([]byte, len("PAYLOADMORE"))
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.ReadFull(c, buf); err != nil {
+	if _, err := io.ReadFull(br, buf); err != nil {
 		t.Fatalf("read echo: %v (got %q)", err, buf)
 	}
 	if got := string(buf); got != "PAYLOADMORE" {
 		t.Fatalf("echo = %q, want %q", got, "PAYLOADMORE")
+	}
+}
+
+// TestHTTPProxyHeaderLimit: http.ReadRequest has no size limit of its own,
+// so headers past http.DefaultMaxHeaderBytes must be refused with 431
+// instead of being buffered without bound.
+func TestHTTPProxyHeaderLimit(t *testing.T) {
+	s := startTestProxy(t, "")
+	c, err := net.Dial("tcp", proxyAddr(s))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+
+	go func() {
+		fmt.Fprintf(c, "GET http://192.0.2.1/ HTTP/1.1\r\nHost: 192.0.2.1\r\n")
+		line := "X-Fill: " + strings.Repeat("a", 1000) + "\r\n"
+		for i := 0; i < 2*http.DefaultMaxHeaderBytes/len(line); i++ {
+			if _, err := io.WriteString(c, line); err != nil {
+				return // the proxy answered and closed
+			}
+		}
+	}()
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	expectStatus(t, bufio.NewReader(c), "431")
+}
+
+// startDripServer accepts one connection, reads the request head, then
+// writes an HTTP response whose body arrives as n bytes, one per gap.
+func startDripServer(t *testing.T, n int, gap time.Duration) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		if _, err := http.ReadRequest(bufio.NewReader(c)); err != nil {
+			return
+		}
+		fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", n)
+		for i := 0; i < n; i++ {
+			time.Sleep(gap)
+			if _, err := c.Write([]byte("x")); err != nil {
+				return
+			}
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func setHTTPIdleTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := httpIdleTimeout
+	httpIdleTimeout = d
+	t.Cleanup(func() { httpIdleTimeout = old })
+}
+
+// TestHTTPProxyIdleTimeoutKeepsMovingTransfer: the bound is on silence, not
+// on total time. Before the fix an absolute 5 min deadline cut every longer
+// plain-HTTP download (apt through the proxy, for example).
+func TestHTTPProxyIdleTimeoutKeepsMovingTransfer(t *testing.T) {
+	setHTTPIdleTimeout(t, 300*time.Millisecond)
+	// 12 bytes, 100 ms apart: 1.2 s in total, four times the idle timeout.
+	s := startTestProxy(t, startDripServer(t, 12, 100*time.Millisecond))
+
+	c, err := net.Dial("tcp", proxyAddr(s))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+	fmt.Fprintf(c, "GET http://192.0.2.1/ HTTP/1.1\r\nHost: 192.0.2.1\r\n\r\n")
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || len(body) != 12 {
+		t.Fatalf("body = %d bytes (err %v), want 12: a moving transfer was cut", len(body), err)
+	}
+}
+
+// TestHTTPProxyIdleTimeoutClosesStalled: an upstream that stops sending
+// must not hold the client and the relay forever.
+func TestHTTPProxyIdleTimeoutClosesStalled(t *testing.T) {
+	setHTTPIdleTimeout(t, 300*time.Millisecond)
+	// Two bytes promised, the second one comes after 10 s.
+	s := startTestProxy(t, startDripServer(t, 2, 10*time.Second))
+
+	c, err := net.Dial("tcp", proxyAddr(s))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+	fmt.Fprintf(c, "GET http://192.0.2.1/ HTTP/1.1\r\nHost: 192.0.2.1\r\n\r\n")
+	start := time.Now()
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	io.Copy(io.Discard, c)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("stalled request closed after %v, want about the idle timeout", elapsed)
+	}
+}
+
+// TestHTTPProxyBadTargetPort: a port outside 1..65535 is a client error
+// (400), not a failed dial to port 0 reported as 502.
+func TestHTTPProxyBadTargetPort(t *testing.T) {
+	s := startTestProxy(t, "")
+	for _, req := range []string{
+		"CONNECT 192.0.2.1:0 HTTP/1.1\r\nHost: 192.0.2.1:0\r\n\r\n",
+		"CONNECT 192.0.2.1:70000 HTTP/1.1\r\nHost: 192.0.2.1:70000\r\n\r\n",
+		"CONNECT 192.0.2.1:abc HTTP/1.1\r\nHost: 192.0.2.1:abc\r\n\r\n",
+		"GET http://192.0.2.1:70000/ HTTP/1.1\r\nHost: 192.0.2.1:70000\r\n\r\n",
+	} {
+		c, err := net.Dial("tcp", proxyAddr(s))
+		if err != nil {
+			t.Fatalf("dial proxy: %v", err)
+		}
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		io.WriteString(c, req)
+		expectStatus(t, bufio.NewReader(c), "400")
+		c.Close()
 	}
 }

@@ -12,7 +12,10 @@ case "$1" in
 			cp -p /etc/defaults/ssh-gate /etc/default/ssh-gate
 			echo "ssh-gate: moved config from /etc/defaults/ssh-gate to /etc/default/ssh-gate"
 		fi
-		rm -rf /etc/defaults
+		# Remove only our own file: /etc/defaults is not ours and may hold
+		# files of the admin or of other packages.
+		rm -f /etc/defaults/ssh-gate
+		rmdir --ignore-fail-on-non-empty /etc/defaults 2>/dev/null || true
 		;;
 esac
 

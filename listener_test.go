@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -151,5 +155,74 @@ func TestResilientListenerRetriesTransient(t *testing.T) {
 	}
 	if n := scripted.count(); n != before {
 		t.Fatalf("accept after close hit underlying (%d -> %d)", before, n)
+	}
+}
+
+// TestConnLimitRefusesOverLimit: past the limit a connection is closed at
+// once, and a closed connection returns its slot.
+func TestConnLimitRefusesOverLimit(t *testing.T) {
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	s, err := NewHTTPProxyServer("127.0.0.1:0", newTestOpener(rules, testDialer{}))
+	if err != nil {
+		t.Fatalf("NewHTTPProxyServer: %v", err)
+	}
+	s.SetConnLimit(newConnLimiter(1))
+	s.Start()
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+	addr := s.ln.Addr().String()
+
+	// The first connection takes the only slot and holds it (no request).
+	first, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial first: %v", err)
+	}
+	defer first.Close()
+
+	second, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial second: %v", err)
+	}
+	defer second.Close()
+	second.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := second.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("over-limit read err = %v, want the connection closed at once", err)
+	}
+
+	first.Close()
+	// The slot comes back once the server sees the close; retry briefly.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		c.SetDeadline(time.Now().Add(time.Second))
+		c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+		line, err := bufio.NewReader(c).ReadString('\n')
+		c.Close()
+		if err == nil && strings.Contains(line, "400") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("slot not released after close: %q, %v", line, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestNewConnLimiterZeroIsUnlimited(t *testing.T) {
+	if newConnLimiter(0) != nil || newConnLimiter(-1) != nil {
+		t.Fatal("newConnLimiter(<=0) != nil, want nil (no limit)")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	if limitConns(ln, nil) != ln {
+		t.Fatal("limitConns with nil limit wrapped the listener")
 	}
 }

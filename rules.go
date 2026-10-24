@@ -94,12 +94,16 @@ func NewRuleEngine(direct string) (*RuleEngine, error) {
 			done:        make(chan struct{}),
 		},
 		private: []netip.Prefix{
+			mustPrefix("0.0.0.0/8"), // "this network"; 0.0.0.0 dials localhost
 			mustPrefix("10.0.0.0/8"),
+			mustPrefix("100.64.0.0/10"), // CGNAT, also Tailscale-style overlays
 			mustPrefix("172.16.0.0/12"),
 			mustPrefix("192.168.0.0/16"),
 			mustPrefix("127.0.0.0/8"),
+			mustPrefix("::/128"),
 			mustPrefix("::1/128"),
 			mustPrefix("169.254.0.0/16"),
+			mustPrefix("fc00::/7"), // unique local
 			mustPrefix("fe80::/10"),
 		},
 	}
@@ -119,11 +123,6 @@ func NewRuleEngine(direct string) (*RuleEngine, error) {
 	}
 
 	return e, nil
-}
-
-func (e *RuleEngine) Route(ctx context.Context, host string, port int) Route {
-	r, _ := e.Decide(ctx, host, port)
-	return r
 }
 
 // normalizeHost canonicalizes a hostname for policy decisions and cache
@@ -179,17 +178,13 @@ func pickTunnelAddr(addrs []netip.Addr) (netip.Addr, error) {
 	return addrs[0], nil
 }
 
-// ResolveTunnel resolves host and picks the tunnel address (v4 first, v6
-// fallback) for client-side dialing through the SSH tunnel.
-func (e *RuleEngine) ResolveTunnel(ctx context.Context, host string) (netip.Addr, error) {
-	addrs, err := e.ResolveAll(ctx, host)
-	if err != nil {
-		return netip.Addr{}, err
-	}
-	return pickTunnelAddr(addrs)
-}
-
+// isPrivate reports whether ip is in a private, loopback, link-local or
+// otherwise local range. The address is unmapped and its zone dropped
+// first: netip.Prefix.Contains never matches an IPv4-mapped address against
+// an IPv4 prefix or an address with a zone, so ::ffff:127.0.0.1 and
+// fe80::1%eth0 would otherwise pass as public.
 func (e *RuleEngine) isPrivate(ip netip.Addr) bool {
+	ip = ip.Unmap().WithZone("")
 	for _, p := range e.private {
 		if p.Contains(ip) {
 			return true
@@ -200,16 +195,16 @@ func (e *RuleEngine) isPrivate(ip netip.Addr) bool {
 
 func (r ruleEntry) matches(ctx context.Context, host string, dns *dnsCache) bool {
 	if r.ipPrefix != nil {
-		// Resolve locally, deliberately not through DoH: an ip: rule is a
-		// direct-route rule, and the direct dial resolves locally too
-		// (opener.go), so rule and dial must share one resolver and one
-		// cache key. DoH would break split-horizon names (public DNS
-		// answers NXDOMAIN for intranet hosts, sending traffic with a
-		// legitimate direct rule through the tunnel) and every direct
-		// cache-miss would pay two DoH round-trips over the tunnel before
-		// deciding "direct". Tunnel destinations keep DoH — different
-		// policy, different key space.
-		addrs, err := dns.localResolveAll(ctx, host)
+		// Resolve per the tunnel policy (DoH when configured), not
+		// locally: the name is not yet known to be direct, and asking the
+		// local resolver here would show every destination name - the
+		// tunneled ones too - to the local network, and let a forged local
+		// answer inside the CIDR send traffic direct. The answer shares
+		// the cache entry the tunnel dial uses, so a tunneled name costs
+		// no extra lookup. Only a name that ends up direct is resolved
+		// locally again, by the direct dial. Split-horizon intranet names
+		// unknown to public DNS need a domain rule instead.
+		addrs, err := dns.ResolveAll(ctx, host)
 		if err != nil {
 			return false
 		}
@@ -273,6 +268,9 @@ type dnsCache struct {
 	lookups   atomic.Int64
 	dohHost   string
 	dohClient *http.Client
+	// localLookup replaces net.DefaultResolver in tests; nil means the
+	// system resolver.
+	localLookup func(ctx context.Context, host string) ([]net.IPAddr, error)
 	// sf coalesces concurrent cache misses for one key into a single
 	// resolver round-trip (see cachedLookup).
 	sf singleflight.Group
@@ -453,7 +451,11 @@ func (c *dnsCache) lookup(ctx context.Context, host string) ([]netip.Addr, bool,
 // but must not affect direct ones, whose names are often unknown to public
 // DNS.
 func (c *dnsCache) lookupLocal(ctx context.Context, host string) ([]netip.Addr, error) {
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	lookup := net.DefaultResolver.LookupIPAddr
+	if c.localLookup != nil {
+		lookup = c.localLookup
+	}
+	addrs, err := lookup(ctx, host)
 	if err != nil {
 		return nil, err
 	}

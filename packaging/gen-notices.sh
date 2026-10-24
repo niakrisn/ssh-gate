@@ -7,7 +7,7 @@
 # Run it where the Go toolchain is available, for example in the packaging
 # builder image:
 #
-#   docker run --rm -v "$PWD:/w" -w /w golang:1.26-bookworm bash packaging/gen-notices.sh
+#   docker run --rm -v "$PWD:/w" -w /w golang:1.26.10-bookworm bash packaging/gen-notices.sh
 #
 # debian/rules checks that the committed file still matches what this script
 # produces, so an unnoticed dependency change fails the package build instead

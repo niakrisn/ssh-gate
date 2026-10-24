@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 )
 
 // contains checks if a string is present in a slice.
@@ -10,19 +12,6 @@ func contains(slice []string, s string) bool {
 	for _, v := range slice {
 		if v == s {
 			return true
-		}
-	}
-	return false
-}
-
-// containsAny checks if any of the strings in the needles slice
-// is present in the haystack slice.
-func containsAny(haystack []string, needles []string) bool {
-	for _, h := range haystack {
-		for _, n := range needles {
-			if h == n {
-				return true
-			}
 		}
 	}
 	return false
@@ -49,12 +38,29 @@ func validateHostPort(hostPort string) error {
 	return nil
 }
 
-// firstNonEmpty returns the first non-empty string from the arguments.
-func firstNonEmpty(strings ...string) string {
-	for _, s := range strings {
-		if s != "" {
-			return s
-		}
+// writeFileAtomic writes data to path through a temp file in the same
+// directory and a rename, so a crash never leaves a truncated file behind.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
 	}
-	return ""
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }

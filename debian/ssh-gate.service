@@ -31,6 +31,17 @@ RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+# The Go runtime reads only /proc/self (cgroup limits for GOMAXPROCS).
+ProtectProc=invisible
+ProcSubset=pid
+# Go compiles ahead of time: no writable and executable memory is needed.
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 DevicePolicy=closed
 UMask=0077

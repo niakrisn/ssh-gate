@@ -1,4 +1,5 @@
-FROM golang:1.26-bookworm
+ARG BASE_IMAGE=golang:1.26.10-bookworm
+FROM ${BASE_IMAGE}
 
 # dpkg-buildpackage lives in dpkg-dev, dh in debhelper, and dpkg expects
 # build-essential in any build environment. man-db is what lets dh_installman

@@ -76,6 +76,21 @@ func (o *Opener) candidates(ctx context.Context, host string, port int) ([]netip
 		return out, route, reason, nil
 	}
 
+	// A public name may resolve to a private or loopback address (DNS
+	// rebinding, nip.io-style names). Through the tunnel the VPS would dial
+	// it in its own network: its localhost, the cloud metadata service, the
+	// provider's internal network. Such addresses never go to the tunnel.
+	public := addrs[:0:0]
+	for _, a := range addrs {
+		if !o.rules.isPrivate(a) {
+			public = append(public, a)
+		}
+	}
+	if len(public) == 0 {
+		return nil, route, reason, fmt.Errorf("resolve %s: only private addresses (%s), refused through the tunnel; add a direct rule to reach it directly", host, addrs[0])
+	}
+	addrs = public
+
 	head, err := pickTunnelAddr(addrs)
 	if err != nil {
 		return nil, route, reason, err

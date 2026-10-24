@@ -28,6 +28,10 @@ and the readiness endpoint reports not ready until the tunnel is back up. The
 process exits only on a fatal startup error, most often an invalid
 configuration.
 .PP
+A SOCKS5 client must finish its handshake within 30 seconds. A plain HTTP
+proxy request is closed after 5 minutes without data in either direction;
+CONNECT tunnels and SOCKS5 relays have no idle limit.
+.PP
 On SIGTERM or SIGINT the listeners close and running relays get 5 seconds to
 finish.
 .SH OPTIONS
@@ -45,7 +49,8 @@ no command substitution. Apply changes with
 .BR "systemctl restart ssh-gate" .
 .TP
 .BI "SSH_HOST=" host
-Gateway address. Required.
+Gateway address. Required. The tunnel connects over IPv4 only: an IPv6
+address is rejected at startup, and a name needs an A record.
 .TP
 .BI "SSH_PORT=" port
 Gateway SSH port. Default
@@ -73,6 +78,25 @@ address. Default
 .BI "HEALTH_LISTEN=" addr
 Health endpoints and web UI. Default
 .BR 127.0.0.1:9090 .
+.TP
+.BI "UI_ALLOWED_HOSTS=" hosts
+Comma-separated host names or addresses, without port, that the web UI and
+the API answer to in addition to
+.BR localhost ,
+.BR 127.0.0.1 ,
+.B ::1
+and the host of
+.BR HEALTH_LISTEN ,
+see
+.BR "HTTP INTERFACES" .
+Empty by default.
+.TP
+.BI "MAX_CONNECTIONS=" n
+Limit of concurrent client connections over all proxy listeners; a
+connection over the limit is closed at once.
+.B 0
+disables the limit. Default
+.BR 4096 .
 .TP
 .BI "DATA_DIR=" dir
 Directory holding
@@ -153,7 +177,13 @@ the tunnel. Three forms are accepted:
 .BI ip: cidr
 Matches a destination whose resolved address falls in
 .IR cidr .
-The address is looked up locally.
+The address comes from the same lookup as a tunnel destination
+(DNS-over-HTTPS when
+.B DOH_HOST
+is set), so choosing a route never shows a name to the local resolver. An
+intranet name that public DNS does not know needs a
+.I domain
+rule instead.
 .TP
 .BI re: regex
 Matches the destination host name against a Go regular expression. An empty
@@ -165,6 +195,13 @@ Matches the name itself and any name below it, so
 covers
 .IR db.internal.local .
 .PP
+Without any rule, an address literal in a private, loopback, link-local,
+shared (100.64.0.0/10) or unique local range is always dialed directly. A
+name routed through the tunnel whose addresses are all in these ranges is
+refused: through the tunnel the gateway would dial its own local network,
+for example a cloud metadata service. Add a direct rule to reach such a name
+from the local network.
+.PP
 Host names are compared in their canonical form: case-insensitively and
 without a trailing dot. The value is not shell-quoted, so one backslash in
 .I DIRECT_RULES
@@ -173,6 +210,21 @@ is one backslash: write
 .SH "HTTP INTERFACES"
 All served on
 .BR HEALTH_LISTEN .
+The web UI and the
+.B /api
+endpoints have no authentication. They answer only to requests whose
+.I Host
+header is
+.BR localhost ,
+.BR 127.0.0.1 ,
+.BR ::1 ,
+the host of
+.B HEALTH_LISTEN
+or a name in
+.BR UI_ALLOWED_HOSTS ,
+and refuse others with 403; this blocks web pages in a local browser from
+reading them through DNS rebinding. The health endpoints answer to any
+.IR Host .
 .TP
 .B /healthz
 Process is up.

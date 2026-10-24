@@ -252,6 +252,11 @@ func (d *sshDialer) monitor() {
 	if connect == nil {
 		connect = connectSSH
 	}
+	// pinned is the trusted host key fingerprint. It starts from
+	// ssh_known_hosts and is set by the first TOFU connect, so every later
+	// reconnect in this process checks the key. Only the monitor connects,
+	// so a local is enough.
+	pinned := d.cfg.fingerprint
 
 	for {
 		// Capture the client under the lock and wait on the local: after a
@@ -289,7 +294,9 @@ func (d *sshDialer) monitor() {
 			return
 		}
 
-		newClient, fp, newRaw, err := connect(d.cfg)
+		cfg := d.cfg
+		cfg.fingerprint = pinned
+		newClient, fp, newRaw, err := connect(cfg)
 		if err != nil {
 			log.Error().Err(err).Int("attempt", attempt+1).Msg("SSH connect failed")
 			attempt++
@@ -313,6 +320,9 @@ func (d *sshDialer) monitor() {
 		}
 		if d.cfg.keepalivePeriod > 0 {
 			go d.keepalive(newClient)
+		}
+		if pinned == "" {
+			pinned = fp
 		}
 		attempt = 0
 		log.Info().Str("host", d.cfg.host).Int("port", d.cfg.port).Str("fingerprint", fp).Msg("SSH connected")
@@ -472,8 +482,12 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) 
 	if remoteKey != nil {
 		fp := sshFingerprint(remoteKey)
 		if cfg.fingerprint == "" {
-			if err := os.WriteFile(filepath.Join(filepath.Dir(cfg.keyPath), sshKnownHostsFile), []byte(fp), 0600); err != nil {
-				log.Warn().Err(err).Msg("save SSH host key fingerprint")
+			// TOFU: the key is trusted only once it is saved. A connect
+			// that cannot pin the key fails, otherwise the next process
+			// start would trust whatever key the network presents.
+			if err := writeFileAtomic(filepath.Join(filepath.Dir(cfg.keyPath), sshKnownHostsFile), []byte(fp), 0600); err != nil {
+				client.Close()
+				return nil, "", nil, fmt.Errorf("save SSH host key fingerprint: %w", err)
 			}
 		}
 		return client, fp, raw, nil

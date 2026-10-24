@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,11 +33,13 @@ type sshProbe struct {
 	reachable bool
 	rttMs     int64
 	at        time.Time
+	// fromSession marks a result taken from the live session instead of
+	// a dial; the RTT then comes from tcp_info at request time.
+	fromSession bool
 }
 
 // HealthServer provides /healthz, /readyz, the Web UI and /api/status.
 type HealthServer struct {
-	mu      sync.Mutex
 	dialer  dialer
 	ln      net.Listener
 	srv     http.Server
@@ -49,6 +53,10 @@ type HealthServer struct {
 	probe     sshProbe
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// allowedHosts are the Host header names (no port) the Web UI and the
+	// API answer to; see uiGuard.
+	allowedHosts map[string]bool
 }
 
 // NewHealthServer creates a new health server with the Web UI,
@@ -61,14 +69,28 @@ func NewHealthServer(listen, sshHost string, sshPort int, d dialer, tracker *Con
 		sshHost: sshHost,
 		sshPort: sshPort,
 		done:    make(chan struct{}),
+		allowedHosts: map[string]bool{
+			"localhost": true,
+			"127.0.0.1": true,
+			"::1":       true,
+		},
+	}
+	// A specific listen host is reachable under its own name too; an
+	// unspecified one (0.0.0.0, ::, empty) names no host.
+	if host, _, err := net.SplitHostPort(listen); err == nil && host != "" {
+		if ip := net.ParseIP(host); ip == nil || !ip.IsUnspecified() {
+			h.allowedHosts[normalizeHost(host)] = true
+		}
 	}
 
+	// Health probes come from orchestrators under any Host; only the UI
+	// and the API, which show connection history, are guarded.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", h.healthHandler)
 	mux.HandleFunc("/readyz", h.readyHandler)
-	mux.HandleFunc("/api/connections", handleConnections(tracker))
-	mux.HandleFunc("/api/status", h.statusHandler)
-	mux.HandleFunc("/", handleUI)
+	mux.Handle("/api/connections", h.uiGuard(handleConnections(tracker)))
+	mux.Handle("/api/status", h.uiGuard(http.HandlerFunc(h.statusHandler)))
+	mux.Handle("/", h.uiGuard(http.HandlerFunc(handleUI)))
 
 	h.srv.Handler = mux
 
@@ -79,6 +101,41 @@ func NewHealthServer(listen, sshHost string, sshPort int, d dialer, tracker *Con
 	h.ln = ln
 
 	return h, nil
+}
+
+// AllowHosts adds Host header names (no port) the Web UI answers to, for
+// access under a LAN name or address (UI_ALLOWED_HOSTS). Call before Start.
+func (h *HealthServer) AllowHosts(hosts []string) {
+	for _, host := range hosts {
+		h.allowedHosts[normalizeHost(host)] = true
+	}
+}
+
+// uiGuard rejects requests whose Host header is not an allowed name. The
+// UI has no authentication and relies on a loopback bind, which DNS
+// rebinding defeats: a page in a local browser points its own name at
+// 127.0.0.1 and reads the API same-origin. Rebinding cannot change the
+// Host header, so checking it closes that hole. It also sets headers that
+// keep the pages from being framed or content-sniffed.
+func (h *HealthServer) uiGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if hh, _, err := net.SplitHostPort(host); err == nil {
+			host = hh
+		}
+		host = normalizeHost(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"))
+		if !h.allowedHosts[host] {
+			log.Warn().Str("host", r.Host).Str("src", r.RemoteAddr).Msg("web ui: Host not allowed")
+			http.Error(w, "Host not allowed; add it to UI_ALLOWED_HOSTS", http.StatusForbidden)
+			return
+		}
+		hdr := w.Header()
+		hdr.Set("X-Content-Type-Options", "nosniff")
+		hdr.Set("X-Frame-Options", "DENY")
+		hdr.Set("Referrer-Policy", "no-referrer")
+		hdr.Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Start begins serving health checks and probing the SSH server port.
@@ -118,9 +175,31 @@ func (h *HealthServer) probeLoop() {
 	}
 }
 
+// liveSessionStats returns the tunnel tcp_info when the SSH session is up
+// and the dialer reports it, nil otherwise.
+func (h *HealthServer) liveSessionStats() *tcpStats {
+	if !h.dialer.Connected() {
+		return nil
+	}
+	if p, ok := h.dialer.(tcpStatsProvider); ok {
+		return p.TunnelTCPStats()
+	}
+	return nil
+}
+
 // runProbe dials the SSH server port (IPv4 only, like the tunnel itself)
-// and stores the reachability result and RTT.
+// and stores the reachability result and RTT. While the session is up and
+// reports tcp_info it does not dial: the live session already proves the
+// server reachable and carries the RTT, and every probe is an
+// unauthenticated connection that sshd logs as [preauth] and that
+// fail2ban-style tools may count against the client address.
 func (h *HealthServer) runProbe() {
+	if h.liveSessionStats() != nil {
+		h.probeMu.Lock()
+		h.probe = sshProbe{reachable: true, at: time.Now(), fromSession: true}
+		h.probeMu.Unlock()
+		return
+	}
 	addr := net.JoinHostPort(h.sshHost, strconv.Itoa(h.sshPort))
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp4", addr, probeTimeout)
@@ -166,6 +245,9 @@ func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	var tcp *tcpStats
 	if p, ok := h.dialer.(tcpStatsProvider); ok {
 		tcp = p.TunnelTCPStats()
+	}
+	if probe.fromSession && tcp != nil {
+		probe.rttMs = int64(math.Round(tcp.RTTMs))
 	}
 
 	active := map[string]int{}

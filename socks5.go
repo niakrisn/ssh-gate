@@ -24,20 +24,33 @@ type SOCKS5Server struct {
 	closeOnce sync.Once
 	conns     sync.WaitGroup // CONNECT relays: one logConn per dial
 	opener    *Opener
+	// handshakes maps the client address of a connection still in the
+	// SOCKS5 handshake to its conn, so the dial callback (which only gets
+	// the request) can lift the handshake deadline.
+	handshakes sync.Map
+	// handshakeTimeout is socks5HandshakeTimeout at construction.
+	handshakeTimeout time.Duration
 }
+
+// socks5HandshakeTimeout bounds the SOCKS5 greeting and request: the
+// library sets no deadline of its own, so a client that connects and stays
+// silent would hold a goroutine and a descriptor forever. A var so tests
+// can shorten it; a server copies it when created.
+var socks5HandshakeTimeout = 30 * time.Second
 
 // NewSOCKS5Server creates a new SOCKS5 server with routing.
 func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 	s := &SOCKS5Server{
-		shutCh: make(chan struct{}),
-		opener: opener,
+		shutCh:           make(chan struct{}),
+		opener:           opener,
+		handshakeTimeout: socks5HandshakeTimeout,
 	}
 
 	s.srv = socks5.NewServer(
 		socks5.WithDialAndRequest(func(ctx context.Context, network, addr string, request *socks5.Request) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
-				return nil, NewConfigurationError("destination address", addr, fmt.Sprintf("invalid format: %v", err))
+				return nil, fmt.Errorf("invalid destination address %q: %w", addr, err)
 			}
 
 			portInt, _ := strconv.Atoi(port)
@@ -48,6 +61,12 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 			}
 
 			src := request.RemoteAddr.String()
+			// The handshake is over: the relay that follows is unbounded,
+			// like a CONNECT tunnel. Lifted before the dial so a slow dial
+			// does not make the reply write fail.
+			if c, ok := s.handshakes.Load(src); ok {
+				_ = c.(net.Conn).SetDeadline(time.Time{})
+			}
 
 			log.Info().Str("proto", "socks5").Str("src", src).Str("host", host).Int("port", portInt).Msg("request")
 
@@ -105,31 +124,51 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 		return nil, err
 	}
 	// keepAliveListener bounds the lifetime of a half-dead relay; the
-	// resilient wrapper absorbs transient accept errors that would end
-	// Serve for good, and its idempotent Close swallows the library's
-	// deferred Close after our Shutdown closed the listener.
+	// resilient wrapper absorbs transient accept errors, so an accept
+	// error here only ever means shutdown.
 	s.ln = &resilientListener{Listener: keepAliveListener{Listener: ln}}
 
 	return s, nil
 }
 
+// SetConnLimit applies the shared connection limit. Call before Start.
+func (s *SOCKS5Server) SetConnLimit(l *connLimiter) {
+	s.ln = limitConns(s.ln, l)
+}
+
+// Start runs the accept loop. It is ours, not the library's Serve: each
+// connection gets the handshake deadline before the library reads from it.
 func (s *SOCKS5Server) Start() {
 	log.Info().Str("listen", s.ln.Addr().String()).Msg("SOCKS5 server starting")
 
 	go func() {
-		// s.ln already carries keepAliveListener + resilientListener
-		// (see NewSOCKS5Server).
-		if err := s.srv.Serve(s.ln); err != nil {
-			select {
-			case <-s.shutCh:
-			default:
-				log.Error().Err(err).Msg("SOCKS5 server failed")
+		for {
+			conn, err := s.ln.Accept()
+			if err != nil {
+				select {
+				case <-s.shutCh:
+				default:
+					log.Error().Err(err).Msg("SOCKS5 server failed")
+				}
+				return
 			}
+			go s.serveConn(conn)
 		}
 	}()
 }
 
-// Shutdown stops the library's accept loop, then waits (bounded by ctx) for
+func (s *SOCKS5Server) serveConn(conn net.Conn) {
+	src := conn.RemoteAddr().String()
+	_ = conn.SetDeadline(time.Now().Add(s.handshakeTimeout))
+	s.handshakes.Store(src, conn)
+	defer s.handshakes.Delete(src)
+	// ServeConn closes conn when it returns.
+	if err := s.srv.ServeConn(conn); err != nil {
+		log.Debug().Str("proto", "socks5").Str("src", src).Err(err).Msg("connection ended")
+	}
+}
+
+// Shutdown stops the accept loop, then waits (bounded by ctx) for
 // in-flight CONNECT relays to finish. The listener close runs once; the
 // drain wait runs on every call, mirroring HTTPProxyServer.Shutdown. Stuck
 // relays left behind at timeout are killed when the SSH dialer stops.

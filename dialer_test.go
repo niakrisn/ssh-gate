@@ -791,3 +791,165 @@ func TestReadKnownHostFingerprint(t *testing.T) {
 		})
 	}
 }
+
+// startStoppableSSHServer starts an in-process SSH server with the given
+// host key that accepts any publickey and channel. stop closes the listener
+// and every live connection, so a dialer sees its tunnel drop.
+func startStoppableSSHServer(t *testing.T, listenAddr string, hostSigner ssh.Signer) (addr string, stop func()) {
+	t.Helper()
+	serverCfg := &ssh.ServerConfig{
+		PublicKeyCallback: func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
+			return nil, nil
+		},
+	}
+	serverCfg.AddHostKey(hostSigner)
+
+	l, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+			go func() {
+				sconn, chans, reqs, err := ssh.NewServerConn(conn, serverCfg)
+				if err != nil {
+					return
+				}
+				defer sconn.Close()
+				go ssh.DiscardRequests(reqs)
+				for newCh := range chans {
+					newCh.Reject(ssh.Prohibited, "test")
+				}
+			}()
+		}
+	}()
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			l.Close()
+			mu.Lock()
+			for _, c := range conns {
+				c.Close()
+			}
+			mu.Unlock()
+		})
+	}
+	t.Cleanup(stop)
+	return l.Addr().String(), stop
+}
+
+func newTestHostSigner(t *testing.T) ssh.Signer {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("host key: %v", err)
+	}
+	s, err := ssh.NewSignerFromSigner(priv)
+	if err != nil {
+		t.Fatalf("host signer: %v", err)
+	}
+	return s
+}
+
+// TestMonitorPinsHostKeyAfterTOFU: the key trusted on first use must be
+// checked on every later reconnect of the same process. Before the fix the
+// pinned fingerprint lived only in ssh_known_hosts and was read at startup,
+// so a reconnect after TOFU accepted any host key and overwrote the file -
+// a man in the middle only had to drop the tunnel once.
+func TestMonitorPinsHostKeyAfterTOFU(t *testing.T) {
+	keyA := newTestHostSigner(t)
+	addr, stopA := startStoppableSSHServer(t, "127.0.0.1:0", keyA)
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split: %v", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("port: %v", err)
+	}
+
+	keyPath := writeTestKey(t)
+	errs := make(chan error, 16)
+	d := &sshDialer{
+		cfg: sshDialerCfg{host: host, port: port, user: "test", keyPath: keyPath},
+		connect: func(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) {
+			c, fp, raw, err := connectSSH(cfg)
+			errs <- err
+			return c, fp, raw, err
+		},
+	}
+	go d.monitor()
+	t.Cleanup(d.stop)
+
+	if err := <-errs; err != nil {
+		t.Fatalf("first connect (TOFU): %v", err)
+	}
+	knownHosts := filepath.Join(filepath.Dir(keyPath), sshKnownHostsFile)
+	pinned, err := os.ReadFile(knownHosts)
+	if err != nil {
+		t.Fatalf("read %s: %v", sshKnownHostsFile, err)
+	}
+	if string(pinned) != sshFingerprint(keyA.PublicKey()) {
+		t.Fatalf("pinned %q, want key A", pinned)
+	}
+
+	// The tunnel drops and another host key answers on the same address.
+	stopA()
+	startStoppableSSHServer(t, addr, newTestHostSigner(t))
+
+	// The first reconnect can race the new server and get "connection
+	// refused"; wait for an attempt that reached the SSH handshake.
+	timeout := time.After(10 * time.Second)
+	for mismatch := false; !mismatch; {
+		select {
+		case err := <-errs:
+			switch {
+			case err == nil:
+				t.Fatal("reconnect to a new host key succeeded, want host key mismatch")
+			case strings.Contains(err.Error(), "host key mismatch"):
+				mismatch = true
+			case errors.Is(err, syscall.ECONNREFUSED):
+				// the new server is not listening yet
+			default:
+				t.Fatalf("reconnect to a new host key: err = %v, want host key mismatch", err)
+			}
+		case <-timeout:
+			t.Fatal("no host key mismatch within 10 s")
+		}
+	}
+	if d.Connected() {
+		t.Fatal("dialer connected to a host with a different key")
+	}
+	after, err := os.ReadFile(knownHosts)
+	if err != nil || string(after) != string(pinned) {
+		t.Fatalf("%s changed to %q (err %v), want it kept", sshKnownHostsFile, after, err)
+	}
+}
+
+// TestConnectSSHFailsWhenPinCannotBeSaved: a TOFU connect that cannot write
+// ssh_known_hosts must fail instead of running unpinned.
+func TestConnectSSHFailsWhenPinCannotBeSaved(t *testing.T) {
+	addr, _ := startStoppableSSHServer(t, "127.0.0.1:0", newTestHostSigner(t))
+	host, portStr, _ := net.SplitHostPort(addr)
+	port, _ := strconv.Atoi(portStr)
+
+	keyPath := writeTestKey(t)
+	// A directory in place of the file makes the rename fail.
+	if err := os.Mkdir(filepath.Join(filepath.Dir(keyPath), sshKnownHostsFile), 0700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	client, _, _, err := connectSSH(sshDialerCfg{host: host, port: port, user: "test", keyPath: keyPath})
+	if err == nil {
+		client.Close()
+		t.Fatal("connectSSH succeeded without saving the host key")
+	}
+}

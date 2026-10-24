@@ -299,3 +299,66 @@ func TestLoadConfigDohHostEmptyDisables(t *testing.T) {
 		t.Fatalf("unset DOH_HOST → dohHost = %q, want cloudflare-dns.com", cfg.dohHost)
 	}
 }
+
+func TestParseMaxConnections(t *testing.T) {
+	cases := map[string]struct {
+		want    int
+		wantErr bool
+	}{
+		"4096": {want: 4096},
+		"1":    {want: 1},
+		"0":    {want: 0},
+		"-1":   {wantErr: true},
+		"":     {wantErr: true},
+		"many": {wantErr: true},
+	}
+	for raw, want := range cases {
+		got, err := parseMaxConnections(raw)
+		if want.wantErr {
+			if err == nil {
+				t.Errorf("parseMaxConnections(%q): expected error, got nil", raw)
+			}
+			continue
+		}
+		if err != nil || got != want.want {
+			t.Errorf("parseMaxConnections(%q) = %d, %v; want %d", raw, got, err, want.want)
+		}
+	}
+}
+
+func TestParseHostList(t *testing.T) {
+	got, err := parseHostList("UI_ALLOWED_HOSTS", " gate.lan, 192.168.1.5 ,,fe80::1")
+	if err != nil {
+		t.Fatalf("parseHostList: %v", err)
+	}
+	if len(got) != 3 || got[0] != "gate.lan" || got[1] != "192.168.1.5" || got[2] != "fe80::1" {
+		t.Fatalf("parseHostList = %v", got)
+	}
+	for _, bad := range []string{"gate.lan:9090", "[::1]", "http://gate.lan", "a b"} {
+		if _, err := parseHostList("UI_ALLOWED_HOSTS", bad); err == nil {
+			t.Errorf("parseHostList(%q): expected error", bad)
+		}
+	}
+	if got, err := parseHostList("UI_ALLOWED_HOSTS", ""); err != nil || len(got) != 0 {
+		t.Fatalf("parseHostList(\"\") = %v, %v; want empty", got, err)
+	}
+}
+
+// TestLoadConfigSSHHostIPv6: the tunnel dials tcp4 only, so an IPv6 literal
+// must fail at startup instead of looping in reconnect.
+func TestLoadConfigSSHHostIPv6(t *testing.T) {
+	t.Setenv("PROXY_MODES", "socks5")
+	t.Setenv("SSH_USER", "u")
+	for _, v := range []string{"2001:db8::1", "[2001:db8::1]", "::1"} {
+		t.Setenv("SSH_HOST", v)
+		if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "IPv4 only") {
+			t.Errorf("SSH_HOST=%q: err = %v, want the IPv4-only error", v, err)
+		}
+	}
+	for _, v := range []string{"203.0.113.1", "vps.example.com", "::ffff:203.0.113.1"} {
+		t.Setenv("SSH_HOST", v)
+		if _, err := loadConfig(); err != nil {
+			t.Errorf("SSH_HOST=%q: unexpected error: %v", v, err)
+		}
+	}
+}

@@ -155,3 +155,94 @@ func TestSOCKS5ShutdownDrains(t *testing.T) {
 		t.Fatalf("repeat Shutdown took %v, want prompt drain", elapsed)
 	}
 }
+
+func setSOCKS5HandshakeTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := socks5HandshakeTimeout
+	socks5HandshakeTimeout = d
+	t.Cleanup(func() { socks5HandshakeTimeout = old })
+}
+
+// TestSOCKS5HandshakeTimeout: a client that connects and stays silent must
+// be dropped. The library sets no deadline, so before the fix such a client
+// held its goroutine and descriptor for as long as TCP stayed up.
+func TestSOCKS5HandshakeTimeout(t *testing.T) {
+	setSOCKS5HandshakeTimeout(t, 200*time.Millisecond)
+	s, err := NewSOCKS5Server("127.0.0.1:0", &Opener{})
+	if err != nil {
+		t.Fatalf("NewSOCKS5Server: %v", err)
+	}
+	s.Start()
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+
+	c, err := net.Dial("tcp", s.ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	start := time.Now()
+	if _, err := c.Read(make([]byte, 1)); err == nil {
+		t.Fatal("read succeeded on a silent connection, want close")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("silent client dropped after %v, want about the handshake timeout", elapsed)
+	}
+}
+
+// TestSOCKS5RelayOutlivesHandshakeTimeout: the deadline covers only the
+// handshake; an established relay that is idle for longer must keep working.
+func TestSOCKS5RelayOutlivesHandshakeTimeout(t *testing.T) {
+	setSOCKS5HandshakeTimeout(t, 200*time.Millisecond)
+	echo, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listener: %v", err)
+	}
+	defer echo.Close()
+	go func() {
+		c, err := echo.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		io.Copy(c, c)
+	}()
+
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	s, err := NewSOCKS5Server("127.0.0.1:0", &Opener{rules: rules, d: testDialer{}, family: FamilyBoth})
+	if err != nil {
+		t.Fatalf("NewSOCKS5Server: %v", err)
+	}
+	s.Start()
+	t.Cleanup(func() { s.Shutdown(context.Background()) })
+
+	c, err := net.Dial("tcp", s.ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	c.Write([]byte{0x05, 0x01, 0x00})
+	greet := make([]byte, 2)
+	if _, err := io.ReadFull(c, greet); err != nil {
+		t.Fatalf("greeting reply: %v", err)
+	}
+	ep := echo.Addr().(*net.TCPAddr).Port
+	c.Write([]byte{0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, byte(ep >> 8), byte(ep)})
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(c, reply); err != nil || reply[1] != 0x00 {
+		t.Fatalf("connect reply: %v %x", err, reply)
+	}
+
+	time.Sleep(500 * time.Millisecond) // well past the handshake timeout
+	if _, err := c.Write([]byte("ping")); err != nil {
+		t.Fatalf("write after idle: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "ping" {
+		t.Fatalf("echo after idle = %q (err %v), want ping", buf, err)
+	}
+}

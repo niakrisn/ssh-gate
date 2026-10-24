@@ -32,6 +32,8 @@ type config struct {
 	sshKeepaliveInterval int
 	sshKeepaliveProbes   int
 	dialTimeout          time.Duration
+	maxConnections       int
+	uiAllowedHosts       []string
 }
 
 type server struct {
@@ -66,7 +68,9 @@ func main() {
 
 	if _, err := os.Stat(filepath.Join(cfg.dataDir, firstRunDoneFile)); os.IsNotExist(err) {
 		printFirstRun(pubKey, cfg)
-		os.WriteFile(filepath.Join(cfg.dataDir, firstRunDoneFile), nil, 0644)
+		if err := os.WriteFile(filepath.Join(cfg.dataDir, firstRunDoneFile), nil, 0644); err != nil {
+			log.Warn().Err(err).Msg("save first-run marker; the hint prints again on next start")
+		}
 	}
 
 	// Connection history is in-memory only: last 1000 connections / 10 minutes.
@@ -104,6 +108,10 @@ func main() {
 
 	var servers []server
 
+	// One limit for all proxy listeners: descriptors and goroutines are
+	// per process.
+	limit := newConnLimiter(cfg.maxConnections)
+
 	// One server instance per listen address; all instances share the
 	// Opener (route policy, DNS, SSH dialer).
 	if contains(cfg.proxyModes, "socks5") {
@@ -112,6 +120,7 @@ func main() {
 			if err != nil {
 				log.Fatal().Err(err).Str("listen", addr).Msg("SOCKS5 server")
 			}
+			s5.SetConnLimit(limit)
 			s5.Start()
 			servers = append(servers, server{Name: "SOCKS5 " + addr, Shutdown: s5.Shutdown})
 		}
@@ -123,6 +132,7 @@ func main() {
 			if err != nil {
 				log.Fatal().Err(err).Str("listen", addr).Msg("HTTP proxy")
 			}
+			hp.SetConnLimit(limit)
 			hp.Start()
 			servers = append(servers, server{Name: "HTTP " + addr, Shutdown: hp.Shutdown})
 		}
@@ -133,6 +143,7 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("health server")
 	}
+	hs.AllowHosts(cfg.uiAllowedHosts)
 	hs.Start()
 	servers = append(servers, server{Name: "health", Shutdown: hs.Shutdown})
 
@@ -193,6 +204,12 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, fmt.Errorf("configuration error: %w", err)
 	}
+	// The tunnel connects over IPv4 only (dialer.go dials tcp4), so an
+	// IPv6 literal could never connect; fail at startup, not in the
+	// reconnect loop.
+	if ip := net.ParseIP(strings.Trim(sshHost, "[]")); ip != nil && ip.To4() == nil {
+		return config{}, fmt.Errorf("invalid SSH_HOST %q: the tunnel connects over IPv4 only, use an IPv4 address or a name with an A record", sshHost)
+	}
 
 	// Validate SSH_USER
 	sshUser, err := getEnvRequired("SSH_USER")
@@ -233,6 +250,12 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("invalid SSH_DIAL_TIMEOUT %s: must be below %s (connection history window)", dialTimeout, connHistoryMaxAge)
 	}
 
+	// Validate MAX_CONNECTIONS
+	maxConnections, err := parseMaxConnections(getEnv("MAX_CONNECTIONS", "4096"))
+	if err != nil {
+		return config{}, err
+	}
+
 	// Validate listen addresses (comma-separated lists; one server per
 	// address).
 	socks5Addrs, err := parseListenList("SOCKS5_LISTEN", getEnv("SOCKS5_LISTEN", ":1080"))
@@ -248,6 +271,12 @@ func loadConfig() (config, error) {
 	healthAddr := getEnv("HEALTH_LISTEN", "127.0.0.1:9090")
 	if err := validateHostPort(healthAddr); err != nil {
 		return config{}, fmt.Errorf("invalid HEALTH_LISTEN: %w", err)
+	}
+
+	// Validate UI_ALLOWED_HOSTS
+	uiAllowedHosts, err := parseHostList("UI_ALLOWED_HOSTS", getEnv("UI_ALLOWED_HOSTS", ""))
+	if err != nil {
+		return config{}, err
 	}
 
 	// Validate DATA_DIR
@@ -303,6 +332,8 @@ func loadConfig() (config, error) {
 		sshKeepaliveInterval: sshKeepaliveInterval,
 		sshKeepaliveProbes:   sshKeepaliveProbes,
 		dialTimeout:          dialTimeout,
+		maxConnections:       maxConnections,
+		uiAllowedHosts:       uiAllowedHosts,
 	}, nil
 }
 
@@ -344,6 +375,23 @@ func parseListenList(name, raw string) ([]string, error) {
 		return nil, fmt.Errorf("invalid %s %q: no listen addresses", name, raw)
 	}
 	return addrs, nil
+}
+
+// parseHostList parses a comma-separated list of host names or IP
+// addresses without ports. Whitespace is trimmed, empty items skipped.
+func parseHostList(name, raw string) ([]string, error) {
+	var hosts []string
+	for _, h := range strings.Split(raw, ",") {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(h); err == nil || strings.ContainsAny(h, "/[] ") {
+			return nil, fmt.Errorf("invalid %s entry %q: want a host name or IP address without port", name, h)
+		}
+		hosts = append(hosts, h)
+	}
+	return hosts, nil
 }
 
 func setLogLevel(level string) {
@@ -429,6 +477,19 @@ func parseDialTimeout(raw string) (time.Duration, error) {
 		return 0, fmt.Errorf("SSH_DIAL_TIMEOUT must be positive, got %s", raw)
 	}
 	return d, nil
+}
+
+// parseMaxConnections parses MAX_CONNECTIONS, the limit of concurrent
+// client connections over all proxy listeners. 0 disables the limit.
+func parseMaxConnections(raw string) (int, error) {
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid MAX_CONNECTIONS %q (integer, e.g. 4096): %w", raw, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("MAX_CONNECTIONS must be non-negative (0 = no limit), got %d", n)
+	}
+	return n, nil
 }
 
 func getEnvRequired(key string) (string, error) {

@@ -529,34 +529,58 @@ func TestResolveAllDOHServerFallback(t *testing.T) {
 	}
 }
 
-// TestIPRuleMatchesViaLocalResolver: ip: rules are matched through the same
-// local resolver the direct dial uses. A public DoH NXDOMAIN must not push a
-// host with a legitimate direct rule into the tunnel (split-horizon names
-// live in local DNS), and deciding "direct" must not cost tunnel traffic.
-func TestIPRuleMatchesViaLocalResolver(t *testing.T) {
-	var reqs atomic.Int64
-	mux := http.NewServeMux()
-	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, _ *http.Request) {
-		reqs.Add(1)
-		w.Header().Set("Content-Type", "application/dns-json")
-		io.WriteString(w, `{"Status":3,"Answer":[]}`) // NXDOMAIN for every name
+// TestIPRuleMatchesViaDoH: ip: rules are matched against the tunnel-policy
+// (DoH) answer, and a name that is tunneled in the end is never sent to the
+// local resolver. Before the fix any ip: rule resolved every destination
+// name locally, so the local network saw all tunneled names and a forged
+// local answer could force traffic direct.
+func TestIPRuleMatchesViaDoH(t *testing.T) {
+	fake := startFakeDoHServer(t, func(name, qtype string) dohAnswer {
+		switch {
+		case name == "intranet.example" && qtype == "A":
+			return dohAnswer{a: []string{"10.1.2.3"}}
+		case name == "public.example" && qtype == "A":
+			return dohAnswer{a: []string{"203.0.113.9"}}
+		}
+		return dohAnswer{status: 0}
 	})
-	srv := httptest.NewTLSServer(mux)
-	defer srv.Close()
-
-	rules, err := NewRuleEngine("ip:127.0.0.0/8")
+	rules, err := NewRuleEngine("ip:10.0.0.0/8")
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
-	rules.SetDOH(srv.Listener.Addr().String(), testDialer{Target: srv.Listener.Addr().String()})
-	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig
-
-	route, reason := rules.Decide(context.Background(), "localhost", 443)
-	if route != RouteDirect || reason != "direct:ip:127.0.0.0/8" {
-		t.Fatalf("Decide(localhost) = %s (%s), want direct (direct:ip:127.0.0.0/8)", route, reason)
+	d, b := setBootstrap(t, fake)
+	rules.SetDOH(b.addr, d)
+	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
+	var local atomic.Int64
+	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
+		local.Add(1)
+		// A forged local answer inside the rule CIDR.
+		return []net.IPAddr{{IP: net.ParseIP("10.9.9.9")}}, nil
 	}
-	if n := reqs.Load(); n != 0 {
-		t.Fatalf("DoH requests = %d, want 0: an ip: rule must resolve locally", n)
+
+	if route, reason := rules.Decide(context.Background(), "intranet.example", 443); route != RouteDirect || reason != "direct:ip:10.0.0.0/8" {
+		t.Fatalf("Decide(intranet.example) = %s (%s), want direct (direct:ip:10.0.0.0/8)", route, reason)
+	}
+	if route, _ := rules.Decide(context.Background(), "public.example", 443); route != RouteTunnel {
+		t.Fatalf("Decide(public.example) = %s, want tunnel: the forged local answer must not count", route)
+	}
+	if n := local.Load(); n != 0 {
+		t.Fatalf("local lookups = %d, want 0: deciding a route must not leak names to local DNS", n)
+	}
+}
+
+// TestIPRuleWithoutDoHUsesLocal: with DoH disabled the local resolver is the
+// tunnel policy too, so ip: rules keep working through it.
+func TestIPRuleWithoutDoHUsesLocal(t *testing.T) {
+	rules, err := NewRuleEngine("ip:10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("10.1.2.3")}}, nil
+	}
+	if route, _ := rules.Decide(context.Background(), "intranet.example", 443); route != RouteDirect {
+		t.Fatalf("Decide(intranet.example) = %s, want direct", route)
 	}
 }
 
@@ -830,8 +854,8 @@ func TestDomainRuleCaseInsensitive(t *testing.T) {
 		{"Example.COM.", "www.example.com"},
 		{"Other.Local", "other.local"},
 	} {
-		if got := rules.Route(ctx, tc.host, 443); got != RouteDirect {
-			t.Errorf("Route(%q) with rule %q = %v, want direct", tc.host, tc.rule, got)
+		if got, _ := rules.Decide(ctx, tc.host, 443); got != RouteDirect {
+			t.Errorf("Decide(%q) with rule %q = %v, want direct", tc.host, tc.rule, got)
 		}
 	}
 }
@@ -846,6 +870,30 @@ func TestRuleEntryParseErrors(t *testing.T) {
 	for _, raw := range []string{"re:", "."} {
 		if _, err := NewRuleEngine(raw); err == nil {
 			t.Errorf("NewRuleEngine(%q): want parse error, got none", raw)
+		}
+	}
+}
+
+// TestDecidePrivateLiterals: every spelling of a local address must be
+// classified private. netip.Prefix.Contains misses IPv4-mapped addresses
+// and addresses with a zone, so before the fix ::ffff:127.0.0.1 went to the
+// tunnel and reached the VPS loopback.
+func TestDecidePrivateLiterals(t *testing.T) {
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	for _, host := range []string{
+		"127.0.0.1", "::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.1.2.3",
+		"0.0.0.0", "::", "100.64.0.1", "fc00::1", "fd12:3456::1", "fe80::1%eth0", "::1",
+	} {
+		if route, reason := rules.Decide(context.Background(), host, 80); route != RouteDirect || reason != "private" {
+			t.Errorf("Decide(%s) = %s (%s), want direct (private)", host, route, reason)
+		}
+	}
+	for _, host := range []string{"203.0.113.1", "2001:db8::1", "::ffff:203.0.113.1", "100.128.0.1"} {
+		if route, _ := rules.Decide(context.Background(), host, 80); route != RouteTunnel {
+			t.Errorf("Decide(%s) = %s, want tunnel", host, route)
 		}
 	}
 }

@@ -34,6 +34,8 @@ services:
       SSH_KEEPALIVE_INTERVAL: "${SSH_KEEPALIVE_INTERVAL:-1s}"
       SSH_KEEPALIVE_PROBES: "${SSH_KEEPALIVE_PROBES:-5}"
       SSH_DIAL_TIMEOUT: "${SSH_DIAL_TIMEOUT:-30s}"
+      MAX_CONNECTIONS: "${MAX_CONNECTIONS:-4096}"
+      UI_ALLOWED_HOSTS: "${UI_ALLOWED_HOSTS:-}"
     security_opt:
       - no-new-privileges:true
     read_only: true
