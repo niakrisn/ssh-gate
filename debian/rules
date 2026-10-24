@@ -38,6 +38,7 @@ override_dh_auto_test:
 
 override_dh_auto_install:
 	install -D -m 0755 bin/ssh-gate debian/tmp/usr/bin/ssh-gate
+	install -D -m 0644 debian/rsyslog.conf debian/tmp/etc/rsyslog.d/40-ssh-gate.conf
 
 override_dh_auto_clean:
 	rm -rf bin debian/notices.check

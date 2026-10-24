@@ -165,11 +165,29 @@ With the defaults that is 15 seconds; an unanswered SSH-layer probe drops the
 tunnel within about two periods.
 .TP
 .BI "LOG_LEVEL=" level
-One of
+Level of the service log, one of
 .BR debug ", " info ", " warn ", " error .
 Default
 .BR info .
-Structured JSON lines on standard error.
+.TP
+.BI "ACCESS_LOG=" on|off
+One line per proxied connection: client, destination, route, bytes,
+duration and
+.IR result :
+.BR ok ", " resolve_error ", " dial_error " or " relay_error .
+The error text of a failed connection is a warning in the service log with
+the same
+.IR conn_id .
+.B LOG_LEVEL
+does not affect it. Default
+.BR on .
+.PP
+Both logs are structured JSON lines. Under systemd they go to the journal
+with a syslog priority per line, the service log as
+.B ssh-gate
+and the access log as
+.BR ssh-gate-access ;
+elsewhere both go to standard error.
 .SH "DIRECT RULES"
 A rule names a destination that is dialed from the local network instead of
 the tunnel. Three forms are accepted:
@@ -253,6 +271,10 @@ filesystem read-only except for the data directory.
 .B /etc/default/ssh-gate
 Configuration, a conffile: local edits are kept across upgrades.
 .TP
+.B /etc/rsyslog.d/40-ssh-gate.conf
+Keeps the access log out of the syslog files when rsyslog is installed; the
+journal still has it.
+.TP
 .B /var/lib/ssh-gate
 Data directory:
 .IR ssh_key ,
@@ -302,9 +324,17 @@ The public key to put in the gateway's
 .EX
 cat /var/lib/ssh-gate/ssh_key.pub
 .EE
+.PP
+Read the access log, or only the service warnings and errors:
+.PP
+.EX
+journalctl -u ssh-gate -t ssh-gate-access -o cat
+journalctl -u ssh-gate -t ssh-gate -p warning
+.EE
 .SH "SEE ALSO"
 .BR ssh (1),
 .BR systemctl (1),
+.BR journalctl (1),
 .BR proxy (7),
 .IR /usr/share/doc/ssh-gate/README.md ,
 .IR /usr/share/doc/ssh-gate/THIRD-PARTY-NOTICES

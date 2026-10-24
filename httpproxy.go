@@ -176,32 +176,25 @@ func statusForDialErr(err error) int {
 }
 
 // openUpstream opens the upstream connection through the shared Opener and
-// wraps it for access logging. The access log is emitted on dial failure.
+// wraps it for access logging. A dial failure is logged here.
 func (s *HTTPProxyServer) openUpstream(ctx context.Context, src, method, host string, port int) (*logConn, error) {
-	log.Info().Str("proto", "http").Str("method", method).Str("src", src).Str("host", host).Int("port", port).Msg("request")
+	info := connInfo{id: nextConnID(), proto: "http", src: src, host: host, port: port, family: s.opener.family}
+	log.Debug().Uint64("conn_id", info.id).Str("proto", "http").Str("method", method).Str("src", src).Str("host", host).Int("port", port).Msg("request")
 
 	start := time.Now()
 	upstream, dst, route, reason, err := s.opener.Open(ctx, src, "http", host, port)
-	dialMS := time.Since(start).Milliseconds()
+	info.dst, info.route, info.reason = dst, route, reason
+	info.dialMS = time.Since(start).Milliseconds()
 
 	if err != nil {
-		log.Info().Str("proto", "http").Str("src", src).Str("host", host).Int("port", port).
-			Str("route", route.String()).Str("reason", reason).Str("dst", dst).Int64("dial_ms", dialMS).Err(err).Msg("access")
+		info.logFailure("dial_error", err)
 		return nil, err
 	}
 
 	return &logConn{
-		Conn:   upstream,
-		proto:  "http",
-		t0:     time.Now(),
-		src:    src,
-		host:   host,
-		port:   port,
-		dst:    dst,
-		route:  route,
-		reason: reason,
-		family: s.opener.family,
-		dialMS: dialMS,
+		Conn:     upstream,
+		t0:       time.Now(),
+		connInfo: info,
 	}, nil
 }
 

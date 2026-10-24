@@ -45,6 +45,10 @@ SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 DevicePolicy=closed
 UMask=0077
+# journald drops lines over 10000 per 30 s per unit by default; the access
+# log writes one line per connection, so a busy proxy would lose lines.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=50000
 KillSignal=SIGTERM
 TimeoutStopSec=15
 Restart=on-failure

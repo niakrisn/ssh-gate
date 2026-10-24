@@ -1,1 +1,2 @@
 usr/bin/ssh-gate
+etc/rsyslog.d/40-ssh-gate.conf

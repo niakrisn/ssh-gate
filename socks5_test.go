@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 // TestSOCKS5AssociateRejectedNoDial: UDP ASSOCIATE must be refused with
@@ -244,5 +250,77 @@ func TestSOCKS5RelayOutlivesHandshakeTimeout(t *testing.T) {
 	buf := make([]byte, 4)
 	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "ping" {
 		t.Fatalf("echo after idle = %q (err %v), want ping", buf, err)
+	}
+}
+
+// captureLogs points the service and access loggers at buffers for one test.
+func captureLogs(t *testing.T) (app, access *bytes.Buffer) {
+	t.Helper()
+	app, access = &bytes.Buffer{}, &bytes.Buffer{}
+	prevApp, prevAccess := log.Logger, accessLog
+	log.Logger = zerolog.New(&syncWriter{w: app})
+	accessLog = zerolog.New(&syncWriter{w: access})
+	t.Cleanup(func() { log.Logger, accessLog = prevApp, prevAccess })
+	return app, access
+}
+
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+// TestSOCKS5ResolveFailureLogged: a name that does not resolve still gets
+// host unreachable (0x04), as when the library itself saw the Resolve error,
+// and now leaves an access line marked resolve_error plus the error in the
+// service log under the same conn_id.
+func TestSOCKS5ResolveFailureLogged(t *testing.T) {
+	app, access := captureLogs(t)
+
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "nx.example", IsNotFound: true}
+	}
+	s, err := NewSOCKS5Server("127.0.0.1:0", &Opener{rules: rules, d: testDialer{}, family: FamilyBoth})
+	if err != nil {
+		t.Fatalf("NewSOCKS5Server: %v", err)
+	}
+	s.Start()
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	name := "nx.example"
+	if code := socks5Connect(t, s.ln.Addr().String(), name, 443); code != 0x04 {
+		t.Fatalf("reply code %#x, want 0x04 (host unreachable)", code)
+	}
+
+	var acc, warn struct {
+		ConnID uint64 `json:"conn_id"`
+		Host   string `json:"host"`
+		Result string `json:"result"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal(access.Bytes(), &acc); err != nil {
+		t.Fatalf("access line %q: %v", access.String(), err)
+	}
+	if acc.Host != name || acc.Result != "resolve_error" || acc.Error != "" || acc.ConnID == 0 {
+		t.Fatalf("access line = %+v, want host %s, result resolve_error, no error text", acc, name)
+	}
+	var found bool
+	for _, line := range bytes.Split(bytes.TrimSpace(app.Bytes()), []byte("\n")) {
+		if json.Unmarshal(line, &warn) == nil && warn.ConnID == acc.ConnID && warn.Error != "" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no service log line with conn_id %d and the error:\n%s", acc.ConnID, app.String())
 	}
 }

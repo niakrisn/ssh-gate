@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	socks5 "github.com/things-go/go-socks5"
 	"github.com/things-go/go-socks5/statute"
@@ -68,39 +70,36 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 				_ = c.(net.Conn).SetDeadline(time.Time{})
 			}
 
-			log.Info().Str("proto", "socks5").Str("src", src).Str("host", host).Int("port", portInt).Msg("request")
+			info := connInfo{id: nextConnID(), proto: "socks5", src: src, host: host, port: portInt, family: s.opener.family}
+			log.Debug().Uint64("conn_id", info.id).Str("proto", "socks5").Str("src", src).Str("host", host).Int("port", portInt).Msg("request")
+
+			if rf, ok := ctx.Value(resolveFailureKey{}).(*resolveFailure); ok {
+				info.route, info.reason = rf.route, rf.reason
+				info.logFailure("resolve_error", rf.err)
+				return nil, errResolveFailed
+			}
 
 			start := time.Now()
 			upstream, dst, route, reason, err := s.opener.Open(ctx, src, "socks5", host, portInt)
-			dialMS := time.Since(start).Milliseconds()
+			info.dst, info.route, info.reason = dst, route, reason
+			info.dialMS = time.Since(start).Milliseconds()
 
 			if err != nil {
-				log.Info().Str("proto", "socks5").Str("src", src).Str("host", host).Int("port", portInt).
-					Str("route", route.String()).Str("reason", reason).Str("family", s.opener.family.String()).
-					Str("dst", dst).Int64("dial_ms", dialMS).Err(err).Msg("access")
+				info.logFailure("dial_error", err)
 				return nil, err
 			}
 
-			log.Debug().Str("host", host).Int("port", portInt).Str("dst", dst).Int64("dial_ms", dialMS).Msg("dial done")
-			log.Debug().Str("proto", "socks5").Str("host", host).Int("port", portInt).Msg("handshake")
+			log.Debug().Uint64("conn_id", info.id).Str("dst", dst).Int64("dial_ms", info.dialMS).Msg("dial done")
 
 			// The library closes the returned conn when its relay ends,
 			// so counting here tracks in-flight relays exactly (UDP
 			// ASSOCIATE is rejected, so every logConn is a CONNECT relay).
 			s.conns.Add(1)
 			return &logConn{
-				Conn:    upstream,
-				onClose: s.conns.Done,
-				proto:   "socks5",
-				t0:      time.Now(),
-				src:     src,
-				host:    host,
-				port:    portInt,
-				dst:     dst,
-				route:   route,
-				reason:  reason,
-				family:  s.opener.family,
-				dialMS:  dialMS,
+				Conn:     upstream,
+				onClose:  s.conns.Done,
+				t0:       time.Now(),
+				connInfo: info,
 			}, nil
 		}),
 		// FQDNs are resolved through the shared Opener (route policy: direct
@@ -202,20 +201,15 @@ func (s *SOCKS5Server) Shutdown(ctx context.Context) error {
 	}
 }
 
-// logConn wraps upstream conn to count bytes and emit access log on close.
-type logConn struct {
-	net.Conn
-	mu       sync.Mutex
-	up, down int64 // client→upstream / upstream→client
-	firstErr error // first non-EOF error from Read/Write
-	t0       time.Time
-	closed   atomic.Bool
-	// onClose runs exactly once, after the first Close (successful or not —
-	// a failed Close still retires the relay, otherwise the shutdown drain
-	// could wait forever on a dead transport). The SOCKS5 server uses it to
-	// retire an in-flight relay from its shutdown drain counter.
-	onClose func()
-	// access fields
+// connIDs numbers proxied connections over both proxies. conn_id links a
+// connection's access line to its error in the service log.
+var connIDs atomic.Uint64
+
+func nextConnID() uint64 { return connIDs.Add(1) }
+
+// connInfo is what the access log knows about one proxied connection.
+type connInfo struct {
+	id                            uint64
 	proto, src, host, dst, reason string
 	port                          int
 	route                         Route
@@ -223,41 +217,69 @@ type logConn struct {
 	dialMS                        int64
 }
 
+func (c *connInfo) fields(e *zerolog.Event) *zerolog.Event {
+	return e.Uint64("conn_id", c.id).
+		Str("proto", c.proto).
+		Str("src", c.src).
+		Str("host", c.host).
+		Int("port", c.port).
+		Str("route", c.route.String()).
+		Str("reason", c.reason).
+		Str("family", c.family.String()).
+		Str("dst", c.dst).
+		Int64("dial_ms", c.dialMS)
+}
+
+// logFailure records a connection that never reached the relay: the access
+// line only names the failed stage in result, the error itself goes to the
+// service log under the same conn_id.
+func (c *connInfo) logFailure(result string, err error) {
+	c.fields(accessLog.Info()).Str("result", result).Msg("access")
+	c.fields(log.Warn()).Str("result", result).Err(err).Msg("connection failed")
+}
+
+// relayErr reports whether err from the upstream conn is worth logging.
+// net.ErrClosed comes from our own Close racing a pending Read, not from
+// the peer.
+func relayErr(err error) bool {
+	return err != nil && err != io.EOF && !errors.Is(err, net.ErrClosed)
+}
+
+// logConn wraps upstream conn to count bytes and emit access log on close.
+type logConn struct {
+	net.Conn
+	mu       sync.Mutex
+	up, down int64 // client→upstream / upstream→client
+	firstErr error // first relayErr error from Read/Write
+	t0       time.Time
+	closed   atomic.Bool
+	// onClose runs exactly once, after the first Close (successful or not —
+	// a failed Close still retires the relay, otherwise the shutdown drain
+	// could wait forever on a dead transport). The SOCKS5 server uses it to
+	// retire an in-flight relay from its shutdown drain counter.
+	onClose func()
+	connInfo
+}
+
 func (l *logConn) Read(p []byte) (int, error) {
 	n, err := l.Conn.Read(p)
-	if n > 0 {
-		l.mu.Lock()
-		l.down += int64(n)
-		if err != nil && err != io.EOF && l.firstErr == nil {
-			l.firstErr = err
-		}
-		l.mu.Unlock()
-	} else if err != nil && err != io.EOF {
-		l.mu.Lock()
-		if l.firstErr == nil {
-			l.firstErr = err
-		}
-		l.mu.Unlock()
+	l.mu.Lock()
+	l.down += int64(n)
+	if relayErr(err) && l.firstErr == nil {
+		l.firstErr = err
 	}
+	l.mu.Unlock()
 	return n, err
 }
 
 func (l *logConn) Write(p []byte) (int, error) {
 	n, err := l.Conn.Write(p)
-	if n > 0 {
-		l.mu.Lock()
-		l.up += int64(n)
-		if err != nil && err != io.EOF && l.firstErr == nil {
-			l.firstErr = err
-		}
-		l.mu.Unlock()
-	} else if err != nil && err != io.EOF {
-		l.mu.Lock()
-		if l.firstErr == nil {
-			l.firstErr = err
-		}
-		l.mu.Unlock()
+	l.mu.Lock()
+	l.up += int64(n)
+	if relayErr(err) && l.firstErr == nil {
+		l.firstErr = err
 	}
+	l.mu.Unlock()
 	return n, err
 }
 
@@ -285,27 +307,40 @@ func (l *logConn) Close() error {
 	ms := time.Since(l.t0).Milliseconds()
 	l.mu.Unlock()
 
-	event := log.Info().
-		Str("proto", l.proto).
-		Str("src", l.src).
-		Str("host", l.host).
-		Int("port", l.port).
-		Str("route", l.route.String()).
-		Str("reason", l.reason).
-		Str("family", l.family.String()).
-		Str("dst", l.dst).
-		Int64("dial_ms", l.dialMS).
+	result := "ok"
+	if firstErr != nil {
+		result = "relay_error"
+	}
+	l.fields(accessLog.Info()).
+		Str("result", result).
 		Int64("ms", ms).
 		Int64("bytes_up", up).
-		Int64("bytes_down", down)
-
+		Int64("bytes_down", down).
+		Msg("access")
 	if firstErr != nil {
-		event.Err(firstErr)
+		l.fields(log.Warn()).
+			Str("result", result).
+			Int64("ms", ms).
+			Int64("bytes_up", up).
+			Int64("bytes_down", down).
+			Err(firstErr).
+			Msg("connection failed")
 	}
 
-	event.Msg("access")
-
 	return err
+}
+
+// errResolveFailed fails the dial of a SOCKS5 request whose name did not
+// resolve. Its text has neither "refused" nor "network is unreachable", so
+// the library answers host unreachable, as for a failed Resolve.
+var errResolveFailed = errors.New("destination name not resolved")
+
+type resolveFailureKey struct{}
+
+type resolveFailure struct {
+	route  Route
+	reason string
+	err    error
 }
 
 // openerResolver adapts the shared Opener's resolution to the go-socks5
@@ -318,9 +353,14 @@ type openerResolver struct {
 
 func (r openerResolver) Resolve(ctx context.Context, host string) (context.Context, net.IP, error) {
 	// Rules do not depend on the port; the interface only carries the name.
-	ip, _, _, err := r.opener.Resolve(ctx, host, 0)
+	ip, route, reason, err := r.opener.Resolve(ctx, host, 0)
 	if err != nil {
-		return ctx, nil, err
+		// Not returned to the library: it would answer the client and drop
+		// the request before the dial callback, the only place that knows
+		// the client address, so the failure would miss the access log.
+		// The callback reports it and fails with errResolveFailed.
+		rf := &resolveFailure{route: route, reason: reason, err: err}
+		return context.WithValue(ctx, resolveFailureKey{}, rf), net.IPv4zero, nil
 	}
 	return ctx, ip, nil
 }

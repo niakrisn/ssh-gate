@@ -55,7 +55,8 @@ in the background until the tunnel comes up.
 | `HEALTH_LISTEN` | no | `127.0.0.1:9090` | Health + Web UI listen address (compose sets `0.0.0.0:9090` inside the container and maps it to `127.0.0.1:9090` on the host) |
 | `UI_ALLOWED_HOSTS` | no | — | Comma-separated hostnames or IPs (no port) the Web UI and API answer to, in addition to `localhost`, `127.0.0.1`, `::1` and the `HEALTH_LISTEN` host. Needed only to open the UI under a LAN name or address (see [Web UI](#web-ui)) |
 | `MAX_CONNECTIONS` | no | `4096` | Limit of concurrent client connections over all proxy listeners; a connection over the limit is closed at once. `0` disables the limit |
-| `LOG_LEVEL` | no | `info` | Log level (`debug`, `info`, `warn`, `error`) (compose sets `warn`) |
+| `LOG_LEVEL` | no | `info` | Service log level (`debug`, `info`, `warn`, `error`) (compose sets `warn`) |
+| `ACCESS_LOG` | no | `on` | Access log, one line per proxied connection (`on`, `off`). Not affected by `LOG_LEVEL`. `result` is `ok`, `resolve_error`, `dial_error` or `relay_error`; the error text is a warning in the service log with the same `conn_id`. Under systemd it goes to the journal as `ssh-gate-access` (`journalctl -u ssh-gate -t ssh-gate-access`); elsewhere it shares stderr with the service log |
 | `DATA_DIR` | no | `/data` | Directory for keys and secrets |
 
 ### DIRECT_RULES format

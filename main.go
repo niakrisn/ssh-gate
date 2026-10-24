@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -49,8 +50,11 @@ const connHistoryMaxAge = 10 * time.Minute
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	setLogLevel(getEnv("LOG_LEVEL", "info"))
-	log.Logger = log.With().Caller().Logger()
+	accessOn, accessErr := parseOnOff(getEnv("ACCESS_LOG", "on"))
+	setupLogging(parseLogLevel(getEnv("LOG_LEVEL", "info")), accessOn)
+	if accessErr != nil {
+		log.Fatal().Err(accessErr).Msg("invalid ACCESS_LOG")
+	}
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -394,17 +398,58 @@ func parseHostList(name, raw string) ([]string, error) {
 	return hosts, nil
 }
 
-func setLogLevel(level string) {
+// accessLog gets one line per proxied connection. It is separate from the
+// service log so that LOG_LEVEL does not hide it and, under systemd, it has
+// its own SYSLOG_IDENTIFIER.
+var accessLog = zerolog.New(os.Stderr).With().Timestamp().Logger()
+
+const (
+	journalIdent       = "ssh-gate"
+	journalAccessIdent = "ssh-gate-access"
+)
+
+// setupLogging builds the service and access loggers. Levels are set per
+// logger, not globally, so the access log stays on at LOG_LEVEL=warn. Under
+// systemd the lines go to journald natively (priority and identifier per
+// line); elsewhere (Docker, a terminal) both loggers write JSON to stderr.
+func setupLogging(level zerolog.Level, access bool) {
+	var appOut, accessOut io.Writer = os.Stderr, os.Stderr
+	if stderrIsJournal() {
+		if conn, err := dialJournal(); err == nil {
+			appOut = &journalWriter{conn: conn, ident: journalIdent, fallback: os.Stderr}
+			accessOut = &journalWriter{conn: conn, ident: journalAccessIdent, fallback: os.Stderr}
+		}
+	}
+
+	log.Logger = zerolog.New(appOut).Level(level).With().Timestamp().Caller().Logger()
+	if access {
+		accessLog = zerolog.New(accessOut).With().Timestamp().Logger()
+	} else {
+		accessLog = zerolog.Nop()
+	}
+}
+
+func parseLogLevel(level string) zerolog.Level {
 	switch strings.ToLower(level) {
 	case "debug":
-		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+		return zerolog.DebugLevel
 	case "warn":
-		zerolog.SetGlobalLevel(zerolog.WarnLevel)
+		return zerolog.WarnLevel
 	case "error":
-		zerolog.SetGlobalLevel(zerolog.ErrorLevel)
+		return zerolog.ErrorLevel
 	default:
-		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+		return zerolog.InfoLevel
 	}
+}
+
+func parseOnOff(v string) (bool, error) {
+	switch strings.ToLower(v) {
+	case "on":
+		return true, nil
+	case "off":
+		return false, nil
+	}
+	return false, fmt.Errorf("%q: want on or off", v)
 }
 
 func getEnv(key, fallback string) string {
