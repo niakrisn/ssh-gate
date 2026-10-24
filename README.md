@@ -35,11 +35,39 @@ startup, the proxies, health endpoints and Web UI still come up (readyz
 reports 503, the UI shows the tunnel as disconnected) and the dialer retries
 in the background until the tunnel comes up.
 
+An empty `SSH_HOST` or `SSH_USER` is not fatal either: the service runs with
+the proxies off, only the health endpoints and the Web UI come up (readyz
+reports 503 `not configured`). Every other startup error (an invalid value, a
+busy port, an unreadable key) exits with status 78; the systemd unit does not
+restart on it.
+
+### Tunnel state
+
+Under systemd (`Type=notify`) the service reports the tunnel state in the
+`Status:` line of `systemctl status ssh-gate`; the same state is `ssh.state`
+in `GET /api/status`, the Web UI shows it, and readyz names it in its 503
+body:
+
+| State | Status line |
+|-------|-------------|
+| `not_configured` | `Not configured: set SSH_HOST and SSH_USER in /etc/default/ssh-gate, then restart the service` |
+| `connecting` | `Connecting to user@host:22` |
+| `key_rejected` | `Key not accepted by user@host:22: add /var/lib/ssh-gate/ssh_key.pub to authorized_keys; retry in 8s (attempt 3)` |
+| `unreachable` | `Cannot reach user@host:22: connect: connection refused; retry in 8s (attempt 3)` |
+| `host_key_mismatch` | `Host key of user@host:22 changed (expected SHA256:..., got SHA256:...): delete /var/lib/ssh-gate/ssh_known_hosts to trust the new key` |
+| `ssh_error` | `SSH error: <error>; retry in 8s (attempt 3)` |
+| `connected` | `Connected to user@host:22` |
+| `reconnecting` | `Tunnel to user@host:22 lost, reconnecting` |
+
+The service reports ready once its listeners are open, without waiting for
+the tunnel, so `systemctl start` does not block on the VPS. On shutdown the
+line is `Stopping, draining connections`.
+
 ## Configuration
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `SSH_HOST` | yes | — | VPS hostname or IPv4 address. The tunnel connects over IPv4 only: an IPv6 address is rejected at startup, a hostname needs an A record |
+| `SSH_HOST` | yes | — | VPS hostname or IPv4 address. The tunnel connects over IPv4 only: an IPv6 address is rejected at startup, a hostname needs an A record. Empty: the service runs not configured (see [Tunnel state](#tunnel-state)) |
 | `SSH_PORT` | no | `22` | SSH port |
 | `SSH_USER` | yes | — | SSH username |
 | `SSH_DIAL_TIMEOUT` | no | `30s` | Max duration of a single destination dial through the tunnel (Go duration, must be positive and below 10m — the connection history window). A dial to a blackholed host fails with a deadline error instead of hanging |

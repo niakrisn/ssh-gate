@@ -3,9 +3,10 @@
 # This file is NOT a shell script: only KEY=value lines, no "export", no
 # command substitution. Apply changes with: systemctl restart ssh-gate
 
-# VPS access. Required: the service refuses to start while SSH_HOST or
-# SSH_USER is empty. SSH_HOST: IPv4 address or a name with an A record (the
-# tunnel connects over IPv4 only).
+# VPS access. Required: while SSH_HOST or SSH_USER is empty the service runs
+# with the proxies off and "systemctl status ssh-gate" asks for them.
+# SSH_HOST: IPv4 address or a name with an A record (the tunnel connects over
+# IPv4 only).
 SSH_HOST=
 SSH_PORT=22
 SSH_USER=

@@ -14,6 +14,16 @@ const STATUS_LABEL = {
 
 const PROTO_LABEL = { socks5: 'SOCKS5', http: 'HTTP' };
 
+// Tunnel states from /api/status (ssh.state) while the session is down.
+const TUNNEL_LABEL = {
+  connecting: 'подключение',
+  reconnecting: 'переподключение',
+  key_rejected: 'VPS не принимает ключ: добавьте ssh_key.pub в authorized_keys',
+  unreachable: 'SSH-сессия не подключена',
+  host_key_mismatch: 'ключ хоста изменился: удалите ssh_known_hosts, чтобы доверять новому',
+  ssh_error: 'ошибка SSH',
+};
+
 const state = { tab: 'active', page: 1, q: '', proto: '' };
 
 const $ = (id) => document.getElementById(id);
@@ -193,13 +203,22 @@ async function refreshStatus() {
 
 function renderStatus(s) {
   const ssh = s.ssh || {};
+  if (ssh.state === 'not_configured') {
+    $('ssh-dot').className = 'dot err';
+    $('ssh-info').textContent = 'Не настроено: задайте SSH_HOST и SSH_USER и перезапустите сервис · работает ' + fmtUptime(s.uptime_s);
+    $('tunnel-info').hidden = true;
+    $('active-summary').textContent = 'Прокси выключены';
+    $('active-count').textContent = '';
+    return;
+  }
   const dotState = !ssh.reachable ? 'err' : ssh.connected ? 'ok' : 'warn';
   $('ssh-dot').className = 'dot ' + dotState;
   let info = ssh.host + ':' + ssh.port + ' · ';
   info += ssh.reachable ? ssh.rtt_ms + ' мс · ' : 'недоступен · ';
-  info += ssh.connected ? 'SSH-сессия активна' : 'SSH-сессия не подключена';
+  info += ssh.connected ? 'SSH-сессия активна' : TUNNEL_LABEL[ssh.state] || 'SSH-сессия не подключена';
   info += ' · работает ' + fmtUptime(s.uptime_s);
   $('ssh-info').textContent = info;
+  $('ssh-info').title = ssh.error || ''; // last connect error, full text
 
   // Second row: live tcp_info of the tunnel connection (null off-Linux or
   // without a session); retrans and >60 s of silence are early

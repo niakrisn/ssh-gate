@@ -48,8 +48,30 @@ type server struct {
 // its record.
 const connHistoryMaxAge = 10 * time.Minute
 
+// exitConfig is the exit status of every startup error (EX_CONFIG from
+// sysexits.h): a bad value, an unreadable key, a busy port. A restart does
+// not fix any of them, so the unit lists it in RestartPreventExitStatus and
+// the service stays failed with the error in the journal instead of
+// restarting in a loop.
+const exitConfig = 78
+
+// missing returns the names of the empty required variables. With any of
+// them empty the service runs not configured: Web UI and health only.
+func (c config) missing() []string {
+	var names []string
+	if c.sshHost == "" {
+		names = append(names, "SSH_HOST")
+	}
+	if c.sshUser == "" {
+		names = append(names, "SSH_USER")
+	}
+	return names
+}
+
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	// log.Fatal is used only for startup errors.
+	zerolog.FatalExitFunc = func() { os.Exit(exitConfig) }
 	accessOn, accessErr := parseOnOff(getEnv("ACCESS_LOG", "on"))
 	setupLogging(parseLogLevel(getEnv("LOG_LEVEL", "info")), accessOn)
 	if accessErr != nil {
@@ -77,10 +99,68 @@ func main() {
 		}
 	}
 
+	status := newSDStatus()
+
 	// Connection history is in-memory only: last 1000 connections / 10 minutes.
 	tracker := NewConnTracker(1000, connHistoryMaxAge)
 
-	dialer, err := newSSHDialer(sshDialerCfg{
+	var servers []server
+	var d dialer
+	var rules *RuleEngine
+	if missing := cfg.missing(); len(missing) > 0 {
+		// First start after install: keep running so that systemctl shows
+		// the hint and the restart after the config edit just works. No
+		// proxies: without a tunnel every tunnel connection would fail.
+		log.Warn().Strs("missing", missing).Msg("not configured: proxies stay off until SSH_HOST and SSH_USER are set and the service restarts")
+		status.set(notConfiguredText(missing))
+		d = unconfiguredDialer{}
+	} else {
+		d, rules, servers = startProxies(cfg, tracker, status)
+	}
+
+	// Health/ready endpoint + Web UI.
+	hs, err := NewHealthServer(cfg.healthAddr, cfg.sshHost, cfg.sshPort, d, tracker)
+	if err != nil {
+		log.Fatal().Err(err).Msg("health server")
+	}
+	hs.AllowHosts(cfg.uiAllowedHosts)
+	hs.Start()
+	servers = append(servers, server{Name: "health", Shutdown: hs.Shutdown})
+
+	// Graceful shutdown on SIGTERM/SIGINT
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		cancel()
+	}()
+
+	if rules != nil {
+		rules.Start(ctx)
+	}
+	status.ready()
+
+	<-ctx.Done()
+	log.Info().Msg("shutting down...")
+	status.stop("Stopping, draining connections")
+	// The signal ctx is already canceled; passing it to the servers would
+	// skip the relay drain entirely. Give the drain its own deadline,
+	// comfortably below compose's stop_grace_period (10 s).
+	const shutdownDrainTimeout = 5 * time.Second
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+	defer cancelDrain()
+	shutdownServers(drainCtx, servers)
+	if rules != nil {
+		rules.Stop()
+	}
+	d.stop()
+}
+
+// startProxies starts the SSH dialer and the proxy listeners. The dialer
+// reports every tunnel state change to the systemd status line.
+func startProxies(cfg config, tracker *ConnTracker, status *sdStatus) (*sshDialer, *RuleEngine, []server) {
+	dcfg := sshDialerCfg{
 		host:              cfg.sshHost,
 		port:              cfg.sshPort,
 		user:              cfg.sshUser,
@@ -90,7 +170,9 @@ func main() {
 		keepaliveProbes:   cfg.sshKeepaliveProbes,
 		tracker:           tracker,
 		dialTimeout:       cfg.dialTimeout,
-	})
+	}
+	dcfg.onStatus = func(st tunnelStatus) { status.set(statusText(dcfg, st)) }
+	dialer, err := newSSHDialer(dcfg)
 	if err != nil {
 		log.Fatal().Err(err).Msg("SSH dialer")
 	}
@@ -141,38 +223,7 @@ func main() {
 			servers = append(servers, server{Name: "HTTP " + addr, Shutdown: hp.Shutdown})
 		}
 	}
-
-	// Health/ready endpoint + Web UI.
-	hs, err := NewHealthServer(cfg.healthAddr, cfg.sshHost, cfg.sshPort, dialer, tracker)
-	if err != nil {
-		log.Fatal().Err(err).Msg("health server")
-	}
-	hs.AllowHosts(cfg.uiAllowedHosts)
-	hs.Start()
-	servers = append(servers, server{Name: "health", Shutdown: hs.Shutdown})
-
-	// Graceful shutdown on SIGTERM/SIGINT
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-		<-sig
-		cancel()
-	}()
-
-	rules.Start(ctx)
-
-	<-ctx.Done()
-	log.Info().Msg("shutting down...")
-	// The signal ctx is already canceled; passing it to the servers would
-	// skip the relay drain entirely. Give the drain its own deadline,
-	// comfortably below compose's stop_grace_period (10 s).
-	const shutdownDrainTimeout = 5 * time.Second
-	drainCtx, cancelDrain := context.WithTimeout(context.Background(), shutdownDrainTimeout)
-	defer cancelDrain()
-	shutdownServers(drainCtx, servers)
-	rules.Stop()
-	dialer.stop()
+	return dialer, rules, servers
 }
 
 func shutdownServers(ctx context.Context, servers []server) {
@@ -203,11 +254,9 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("invalid PROXY_MODES: %w", err)
 	}
 
-	// Validate SSH_HOST (getEnvRequired already rejects an empty value)
-	sshHost, err := getEnvRequired("SSH_HOST")
-	if err != nil {
-		return config{}, fmt.Errorf("configuration error: %w", err)
-	}
+	// SSH_HOST and SSH_USER may be empty: the service then runs not
+	// configured (see config.missing) instead of exiting.
+	sshHost := os.Getenv("SSH_HOST")
 	// The tunnel connects over IPv4 only (dialer.go dials tcp4), so an
 	// IPv6 literal could never connect; fail at startup, not in the
 	// reconnect loop.
@@ -215,11 +264,7 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("invalid SSH_HOST %q: the tunnel connects over IPv4 only, use an IPv4 address or a name with an A record", sshHost)
 	}
 
-	// Validate SSH_USER
-	sshUser, err := getEnvRequired("SSH_USER")
-	if err != nil {
-		return config{}, fmt.Errorf("configuration error: %w", err)
-	}
+	sshUser := os.Getenv("SSH_USER")
 
 	// Validate DIRECT_IP_FAMILY
 	directIPFamily, err := parseIPFamily(getEnv("DIRECT_IP_FAMILY", "both"))
@@ -535,14 +580,6 @@ func parseMaxConnections(raw string) (int, error) {
 		return 0, fmt.Errorf("MAX_CONNECTIONS must be non-negative (0 = no limit), got %d", n)
 	}
 	return n, nil
-}
-
-func getEnvRequired(key string) (string, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return "", fmt.Errorf("required env var %s is empty", key)
-	}
-	return v, nil
 }
 
 // firstRunPorts returns the unique ports of the listen addresses in order,

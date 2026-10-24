@@ -1,3 +1,28 @@
+ssh-gate (0.4.0-1) unstable; urgency=medium
+
+  * systemd: Type=notify. READY=1 once the listeners are open (not waiting
+    for the tunnel); the Status: line of systemctl status shows the tunnel
+    state: not configured, connecting, key not accepted, unreachable, host
+    key changed, SSH error, connected, reconnecting, stopping. A failure
+    state names the file to act on and the next retry.
+  * Empty SSH_HOST or SSH_USER is no longer fatal: the service runs with the
+    proxies off, health and Web UI only. The package now starts the service
+    on a fresh install.
+  * Startup errors exit with 78; RestartPreventExitStatus=78 keeps the unit
+    failed instead of restarting it in a loop.
+  * /api/status reports ssh.state and ssh.error; /readyz names the state;
+    the Web UI shows it.
+  * Logs go to journald over its native protocol: a priority per line,
+    identifiers ssh-gate and ssh-gate-access. Outside systemd both stay JSON
+    on stderr.
+  * ACCESS_LOG=on|off (default on), not affected by LOG_LEVEL. Access lines
+    carry conn_id and result; the error is a service log warning with the
+    same conn_id.
+  * LogRateLimitBurst=50000 per 30 s; /etc/rsyslog.d/40-ssh-gate.conf keeps
+    the access log out of the syslog files.
+
+ -- Nikita Kozlov <niakrisn@gmail.com>  Sat, 24 Oct 2026 10:21:31 +0000
+
 ssh-gate (0.3.0-1) unstable; urgency=high
 
   * Security: check the SSH host key on every reconnect, not only at

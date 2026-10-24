@@ -138,12 +138,15 @@ func (h *HealthServer) uiGuard(next http.Handler) http.Handler {
 	})
 }
 
-// Start begins serving health checks and probing the SSH server port.
+// Start begins serving health checks and probing the SSH server port. An
+// empty sshHost (not configured) has no port to probe.
 func (h *HealthServer) Start() {
 	if !h.started.CompareAndSwap(false, true) {
 		return
 	}
-	go h.probeLoop()
+	if h.sshHost != "" {
+		go h.probeLoop()
+	}
 	go func() {
 		log.Info().Str("listen", h.ln.Addr().String()).Msg("health server starting")
 		if err := h.srv.Serve(h.ln); err != nil {
@@ -223,14 +226,33 @@ func (h *HealthServer) readyHandler(w http.ResponseWriter, r *http.Request) {
 	if h.dialer.Connected() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	if st := h.tunnelStatus(); st.State == stateNotConfigured {
+		w.Write([]byte("not configured: SSH_HOST and SSH_USER are required"))
 	} else {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("SSH not connected"))
+		w.Write([]byte("SSH not connected: " + st.State))
 	}
 }
 
+// tunnelStatus returns the dialer's tunnel state. A dialer without a state
+// (test fakes) is connected or connecting by Connected().
+func (h *HealthServer) tunnelStatus() tunnelStatus {
+	if p, ok := h.dialer.(statusProvider); ok {
+		if st := p.Status(); st.State != "" {
+			return st
+		}
+	}
+	if h.dialer.Connected() {
+		return tunnelStatus{State: stateConnected}
+	}
+	return tunnelStatus{State: stateConnecting}
+}
+
 // statusHandler serves GET /api/status: the SSH tunnel endpoint, the current
-// session state, the latest port probe, the live tcp_info tunnel counters
+// session state (state, plus the last connect error in a failure state),
+// the latest port probe, the live tcp_info tunnel counters
 // (null when unavailable) and active connection counts per protocol.
 func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -259,15 +281,30 @@ func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 		total += n
 	}
 
+	// No probe has run yet, or none runs (not configured): report 0, not
+	// the Unix time of the zero time.
+	var checkedAt int64
+	if !probe.at.IsZero() {
+		checkedAt = probe.at.Unix()
+	}
+
+	st := h.tunnelStatus()
+	errText := ""
+	if st.Err != nil {
+		errText = st.Err.Error()
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(map[string]any{
 		"ssh": map[string]any{
 			"host":       h.sshHost,
 			"port":       h.sshPort,
 			"connected":  h.dialer.Connected(),
+			"state":      st.State,
+			"error":      errText,
 			"reachable":  probe.reachable,
 			"rtt_ms":     probe.rttMs,
-			"checked_at": probe.at.Unix(),
+			"checked_at": checkedAt,
 			"tcp":        tcp,
 		},
 		"active":       active,

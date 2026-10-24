@@ -26,7 +26,21 @@ Losing the SSH connection is not fatal. The proxies keep serving direct
 destinations, dialing is retried with jittered backoff capped at 60 seconds,
 and the readiness endpoint reports not ready until the tunnel is back up. The
 process exits only on a fatal startup error, most often an invalid
-configuration.
+configuration. Empty
+.BR SSH_HOST " or " SSH_USER
+is not such an error: the process keeps running with the proxies off, and only
+the health endpoints and the Web UI are served until the configuration is
+filled in and the service restarted.
+.PP
+Under systemd the tunnel state is the
+.B Status:
+line of
+.BR "systemctl status ssh-gate" :
+not configured, connecting, key not accepted by the gateway, gateway
+unreachable, host key changed, other SSH error, connected or reconnecting.
+A failure state names the file to act on and the time of the next attempt.
+The service reports ready once its listeners are open, without waiting for the
+tunnel.
 .PP
 A SOCKS5 client must finish its handshake within 30 seconds. A plain HTTP
 proxy request is closed after 5 minutes without data in either direction;
@@ -49,15 +63,16 @@ no command substitution. Apply changes with
 .BR "systemctl restart ssh-gate" .
 .TP
 .BI "SSH_HOST=" host
-Gateway address. Required. The tunnel connects over IPv4 only: an IPv6
-address is rejected at startup, and a name needs an A record.
+Gateway address. Required; while it is empty the proxies stay off. The tunnel
+connects over IPv4 only: an IPv6 address is rejected at startup, and a name
+needs an A record.
 .TP
 .BI "SSH_PORT=" port
 Gateway SSH port. Default
 .BR 22 .
 .TP
 .BI "SSH_USER=" user
-Gateway account. Required.
+Gateway account. Required; while it is empty the proxies stay off.
 .TP
 .BI "PROXY_MODES=" modes
 Comma-separated list of proxies to serve:
@@ -287,16 +302,16 @@ gateway.
 .B 0
 Clean shutdown after SIGTERM or SIGINT.
 .TP
-.B 1
+.B 78
 Fatal startup error:
-.BR SSH_HOST ", " SSH_USER
-empty,
 .B SSH_PORT
 not a port, an unparsable
 .BR PROXY_MODES ", " DIRECT_RULES ", " DIRECT_IP_FAMILY
-or duration value, the data directory not writable, or a listen address
-already in use. Under systemd such an exit is retried according to
-.BR Restart .
+or duration value, the data directory not writable, an unreadable key, or a
+listen address already in use. A restart cannot fix it, so the unit lists the
+status in
+.B RestartPreventExitStatus
+and stays failed.
 .SH EXAMPLES
 Serve the whole LAN instead of loopback only, then restart:
 .PP
@@ -312,9 +327,10 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.com
 curl -x http://127.0.0.1:3128 https://example.com
 .EE
 .PP
-Check whether the tunnel is up:
+Check whether the tunnel is up, and why not:
 .PP
 .EX
+systemctl status ssh-gate
 curl -fsS http://127.0.0.1:9090/readyz
 .EE
 .PP

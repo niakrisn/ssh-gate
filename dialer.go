@@ -38,6 +38,9 @@ type sshDialer struct {
 	rawConn syscall.RawConn
 	cfg     sshDialerCfg
 	done    atomic.Bool
+	// status is the tunnel state for Status(); only the monitor and the
+	// constructor change it, through setStatus.
+	status tunnelStatus
 	// connect establishes one tunnel connection; the monitor calls it
 	// instead of connectSSH directly so tests can observe and control
 	// reconnect rounds. The constructor sets connectSSH; a nil value (test
@@ -69,6 +72,10 @@ type sshDialerCfg struct {
 	// exchange and KEX). x/crypto applies Config.Timeout to the dial only,
 	// so the handshake gets an explicit socket deadline. <= 0 uses 10 s.
 	handshakeTimeout time.Duration
+	// onStatus, when set, gets every tunnel state change (main sets the
+	// systemd status line from it). It is called from the monitor
+	// goroutine, one call at a time.
+	onStatus func(tunnelStatus)
 }
 
 // newSSHDialer builds the dialer and starts the connection lifecycle in the
@@ -89,8 +96,26 @@ func newSSHDialer(cfg sshDialerCfg) (*sshDialer, error) {
 	}
 
 	d := &sshDialer{cfg: cfg, connect: connectSSH}
+	d.setStatus(tunnelStatus{State: stateConnecting})
 	go d.monitor()
 	return d, nil
+}
+
+// setStatus stores the tunnel state and reports it to onStatus.
+func (d *sshDialer) setStatus(st tunnelStatus) {
+	d.mu.Lock()
+	d.status = st
+	d.mu.Unlock()
+	if d.cfg.onStatus != nil {
+		d.cfg.onStatus(st)
+	}
+}
+
+// Status returns the current tunnel state.
+func (d *sshDialer) Status() tunnelStatus {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.status
 }
 
 // readKnownHostFingerprint returns the stored SSH host key fingerprint from
@@ -248,6 +273,11 @@ func reconnectDelay(attempt int) time.Duration {
 
 func (d *sshDialer) monitor() {
 	attempt := 0
+	// The first pass dials immediately (the constructor is lazy, a
+	// startup delay would only slow the healthy path); backoff and jitter
+	// apply from the first retry on. The delay is set right after a failed
+	// connect, so the status line can tell when the next attempt runs.
+	var delay time.Duration
 	connect := d.connect
 	if connect == nil {
 		connect = connectSSH
@@ -276,14 +306,7 @@ func (d *sshDialer) monitor() {
 			d.mu.Lock()
 			d.client = nil
 			d.mu.Unlock()
-		}
-
-		// The first pass dials immediately (the constructor is lazy, a
-		// startup delay would only slow the healthy path); backoff and
-		// jitter apply from the first retry on.
-		var delay time.Duration
-		if attempt > 0 {
-			delay = reconnectDelay(attempt) + time.Duration(rand.Intn(500))*time.Millisecond
+			d.setStatus(tunnelStatus{State: stateReconnecting})
 		}
 
 		log.Warn().Int("attempt", attempt+1).Dur("delay", delay).Msg("SSH not connected, dialing...")
@@ -300,6 +323,8 @@ func (d *sshDialer) monitor() {
 		if err != nil {
 			log.Error().Err(err).Int("attempt", attempt+1).Msg("SSH connect failed")
 			attempt++
+			delay = reconnectDelay(attempt) + time.Duration(rand.Intn(500))*time.Millisecond
+			d.setStatus(tunnelStatus{State: failState(err), Err: err, Attempt: attempt, Retry: delay})
 			continue
 		}
 		if d.done.Load() {
@@ -325,6 +350,8 @@ func (d *sshDialer) monitor() {
 			pinned = fp
 		}
 		attempt = 0
+		delay = 0
+		d.setStatus(tunnelStatus{State: stateConnected})
 		log.Info().Str("host", d.cfg.host).Int("port", d.cfg.port).Str("fingerprint", fp).Msg("SSH connected")
 	}
 }
@@ -412,7 +439,7 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) 
 		if cfg.fingerprint != "" {
 			got := sshFingerprint(key)
 			if got != cfg.fingerprint {
-				return fmt.Errorf("host key mismatch: expected %s, got %s", cfg.fingerprint, got)
+				return &hostKeyMismatchError{want: cfg.fingerprint, got: got}
 			}
 		}
 		return nil
@@ -443,7 +470,7 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) 
 	}
 	rawConn, err := dl.Dial("tcp4", addr)
 	if err != nil {
-		return nil, "", nil, fmt.Errorf("SSH dial to %s: %w", addr, err)
+		return nil, "", nil, &connectError{state: stateUnreachable, err: fmt.Errorf("SSH dial to %s: %w", addr, err)}
 	}
 	// OS-level TCP keepalive detects silent (half-open) dead paths without
 	// relying on SSH cooperation; SSH_KEEPALIVE_PERIOD=0 disables it.
@@ -471,7 +498,7 @@ func connectSSH(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) 
 	sshConn, chans, reqs, err := ssh.NewClientConn(rawConn, addr, sshConfig)
 	if err != nil {
 		rawConn.Close()
-		return nil, "", nil, fmt.Errorf("SSH handshake to %s: %w", addr, err)
+		return nil, "", nil, &connectError{state: handshakeState(err), err: fmt.Errorf("SSH handshake to %s: %w", addr, err)}
 	}
 	if err := rawConn.SetDeadline(time.Time{}); err != nil {
 		rawConn.Close()

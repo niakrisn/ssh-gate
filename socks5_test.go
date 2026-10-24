@@ -7,11 +7,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -253,26 +253,75 @@ func TestSOCKS5RelayOutlivesHandshakeTimeout(t *testing.T) {
 	}
 }
 
-// captureLogs points the service and access loggers at buffers for one test.
-func captureLogs(t *testing.T) (app, access *bytes.Buffer) {
-	t.Helper()
-	app, access = &bytes.Buffer{}, &bytes.Buffer{}
-	prevApp, prevAccess := log.Logger, accessLog
-	log.Logger = zerolog.New(&syncWriter{w: app})
-	accessLog = zerolog.New(&syncWriter{w: access})
-	t.Cleanup(func() { log.Logger, accessLog = prevApp, prevAccess })
-	return app, access
+// testAppLog and testAccessLog are where the service and access loggers
+// write in tests. The loggers are set once, at init: reassigning them in a
+// test races with relay goroutines of earlier tests that still log, so
+// captureLogs only switches the sink.
+var testAppLog, testAccessLog switchWriter
+
+func init() {
+	log.Logger = log.Logger.Output(&testAppLog)
+	accessLog = accessLog.Output(&testAccessLog)
 }
 
-type syncWriter struct {
+// switchWriter writes to w, or to stderr while w is nil.
+type switchWriter struct {
 	mu sync.Mutex
 	w  io.Writer
 }
 
-func (s *syncWriter) Write(p []byte) (int, error) {
+func (s *switchWriter) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.w == nil {
+		return os.Stderr.Write(p)
+	}
 	return s.w.Write(p)
+}
+
+func (s *switchWriter) set(w io.Writer) io.Writer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev := s.w
+	s.w = w
+	return prev
+}
+
+// captureLogs points the service and access loggers at buffers for one test.
+func captureLogs(t *testing.T) (app, access *syncBuffer) {
+	t.Helper()
+	app, access = &syncBuffer{}, &syncBuffer{}
+	prevApp, prevAccess := testAppLog.set(app), testAccessLog.set(access)
+	t.Cleanup(func() {
+		testAppLog.set(prevApp)
+		testAccessLog.set(prevAccess)
+	})
+	return app, access
+}
+
+// syncBuffer is a log sink that is safe to read while server goroutines
+// still write to it (the "connection ended" line lands after the reply).
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) Bytes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return bytes.Clone(s.b.Bytes())
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 // TestSOCKS5ResolveFailureLogged: a name that does not resolve still gets
