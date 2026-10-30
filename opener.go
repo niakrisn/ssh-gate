@@ -14,9 +14,8 @@ import (
 // the route, resolves the destination per the route's policy, and dials.
 // Both the HTTP proxy and the SOCKS5 server open connections through it, so
 // the route/resolve policy exists exactly once: direct destinations resolve
-// through the local resolver (independent of any DoH configuration,
-// including DoH NXDOMAINs), tunnel destinations resolve through the
-// in-tunnel DoH endpoint.
+// through the local resolver (independent of any tunnel resolver, including
+// its NXDOMAINs), tunnel destinations resolve through the tunnel resolvers.
 type Opener struct {
 	rules  *RuleEngine
 	d      dialer
@@ -48,59 +47,70 @@ func (o *Opener) resolveAddr(ctx context.Context, host string, port int) (netip.
 // address in dial order: direct routes keep all family-matching addresses
 // in resolver order; tunnel routes lead with pickTunnelAddr's choice (first
 // IPv4, IPv6 fallback) followed by the rest. Open dials down this list, so
-// one dead address (a stale A record) no longer kills the connect.
+// one dead address (a stale A record) no longer kills the connect. A tunnel
+// route may turn direct here, see below, so callers must use the returned
+// route.
 func (o *Opener) candidates(ctx context.Context, host string, port int) ([]netip.Addr, Route, string, error) {
 	route, reason := o.rules.Decide(ctx, host, port)
 
 	var addrs []netip.Addr
+	var localDirect bool
 	var err error
 	if route == RouteDirect {
 		addrs, err = o.rules.dns.localResolveAll(ctx, host)
 	} else {
-		addrs, err = o.rules.dns.ResolveAll(ctx, host)
+		addrs, localDirect, err = o.rules.dns.resolveTunnel(ctx, host)
 	}
 	if err != nil {
 		return nil, route, reason, err
 	}
 
-	if route == RouteDirect {
-		var out []netip.Addr
+	if route == RouteTunnel {
+		// A public name may resolve to a private or loopback address (DNS
+		// rebinding, nip.io-style names). Through the tunnel the VPS would
+		// dial it in its own network: its localhost, the cloud metadata
+		// service, the provider's internal network. Such addresses never go
+		// to the tunnel.
+		public := addrs[:0:0]
 		for _, a := range addrs {
-			if familyMatches(o.family, a.AsSlice()) {
-				out = append(out, a)
+			if !o.rules.isPrivate(a) {
+				public = append(public, a)
 			}
 		}
-		if len(out) == 0 {
-			return nil, route, reason, fmt.Errorf("resolve %s: no %s addresses", host, o.family)
+		if len(public) > 0 {
+			head, err := pickTunnelAddr(public)
+			if err != nil {
+				return nil, route, reason, err
+			}
+			out := make([]netip.Addr, 0, len(public))
+			out = append(out, head)
+			for _, a := range public {
+				if a != head {
+					out = append(out, a)
+				}
+			}
+			return out, route, reason, nil
 		}
-		return out, route, reason, nil
+
+		// With localOnNXDomain a private answer of the local resolver is an
+		// intranet name, for example behind a VPN that overrides DNS: it
+		// goes direct. Loopback and link-local stay refused, or a page could
+		// point its own name at them by DNS rebinding.
+		reachable := dropHostLocal(addrs)
+		if !localDirect || len(reachable) == 0 {
+			return nil, route, reason, fmt.Errorf("resolve %s: only private addresses (%s), refused through the tunnel; add a direct rule to reach it directly", host, addrs[0])
+		}
+		addrs, route, reason = reachable, RouteDirect, "local-private"
 	}
 
-	// A public name may resolve to a private or loopback address (DNS
-	// rebinding, nip.io-style names). Through the tunnel the VPS would dial
-	// it in its own network: its localhost, the cloud metadata service, the
-	// provider's internal network. Such addresses never go to the tunnel.
-	public := addrs[:0:0]
+	var out []netip.Addr
 	for _, a := range addrs {
-		if !o.rules.isPrivate(a) {
-			public = append(public, a)
-		}
-	}
-	if len(public) == 0 {
-		return nil, route, reason, fmt.Errorf("resolve %s: only private addresses (%s), refused through the tunnel; add a direct rule to reach it directly", host, addrs[0])
-	}
-	addrs = public
-
-	head, err := pickTunnelAddr(addrs)
-	if err != nil {
-		return nil, route, reason, err
-	}
-	out := make([]netip.Addr, 0, len(addrs))
-	out = append(out, head)
-	for _, a := range addrs {
-		if a != head {
+		if familyMatches(o.family, a.AsSlice()) {
 			out = append(out, a)
 		}
+	}
+	if len(out) == 0 {
+		return nil, route, reason, fmt.Errorf("resolve %s: no %s addresses", host, o.family)
 	}
 	return out, route, reason, nil
 }

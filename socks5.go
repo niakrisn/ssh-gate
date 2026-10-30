@@ -103,8 +103,9 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 			}, nil
 		}),
 		// FQDNs are resolved through the shared Opener (route policy: direct
-		// via local DNS, tunnel via DoH; cached, 5 s lookup timeout) instead
-		// of the library default, which is unbounded and uncached.
+		// via local DNS, tunnel via the tunnel resolvers; cached, 5 s lookup
+		// timeout) instead of the library default, which is unbounded and
+		// uncached.
 		socks5.WithResolver(openerResolver{opener: s.opener}),
 		// The library default for ASSOCIATE dials the target with plain
 		// net.Dial (it never consults the dial-with-request or resolver
@@ -346,7 +347,8 @@ type resolveFailure struct {
 // openerResolver adapts the shared Opener's resolution to the go-socks5
 // NameResolver interface. The SOCKS5 handshake must return an IP before the
 // dial callback runs, so it resolves per the same route policy Open applies:
-// direct hosts through the local resolver, tunnel hosts through DoH.
+// direct hosts through the local resolver, tunnel hosts through the tunnel
+// resolvers.
 type openerResolver struct {
 	opener *Opener
 }

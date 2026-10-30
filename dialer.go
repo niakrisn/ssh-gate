@@ -147,7 +147,7 @@ func (d *sshDialer) DialContext(ctx context.Context, network, addr string) (net.
 
 type noTrackKey struct{}
 
-// ctxWithNoTrack marks an internal dial (the DoH transport) that must not
+// ctxWithNoTrack marks an internal dial (a tunnel DNS query) that must not
 // appear in the connection tracker.
 func ctxWithNoTrack(ctx context.Context) context.Context {
 	return context.WithValue(ctx, noTrackKey{}, true)

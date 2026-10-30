@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -272,31 +273,129 @@ func TestLoadConfigListenLists(t *testing.T) {
 	}
 }
 
-// TestLoadConfigDohHostEmptyDisables: DOH_HOST is read strictly — unset
-// falls back to the default endpoint, set-but-empty disables DoH as the
-// documentation promises. The old getEnv path collapsed empty to the
-// default, making the documented "empty disables DoH" unreachable.
-func TestLoadConfigDohHostEmptyDisables(t *testing.T) {
+// TestLoadConfigTunnelDNSDefault: DoH is optional and off by default, unset
+// or empty alike; the tunnel then resolves through the built-in servers.
+func TestLoadConfigTunnelDNSDefault(t *testing.T) {
+	t.Setenv("PROXY_MODES", "socks5")
+	t.Setenv("SSH_HOST", "h")
+	t.Setenv("SSH_USER", "u")
+	t.Setenv("TUNNEL_DNS", "")
+
+	t.Setenv("DOH_HOST", "")
+	check := func(what string) {
+		t.Helper()
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		want := []string{"1.1.1.1:53", "8.8.8.8:53"}
+		if cfg.dohHost != "" || !slices.Equal(cfg.tunnelDNS, want) {
+			t.Fatalf("%s: dohHost = %q, tunnelDNS = %v, want no DoH and %v", what, cfg.dohHost, cfg.tunnelDNS, want)
+		}
+	}
+	check(`DOH_HOST=""`)
+	os.Unsetenv("DOH_HOST")
+	check("unset DOH_HOST")
+
+	t.Setenv("DOH_HOST", "dns.google")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("DOH_HOST=dns.google: %v", err)
+	}
+	if cfg.dohHost != "dns.google" || cfg.tunnelDNS != nil {
+		t.Fatalf("DOH_HOST=dns.google: dohHost = %q, tunnelDNS = %v", cfg.dohHost, cfg.tunnelDNS)
+	}
+}
+
+// TestLoadConfigTunnelDNS covers the TUNNEL_DNS forms.
+func TestLoadConfigTunnelDNS(t *testing.T) {
+	t.Setenv("PROXY_MODES", "socks5")
+	t.Setenv("SSH_HOST", "h")
+	t.Setenv("SSH_USER", "u")
+	t.Setenv("DOH_HOST", "")
+
+	for raw, want := range map[string][]string{
+		"1.1.1.1":                 {"1.1.1.1:53"},
+		"1.1.1.1:5353":            {"1.1.1.1:5353"},
+		"2606:4700::1111":         {"[2606:4700::1111]:53"},
+		"[2606:4700::1111]:5353":  {"[2606:4700::1111]:5353"},
+		"127.0.0.53":              {"127.0.0.53:53"},
+		" 1.1.1.1 , 9.9.9.9:53 ,": {"1.1.1.1:53", "9.9.9.9:53"},
+	} {
+		t.Setenv("TUNNEL_DNS", raw)
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Errorf("TUNNEL_DNS=%q: %v", raw, err)
+			continue
+		}
+		if !slices.Equal(cfg.tunnelDNS, want) {
+			t.Errorf("TUNNEL_DNS=%q = %v, want %v", raw, cfg.tunnelDNS, want)
+		}
+	}
+	for _, raw := range []string{"dns.google", "dns.google:53", "1.1.1.1:0", "1.1.1.1:70000", "1.1.1.1:dns", " , "} {
+		t.Setenv("TUNNEL_DNS", raw)
+		if _, err := loadConfig(); err == nil {
+			t.Errorf("TUNNEL_DNS=%q: expected error, got nil", raw)
+		}
+	}
+
+	t.Setenv("TUNNEL_DNS", "1.1.1.1")
+	t.Setenv("DOH_HOST", "dns.google")
+	if _, err := loadConfig(); err == nil {
+		t.Error("DOH_HOST and TUNNEL_DNS together: expected error, got nil")
+	}
+}
+
+// TestLoadConfigLocalDNSOnNXDomain: the setting is off by default and takes
+// on/off like ACCESS_LOG.
+func TestLoadConfigLocalDNSOnNXDomain(t *testing.T) {
 	t.Setenv("PROXY_MODES", "socks5")
 	t.Setenv("SSH_HOST", "h")
 	t.Setenv("SSH_USER", "u")
 
-	t.Setenv("DOH_HOST", "")
-	cfg, err := loadConfig()
-	if err != nil {
-		t.Fatalf(`DOH_HOST="": %v`, err)
+	t.Setenv("LOCAL_DNS_ON_NXDOMAIN", "")
+	if cfg, err := loadConfig(); err != nil || cfg.localOnNXDomain {
+		t.Fatalf("default: localOnNXDomain = %v, err = %v", cfg.localOnNXDomain, err)
 	}
-	if cfg.dohHost != "" {
-		t.Fatalf(`DOH_HOST="" → dohHost = %q, want "" (empty must disable DoH)`, cfg.dohHost)
+	t.Setenv("LOCAL_DNS_ON_NXDOMAIN", "on")
+	if cfg, err := loadConfig(); err != nil || !cfg.localOnNXDomain {
+		t.Fatalf("on: localOnNXDomain = %v, err = %v", cfg.localOnNXDomain, err)
+	}
+	t.Setenv("LOCAL_DNS_ON_NXDOMAIN", "maybe")
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("LOCAL_DNS_ON_NXDOMAIN=maybe: expected error, got nil")
+	}
+}
+
+// TestConfigureDNS: the config picks one tunnel resolver mode and passes the
+// NXDOMAIN setting on.
+func TestConfigureDNS(t *testing.T) {
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	cfg := config{tunnelDNS: []string{"1.1.1.1:53", "9.9.9.9:5353"}, localOnNXDomain: true}
+	configureDNS(rules, cfg, testDialer{})
+	if mode := rules.DNSStatus().Mode; mode != "servers" {
+		t.Fatalf("mode = %s, want servers", mode)
+	}
+	if !rules.dns.localOnNXDomain {
+		t.Fatal("localOnNXDomain not passed on")
+	}
+	if len(rules.dns.tunnel) != 2 || rules.dns.tunnel[0].name != "1.1.1.1" || rules.dns.tunnel[1].name != "9.9.9.9:5353" {
+		t.Fatalf("tunnel = %+v", rules.dns.tunnel)
 	}
 
-	os.Unsetenv("DOH_HOST")
-	cfg, err = loadConfig()
+	rules, err = NewRuleEngine("")
 	if err != nil {
-		t.Fatalf("unset DOH_HOST: %v", err)
+		t.Fatalf("NewRuleEngine: %v", err)
 	}
-	if cfg.dohHost != "cloudflare-dns.com" {
-		t.Fatalf("unset DOH_HOST → dohHost = %q, want cloudflare-dns.com", cfg.dohHost)
+	configureDNS(rules, config{dohHost: "dns.google"}, testDialer{})
+	if mode := rules.DNSStatus().Mode; mode != "doh" {
+		t.Fatalf("mode = %s, want doh", mode)
+	}
+	if len(rules.dns.tunnel) != 1 || rules.dns.tunnel[0].name != "dns.google" {
+		t.Fatalf("tunnel = %+v", rules.dns.tunnel)
 	}
 }
 

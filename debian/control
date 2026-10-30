@@ -23,4 +23,4 @@ Description: SSH tunnel with SOCKS5 and HTTP proxy
  ssh-gate opens a single SSH connection to a gateway host and exposes local
  SOCKS5 and HTTP proxies over it. Per-destination direct routing rules decide
  which traffic bypasses the tunnel, and hostname resolution for tunnelled
- destinations goes through DNS-over-HTTPS queried over the same connection.
+ destinations goes through DNS servers queried over the same connection.

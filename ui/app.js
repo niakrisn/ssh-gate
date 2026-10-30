@@ -201,12 +201,32 @@ async function refreshStatus() {
   }
 }
 
+// DNS row: per-server answers and failures since the start; degraded means a
+// server is paused or names reached the local resolver in the last minute.
+function renderDNS(dns) {
+  $('dns-row').hidden = !dns;
+  if (!dns) return;
+  $('dns-dot').className = 'dot ' + (dns.degraded ? 'warn' : 'ok');
+  const parts = dns.servers.map((srv) => {
+    if (srv.ok + srv.fail === 0) return srv.name + ' не использовался';
+    let p = srv.name;
+    if (srv.last_ok_at > 0) p += ' · ' + srv.rtt_ms + ' мс';
+    if (srv.fail > 0) p += ' · ошибок ' + srv.fail + ' из ' + (srv.ok + srv.fail);
+    return p;
+  });
+  if (dns.local_fallbacks > 0) parts.push('локальный резерв: ' + dns.local_fallbacks);
+  $('dns-info').textContent = 'DNS: ' + parts.join(' · ');
+  // last error of each server, full text
+  $('dns-info').title = dns.servers.filter((srv) => srv.error).map((srv) => srv.name + ': ' + srv.error).join('\n');
+}
+
 function renderStatus(s) {
   const ssh = s.ssh || {};
   if (ssh.state === 'not_configured') {
     $('ssh-dot').className = 'dot err';
     $('ssh-info').textContent = 'Не настроено: задайте SSH_HOST и SSH_USER и перезапустите сервис · работает ' + fmtUptime(s.uptime_s);
     $('tunnel-info').hidden = true;
+    $('dns-row').hidden = true;
     $('active-summary').textContent = 'Прокси выключены';
     $('active-count').textContent = '';
     return;
@@ -219,6 +239,7 @@ function renderStatus(s) {
   info += ' · работает ' + fmtUptime(s.uptime_s);
   $('ssh-info').textContent = info;
   $('ssh-info').title = ssh.error || ''; // last connect error, full text
+  renderDNS(s.dns);
 
   // Second row: live tcp_info of the tunnel connection (null off-Linux or
   // without a session); retrans and >60 s of silence are early

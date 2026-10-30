@@ -2,14 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"net/netip"
-	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -17,7 +11,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"golang.org/x/sync/singleflight"
 )
 
 type Route int
@@ -41,16 +34,8 @@ type ruleEntry struct {
 	domain   string
 }
 
-const (
-	dnsCacheMaxSize = 1000
-	dnsCacheTTL     = 30 * time.Second
-	// dnsNegativeTTL bounds how long an authoritative NXDOMAIN is cached —
-	// short enough that a freshly registered name recovers quickly.
-	dnsNegativeTTL = 10 * time.Second
-	// dohMaxResponse bounds a single DoH answer body against a misbehaving
-	// endpoint returning an unreasonably large response.
-	dohMaxResponse = 1 << 20
-)
+// hostLocalV4 is the IPv4 "this network" range; 0.0.0.0 dials localhost.
+var hostLocalV4 = netip.MustParsePrefix("0.0.0.0/8")
 
 type RuleEngine struct {
 	rules   []ruleEntry
@@ -73,17 +58,6 @@ func (e *RuleEngine) Stop() {
 	e.dns.stop()
 }
 
-// SetDOH makes cached resolution query the given DNS-over-HTTPS endpoint
-// (https://host/dns-query, RFC 8484) through the SSH dialer, so DNS traffic
-// stays inside the encrypted tunnel and cannot be poisoned on the client
-// side. A definitive DoH answer (including NXDOMAIN) is authoritative; the
-// local resolver is used only when the DoH endpoint is unreachable.
-// Direct destinations keep using local DNS.
-func (e *RuleEngine) SetDOH(host string, d dialer) {
-	e.dns.dohHost = host
-	e.dns.dohClient = tunnelHTTPClient(d, 0, nil)
-}
-
 func NewRuleEngine(direct string) (*RuleEngine, error) {
 	e := &RuleEngine{
 		dns: &dnsCache{
@@ -92,6 +66,7 @@ func NewRuleEngine(direct string) (*RuleEngine, error) {
 			ttl:         dnsCacheTTL,
 			negativeTTL: dnsNegativeTTL,
 			done:        make(chan struct{}),
+			now:         time.Now,
 		},
 		private: []netip.Prefix{
 			mustPrefix("0.0.0.0/8"), // "this network"; 0.0.0.0 dials localhost
@@ -108,6 +83,10 @@ func NewRuleEngine(direct string) (*RuleEngine, error) {
 		},
 	}
 
+	// ip: rules go last: the others need no lookup, so a name listed in
+	// DIRECT_RULES never reaches the tunnel resolver, whatever the order of
+	// the rules. Every rule leads to direct, so this changes only the reason.
+	var ipRules []ruleEntry
 	if direct != "" {
 		for _, entry := range strings.Split(direct, ",") {
 			entry = strings.TrimSpace(entry)
@@ -118,9 +97,14 @@ func NewRuleEngine(direct string) (*RuleEngine, error) {
 			if err != nil {
 				return nil, err
 			}
-			e.rules = append(e.rules, r)
+			if r.ipPrefix != nil {
+				ipRules = append(ipRules, r)
+			} else {
+				e.rules = append(e.rules, r)
+			}
 		}
 	}
+	e.rules = append(e.rules, ipRules...)
 
 	return e, nil
 }
@@ -129,7 +113,7 @@ func NewRuleEngine(direct string) (*RuleEngine, error) {
 // keys: DNS names are case-insensitive and a trailing dot (root label) is
 // cosmetic, yet clients and middles legitimately send both spellings.
 // Without it a direct rule silently misses for EXAMPLE.COM or example.com.
-// and one host keeps two cache entries and two DoH cycles. User-facing
+// and one host keeps two cache entries and two lookups. User-facing
 // display (access log, tracker, ConnMeta.Host) keeps the raw spelling.
 func normalizeHost(host string) string {
 	return strings.TrimSuffix(strings.ToLower(host), ".")
@@ -178,6 +162,20 @@ func pickTunnelAddr(addrs []netip.Addr) (netip.Addr, error) {
 	return addrs[0], nil
 }
 
+// dropHostLocal removes loopback, unspecified and link-local addresses: a DNS
+// answer must never send a connection there by itself. Reaching such an
+// address is the job of an IP literal or a direct rule.
+func dropHostLocal(addrs []netip.Addr) []netip.Addr {
+	out := addrs[:0:0]
+	for _, a := range addrs {
+		a = a.Unmap().WithZone("")
+		if !a.IsLoopback() && !a.IsLinkLocalUnicast() && !hostLocalV4.Contains(a) && a != netip.IPv6Unspecified() {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 // isPrivate reports whether ip is in a private, loopback, link-local or
 // otherwise local range. The address is unmapped and its zone dropped
 // first: netip.Prefix.Contains never matches an IPv4-mapped address against
@@ -195,15 +193,15 @@ func (e *RuleEngine) isPrivate(ip netip.Addr) bool {
 
 func (r ruleEntry) matches(ctx context.Context, host string, dns *dnsCache) bool {
 	if r.ipPrefix != nil {
-		// Resolve per the tunnel policy (DoH when configured), not
-		// locally: the name is not yet known to be direct, and asking the
-		// local resolver here would show every destination name - the
-		// tunneled ones too - to the local network, and let a forged local
-		// answer inside the CIDR send traffic direct. The answer shares
+		// Resolve per the tunnel policy, not locally: the name is not yet
+		// known to be direct, and asking the local resolver here would show
+		// every destination name - the tunneled ones too - to the local
+		// network, and let a forged local answer inside the CIDR send
+		// traffic direct. The answer shares
 		// the cache entry the tunnel dial uses, so a tunneled name costs
 		// no extra lookup. Only a name that ends up direct is resolved
 		// locally again, by the direct dial. Split-horizon intranet names
-		// unknown to public DNS need a domain rule instead.
+		// unknown to public DNS need a domain rule or localOnNXDomain.
 		addrs, err := dns.ResolveAll(ctx, host)
 		if err != nil {
 			return false
@@ -253,300 +251,6 @@ func parseRuleEntry(raw string) (ruleEntry, error) {
 		return ruleEntry{}, fmt.Errorf("rule %q contains no domain", raw)
 	}
 	return ruleEntry{raw: raw, domain: domain}, nil
-}
-
-// dnsCache caches DNS resolution with TTL.
-type dnsCache struct {
-	mu          sync.Mutex
-	cache       map[string]cacheEntry
-	ttl         time.Duration
-	negativeTTL time.Duration
-	done        chan struct{}
-	closeOnce   sync.Once
-	// lookups counts real resolver queries (cache hits and IP literals
-	// excluded); tests use it to assert caching without timing tricks.
-	lookups   atomic.Int64
-	dohHost   string
-	dohClient *http.Client
-	// localLookup replaces net.DefaultResolver in tests; nil means the
-	// system resolver.
-	localLookup func(ctx context.Context, host string) ([]net.IPAddr, error)
-	// sf coalesces concurrent cache misses for one key into a single
-	// resolver round-trip (see cachedLookup).
-	sf singleflight.Group
-}
-
-// startPurge launches a background goroutine that purges expired entries every TTL.
-func (c *dnsCache) startPurge(ctx context.Context) {
-	go func() {
-		ticker := time.NewTicker(c.ttl)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				c.closeOnce.Do(func() { close(c.done) })
-				return
-			case <-c.done:
-				return
-			case <-ticker.C:
-				c.purge()
-			}
-		}
-	}()
-}
-
-func (c *dnsCache) stop() {
-	c.closeOnce.Do(func() { close(c.done) })
-}
-
-func (c *dnsCache) purge() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now()
-	for k, v := range c.cache {
-		if now.After(v.expires) {
-			delete(c.cache, k)
-		}
-	}
-}
-
-type cacheEntry struct {
-	addrs   []netip.Addr
-	expires time.Time
-	// neg marks a cached authoritative NXDOMAIN: repeats within the
-	// negative TTL fail fast without touching the network.
-	neg bool
-}
-
-// ResolveAll resolves host to all of its IPv4 and IPv6 addresses. IP
-// literals are returned as-is without touching the resolver or the cache.
-// The host is normalized (see normalizeHost) so every spelling of one name
-// shares one cache entry.
-func (c *dnsCache) ResolveAll(ctx context.Context, host string) ([]netip.Addr, error) {
-	host = normalizeHost(host)
-	return c.cachedLookup(ctx, host, host, c.lookup)
-}
-
-// localResolveAll resolves host through the local resolver only — no DoH,
-// even when a DoH endpoint is configured: direct-routed destinations keep
-// their resolution local. Results are cached under a separate key space so
-// the two policies cannot shadow each other.
-func (c *dnsCache) localResolveAll(ctx context.Context, host string) ([]netip.Addr, error) {
-	host = normalizeHost(host)
-	return c.cachedLookup(ctx, "local:"+host, host, func(ctx context.Context, h string) ([]netip.Addr, bool, error) {
-		addrs, err := c.lookupLocal(ctx, h)
-		return addrs, true, err // local DNS IS the policy for this key space
-	})
-}
-
-// cachedLookup serves key from the cache or runs lookup and stores the
-// result. lookup must return unmapped addresses; its second result reports
-// whether the answer is authoritative for the key's policy (see lookup) —
-// only authoritative answers are cached, so a degraded answer degrades one
-// connection instead of poisoning the whole TTL. An authoritative NXDOMAIN
-// is cached as a negative entry for negativeTTL: a dead name on a hot path
-// must not pay a full DoH round-trip per connection. Concurrent misses of
-// the same key share one lookup through singleflight: they get one result
-// (or one error) and the resolver sees a single round-trip, not a
-// thundering herd per arriving connection burst.
-func (c *dnsCache) cachedLookup(ctx context.Context, key, host string, lookup func(context.Context, string) ([]netip.Addr, bool, error)) ([]netip.Addr, error) {
-	if ip, err := netip.ParseAddr(host); err == nil {
-		return []netip.Addr{ip.Unmap()}, nil
-	}
-
-	c.mu.Lock()
-	if entry, ok := c.cache[key]; ok && time.Now().Before(entry.expires) {
-		neg := entry.neg
-		c.mu.Unlock()
-		if neg {
-			return nil, NewDNSError(host, errDohNotFound)
-		}
-		return entry.addrs, nil
-	}
-	c.mu.Unlock()
-
-	v, err, _ := c.sf.Do(key, func() (any, error) {
-		// The shared lookup runs on a context detached from the caller
-		// that happened to win the race — one caller hanging up must not
-		// kill the lookup the others are waiting on. It keeps the same
-		// 5 s bound.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		c.lookups.Add(1)
-
-		addrs, authoritative, err := lookup(ctx, host)
-		if err != nil {
-			// Only the tunnel policy treats NXDOMAIN as authoritative;
-			// local resolver errors are transient and never cached
-			// (authoritative marks exactly the answers worth caching).
-			if authoritative && errors.Is(err, errDohNotFound) {
-				c.store(key, cacheEntry{expires: time.Now().Add(c.negativeTTL), neg: true})
-			}
-			return nil, NewDNSError(host, err)
-		}
-		if len(addrs) == 0 {
-			return nil, fmt.Errorf("no address for %s", host)
-		}
-		if authoritative {
-			c.store(key, cacheEntry{addrs: addrs, expires: time.Now().Add(c.ttl)})
-		}
-		return addrs, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return v.([]netip.Addr), nil
-}
-
-// store writes entry under key, evicting the oldest entry when full.
-func (c *dnsCache) store(key string, entry cacheEntry) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.cache) >= dnsCacheMaxSize {
-		var oldestKey string
-		var oldestTime time.Time
-		for k, v := range c.cache {
-			if oldestKey == "" || v.expires.Before(oldestTime) {
-				oldestKey = k
-				oldestTime = v.expires
-			}
-		}
-		if oldestKey != "" {
-			delete(c.cache, oldestKey)
-		}
-	}
-	c.cache[key] = entry
-}
-
-// errDohNotFound marks a definitive not-found from the DoH endpoint
-// (NXDOMAIN or an empty answer); it must not fall back to the local
-// resolver.
-var errDohNotFound = errors.New("no answer")
-
-// lookup resolves host through the configured DoH endpoint when set and
-// falls back to the local resolver only on DoH transport failure. The bool
-// result marks the answer authoritative for the tunnel key space: DoH
-// answers (and local DNS when no endpoint is configured, i.e. by policy)
-// are; the unreachable-DoH fallback is not — it must not be cached under
-// the tunnel key or it would route tunnel destinations by home DNS for the
-// whole TTL.
-func (c *dnsCache) lookup(ctx context.Context, host string) ([]netip.Addr, bool, error) {
-	if c.dohClient != nil {
-		addrs, err := c.dohLookup(ctx, host)
-		if err == nil || errors.Is(err, errDohNotFound) {
-			return addrs, true, err
-		}
-		// DoH endpoint unreachable: fall back to the local resolver. The
-		// warning is the only signal that resolution degraded to local DNS.
-		log.Warn().Str("host", host).Err(err).Msg("DoH lookup failed, falling back to the local resolver")
-		addrs, err = c.lookupLocal(ctx, host)
-		return addrs, false, err
-	}
-	addrs, err := c.lookupLocal(ctx, host)
-	return addrs, true, err
-}
-
-// lookupLocal resolves host through the local resolver. Unlike lookup it
-// never touches DoH: a DoH NXDOMAIN is authoritative for tunnel destinations
-// but must not affect direct ones, whose names are often unknown to public
-// DNS.
-func (c *dnsCache) lookupLocal(ctx context.Context, host string) ([]netip.Addr, error) {
-	lookup := net.DefaultResolver.LookupIPAddr
-	if c.localLookup != nil {
-		lookup = c.localLookup
-	}
-	addrs, err := lookup(ctx, host)
-	if err != nil {
-		return nil, err
-	}
-	return toNetip(addrs), nil
-}
-
-// toNetip converts resolver results to unmapped netip addresses.
-func toNetip(addrs []net.IPAddr) []netip.Addr {
-	out := make([]netip.Addr, 0, len(addrs))
-	for _, a := range addrs {
-		if ip, ok := netip.AddrFromSlice(a.IP); ok {
-			out = append(out, ip.Unmap())
-		}
-	}
-	return out
-}
-
-// dohResponse is an RFC 8484 dns-json answer subset.
-type dohResponse struct {
-	Status int `json:"Status"`
-	Answer []struct {
-		Type int    `json:"Type"`
-		Data string `json:"Data"`
-	} `json:"Answer"`
-}
-
-// dohQuery pairs a DNS record type with how it is addressed in a dns-json
-// query (the "type" URL parameter) and how it is matched in answers.
-type dohQuery struct {
-	name string
-	want int
-}
-
-var (
-	dohQueryA    = dohQuery{name: "A", want: 1}
-	dohQueryAAAA = dohQuery{name: "AAAA", want: 28}
-)
-
-// dohJSONQuery performs one dns-json DoH query (RFC 8484 GET) on the
-// endpoint and returns the addresses of the wanted record type, unmapped.
-// errDohNotFound marks a definitive NXDOMAIN; any other error is a
-// transport or protocol failure.
-func dohJSONQuery(ctx context.Context, client *http.Client, endpoint, host string, q dohQuery) ([]netip.Addr, error) {
-	u := "https://" + endpoint + "/dns-query?" + url.Values{"name": {host}, "type": {q.name}}.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/dns-json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	var d dohResponse
-	err = json.NewDecoder(io.LimitReader(resp.Body, dohMaxResponse)).Decode(&d)
-	resp.Body.Close()
-	if err != nil {
-		return nil, err
-	}
-	if d.Status == 3 { // NXDOMAIN
-		return nil, errDohNotFound
-	}
-	if resp.StatusCode != http.StatusOK || d.Status != 0 {
-		return nil, fmt.Errorf("doh: status %d/%d", resp.StatusCode, d.Status)
-	}
-	var out []netip.Addr
-	for _, a := range d.Answer {
-		if a.Type != q.want {
-			continue
-		}
-		if ip, perr := netip.ParseAddr(a.Data); perr == nil {
-			out = append(out, ip.Unmap())
-		}
-	}
-	return out, nil
-}
-
-// dohLookup queries the DoH endpoint for A and AAAA records.
-func (c *dnsCache) dohLookup(ctx context.Context, host string) ([]netip.Addr, error) {
-	var out []netip.Addr
-	for _, q := range [2]dohQuery{dohQueryA, dohQueryAAAA} {
-		addrs, err := dohJSONQuery(ctx, c.dohClient, c.dohHost, host, q)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, addrs...)
-	}
-	if len(out) == 0 {
-		return nil, errDohNotFound
-	}
-	return out, nil
 }
 
 func mustPrefix(s string) netip.Prefix {

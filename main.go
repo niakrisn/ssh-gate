@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,6 +29,8 @@ type config struct {
 	directRules          string
 	directIPFamily       IPFamily
 	dohHost              string
+	tunnelDNS            []string
+	localOnNXDomain      bool
 	healthAddr           string
 	sshKeepalivePeriod   time.Duration
 	sshKeepaliveInterval int
@@ -124,6 +127,9 @@ func main() {
 		log.Fatal().Err(err).Msg("health server")
 	}
 	hs.AllowHosts(cfg.uiAllowedHosts)
+	if rules != nil {
+		hs.SetDNSStatus(rules.DNSStatus)
+	}
 	hs.Start()
 	servers = append(servers, server{Name: "health", Shutdown: hs.Shutdown})
 
@@ -157,6 +163,17 @@ func main() {
 	d.stop()
 }
 
+// configureDNS routes tunnel-destination resolution through the configured
+// resolvers, inside the SSH tunnel. Direct destinations keep local DNS.
+func configureDNS(rules *RuleEngine, cfg config, d dialer) {
+	rules.dns.localOnNXDomain = cfg.localOnNXDomain
+	if cfg.dohHost != "" {
+		rules.SetDOH(cfg.dohHost, d)
+		return
+	}
+	rules.SetTunnelDNS(cfg.tunnelDNS, d)
+}
+
 // startProxies starts the SSH dialer and the proxy listeners. The dialer
 // reports every tunnel state change to the systemd status line.
 func startProxies(cfg config, tracker *ConnTracker, status *sdStatus) (*sshDialer, *RuleEngine, []server) {
@@ -182,14 +199,12 @@ func startProxies(cfg config, tracker *ConnTracker, status *sdStatus) (*sshDiale
 		log.Fatal().Err(err).Msg("rule engine")
 	}
 
-	// Route tunnel-destination resolution through the configured DoH
-	// endpoint, inside the SSH tunnel. Direct destinations keep local DNS.
-	if cfg.dohHost != "" {
-		rules.SetDOH(cfg.dohHost, dialer)
-	}
+	configureDNS(rules, cfg, dialer)
+	log.Info().Str("mode", rules.DNSStatus().Mode).Strs("tunnel_dns", cfg.tunnelDNS).Bool("local_on_nxdomain", cfg.localOnNXDomain).Msg("DNS resolvers configured")
 
 	// One Opener per process: both proxy protocols share the route/resolve
-	// policy (direct via local DNS, tunnel via DoH) and the SSH dialer.
+	// policy (direct via local DNS, tunnel via the tunnel resolvers) and the
+	// SSH dialer.
 	opener := &Opener{rules: rules, d: dialer, family: cfg.directIPFamily}
 
 	var servers []server
@@ -335,18 +350,9 @@ func loadConfig() (config, error) {
 	}
 
 	// Validate DOH_HOST: a hostname (optionally with port 443) for the
-	// DNS-over-HTTPS endpoint that tunnel destinations resolve through.
-	// Read strictly: unset falls back to the default endpoint, set-but-empty
-	// disables DoH (main wires SetDOH only for a non-empty host), as
-	// .env.example documents. getEnv would collapse empty to the default and
-	// make that promise unreachable. Note compose interpolates
-	// ${DOH_HOST:-cloudflare-dns.com}, so an empty value there still becomes
-	// the default — under compose disable DoH by not setting the variable
-	// (deb/systemd: just omit it).
-	dohHost, ok := os.LookupEnv("DOH_HOST")
-	if !ok {
-		dohHost = "cloudflare-dns.com"
-	}
+	// optional DNS-over-HTTPS endpoint that tunnel destinations resolve
+	// through. Empty means the DNS servers of TUNNEL_DNS.
+	dohHost := os.Getenv("DOH_HOST")
 	if dohHost != "" {
 		if strings.Contains(dohHost, "/") {
 			return config{}, fmt.Errorf("invalid DOH_HOST %q: use a hostname, e.g. cloudflare-dns.com", dohHost)
@@ -365,6 +371,24 @@ func loadConfig() (config, error) {
 		}
 	}
 
+	// Validate TUNNEL_DNS: one tunnel resolver mode only, so the running
+	// config never depends on which of the two wins.
+	if dohHost != "" && os.Getenv("TUNNEL_DNS") != "" {
+		return config{}, fmt.Errorf("DOH_HOST and TUNNEL_DNS are both set: use one of them")
+	}
+	var tunnelDNS []string
+	if dohHost == "" {
+		if tunnelDNS, err = parseTunnelDNS(getEnv("TUNNEL_DNS", defaultTunnelDNS)); err != nil {
+			return config{}, err
+		}
+	}
+
+	// Validate LOCAL_DNS_ON_NXDOMAIN
+	localOnNXDomain, err := parseOnOff(getEnv("LOCAL_DNS_ON_NXDOMAIN", "off"))
+	if err != nil {
+		return config{}, fmt.Errorf("invalid LOCAL_DNS_ON_NXDOMAIN: %w", err)
+	}
+
 	return config{
 		sshHost:              sshHost,
 		sshPort:              port,
@@ -376,6 +400,8 @@ func loadConfig() (config, error) {
 		directRules:          getEnv("DIRECT_RULES", ""),
 		directIPFamily:       directIPFamily,
 		dohHost:              dohHost,
+		tunnelDNS:            tunnelDNS,
+		localOnNXDomain:      localOnNXDomain,
 		healthAddr:           healthAddr,
 		sshKeepalivePeriod:   sshKeepalivePeriod,
 		sshKeepaliveInterval: sshKeepaliveInterval,
@@ -384,6 +410,39 @@ func loadConfig() (config, error) {
 		maxConnections:       maxConnections,
 		uiAllowedHosts:       uiAllowedHosts,
 	}, nil
+}
+
+// defaultTunnelDNS is used when neither TUNNEL_DNS nor DOH_HOST is set.
+const defaultTunnelDNS = "1.1.1.1,8.8.8.8"
+
+// parseTunnelDNS parses a comma-separated list of DNS server IPs with an
+// optional port into host:port addresses. Names are refused: resolving the
+// resolver would need a resolver.
+func parseTunnelDNS(raw string) ([]string, error) {
+	var servers []string
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		host, port := entry, "53"
+		if _, err := netip.ParseAddr(entry); err != nil {
+			if host, port, err = net.SplitHostPort(entry); err != nil {
+				return nil, fmt.Errorf("invalid TUNNEL_DNS entry %q: use an IP address with an optional port", entry)
+			}
+		}
+		if _, err := netip.ParseAddr(host); err != nil {
+			return nil, fmt.Errorf("invalid TUNNEL_DNS entry %q: use an IP address, not a name", entry)
+		}
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("invalid TUNNEL_DNS entry %q: bad port", entry)
+		}
+		servers = append(servers, net.JoinHostPort(host, port))
+	}
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("TUNNEL_DNS has no servers")
+	}
+	return servers, nil
 }
 
 func parseModes(raw string) ([]string, error) {

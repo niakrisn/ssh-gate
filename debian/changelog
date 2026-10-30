@@ -1,3 +1,30 @@
+ssh-gate (0.5.0-1) unstable; urgency=medium
+
+  * Tunnel names now always resolve inside the tunnel. TUNNEL_DNS lists DNS
+    servers queried over TCP through the tunnel, default 1.1.1.1,8.8.8.8;
+    127.0.0.53 is the resolver of the VPS itself.
+  * DOH_HOST is optional and off by default. Setting it and TUNNEL_DNS
+    together is a startup error. Upgrade note: an unset DOH_HOST no longer
+    means cloudflare-dns.com, and an empty one no longer sends tunnel names
+    to the local resolver; both now use the TUNNEL_DNS servers. A value kept
+    in /etc/default/ssh-gate stays in effect.
+  * Names matching a domain or re: rule use only the local resolver: these
+    rules are now checked before ip: rules, whatever their order.
+  * LOCAL_DNS_ON_NXDOMAIN=on|off (default off) asks the local resolver after
+    a tunnel not-found, for names only the local network knows. A local
+    answer of only private addresses then goes direct, except loopback and
+    link-local, and is refused while the tunnel is up but no tunnel resolver
+    answers.
+  * The tunnel step of a lookup has its own 3 s bound, so a silent server
+    leaves the local resolver time to answer; before, that lookup failed.
+  * A tunnel resolver no channel opens to is paused for 10 s, then one lookup
+    probes it. A failure on an open channel is about the name and pauses
+    nothing, so a web page cannot switch the resolvers off.
+  * /api/status has a dns field and the Web UI a DNS row: latency, failed
+    lookups, fallbacks to the local resolver.
+
+ -- Nikita Kozlov <niakrisn@gmail.com>  Fri, 30 Oct 2026 10:02:24 +0000
+
 ssh-gate (0.4.0-1) unstable; urgency=medium
 
   * systemd: Type=notify. READY=1 once the listeners are open (not waiting

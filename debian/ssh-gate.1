@@ -10,9 +10,9 @@ it: SOCKS5 by default, an HTTP CONNECT proxy when asked for. Every destination
 is dialed either through the tunnel or directly from the local network,
 depending on the rules in
 .BR DIRECT_RULES .
-Hostnames routed through the tunnel are resolved with DNS-over-HTTPS queried
-over the tunnel itself, so a local resolver never sees them; direct
-destinations are resolved locally.
+Hostnames routed through the tunnel are resolved by DNS servers queried over
+the tunnel itself, so a local resolver sees them only while no such server
+answers; direct destinations are resolved locally.
 .PP
 Authentication uses an Ed25519 key pair generated on first start. The public
 half has to be present in the gateway's
@@ -136,11 +136,27 @@ Address family used when dialing direct destinations:
 Default
 .BR ipv4 .
 .TP
+.BI "TUNNEL_DNS=" servers
+Comma-separated DNS servers for tunnel destinations: IP addresses with an
+optional port, queried over TCP through the tunnel. A server that cannot be
+reached is skipped for 10 seconds; a failure for one name is not held against
+the server. If no server answers, the name goes to the local resolver. Default
+.BR 1.1.1.1,8.8.8.8 .
+.TP
 .BI "DOH_HOST=" host
-DNS-over-HTTPS server for tunnel destinations, reached over HTTPS on port 443
-through the tunnel. Default
-.BR cloudflare-dns.com .
-Empty disables DNS-over-HTTPS and leaves resolution to the local resolver.
+DNS-over-HTTPS server to use instead of
+.BR TUNNEL_DNS ,
+reached over HTTPS on port 443 through the tunnel. Empty by default. Setting
+both variables is a startup error.
+.TP
+.BI "LOCAL_DNS_ON_NXDOMAIN=" on|off
+Ask the local resolver when a tunnel resolver says a name does not exist, for
+names only the local network knows. A local answer with only private
+addresses then goes direct, except loopback and link-local, and is refused
+while the tunnel is up but no tunnel resolver answers. Every unknown name
+reaches the local resolver, and a web page can use DNS rebinding to reach the
+local network. Default
+.BR off .
 .TP
 .BI "SSH_DIAL_TIMEOUT=" dur
 Deadline for dialing one destination through the tunnel. Must be positive
@@ -210,13 +226,14 @@ the tunnel. Three forms are accepted:
 .BI ip: cidr
 Matches a destination whose resolved address falls in
 .IR cidr .
-The address comes from the same lookup as a tunnel destination
-(DNS-over-HTTPS when
-.B DOH_HOST
-is set), so choosing a route never shows a name to the local resolver. An
-intranet name that public DNS does not know needs a
+The address comes from the same lookup as a tunnel destination, so choosing a
+route never shows a name to the local resolver. An intranet name that public
+DNS does not know needs a
 .I domain
-rule instead.
+rule or
+.BR LOCAL_DNS_ON_NXDOMAIN=on .
+These rules are checked after the other forms, so a name that matches one of
+those never reaches a tunnel resolver.
 .TP
 .BI re: regex
 Matches the destination host name against a Go regular expression. An empty

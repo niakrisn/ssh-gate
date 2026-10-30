@@ -48,6 +48,8 @@ type HealthServer struct {
 	tracker *ConnTracker
 	sshHost string
 	sshPort int
+	// dnsStatus reports the tunnel resolvers; nil while the proxies are off.
+	dnsStatus func() dnsStatus
 
 	probeMu   sync.Mutex
 	probe     sshProbe
@@ -250,10 +252,17 @@ func (h *HealthServer) tunnelStatus() tunnelStatus {
 	return tunnelStatus{State: stateConnecting}
 }
 
+// SetDNSStatus sets the source of the dns field of /api/status. Call it
+// before Start.
+func (h *HealthServer) SetDNSStatus(f func() dnsStatus) {
+	h.dnsStatus = f
+}
+
 // statusHandler serves GET /api/status: the SSH tunnel endpoint, the current
 // session state (state, plus the last connect error in a failure state),
 // the latest port probe, the live tcp_info tunnel counters
-// (null when unavailable) and active connection counts per protocol.
+// (null when unavailable), the tunnel resolvers (null when the proxies are
+// off) and active connection counts per protocol.
 func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -294,6 +303,12 @@ func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 		errText = st.Err.Error()
 	}
 
+	var dns *dnsStatus
+	if h.dnsStatus != nil {
+		s := h.dnsStatus()
+		dns = &s
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(map[string]any{
 		"ssh": map[string]any{
@@ -307,6 +322,7 @@ func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 			"checked_at": checkedAt,
 			"tcp":        tcp,
 		},
+		"dns":          dns,
 		"active":       active,
 		"active_total": total,
 		"uptime_s":     int64(time.Since(processStartedAt).Seconds()),

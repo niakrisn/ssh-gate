@@ -222,6 +222,68 @@ func TestWebUIStatusAPI(t *testing.T) {
 	}
 }
 
+// TestWebUIStatusDNS: /api/status carries the resolver status when a source is
+// set and null otherwise, and a degraded resolver does not touch readyz.
+func TestWebUIStatusDNS(t *testing.T) {
+	sshHost, sshPort := liveLocalPort(t)
+	status := func(h *HealthServer) map[string]json.RawMessage {
+		t.Helper()
+		resp, err := http.Get("http://" + h.ln.Addr().String() + "/api/status")
+		if err != nil {
+			t.Fatalf("GET /api/status: %v", err)
+		}
+		defer resp.Body.Close()
+		var out map[string]json.RawMessage
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return out
+	}
+	start := func(set bool) *HealthServer {
+		h, err := NewHealthServer("127.0.0.1:0", sshHost, sshPort, testDialer{}, nil)
+		if err != nil {
+			t.Fatalf("NewHealthServer: %v", err)
+		}
+		if set {
+			h.SetDNSStatus(func() dnsStatus {
+				return dnsStatus{Mode: "servers", Degraded: true, LocalFallbacks: 3, Servers: []dnsServerStatus{{Name: "1.1.1.1", OK: 1197, Fail: 3}}}
+			})
+		}
+		h.Start()
+		t.Cleanup(func() { h.Shutdown(context.Background()) })
+		return h
+	}
+
+	off := status(start(false))
+	if got := string(off["dns"]); got != "null" {
+		t.Fatalf("dns without a source = %s, want null", got)
+	}
+
+	h := start(true)
+	out := status(h)
+	var dns dnsStatus
+	if err := json.Unmarshal(out["dns"], &dns); err != nil {
+		t.Fatalf("decode dns: %v", err)
+	}
+	if !dns.Degraded || dns.LocalFallbacks != 3 || len(dns.Servers) != 1 || dns.Servers[0].Fail != 3 {
+		t.Fatalf("dns = %+v", dns)
+	}
+	for _, key := range []string{"ssh", "active", "active_total", "uptime_s"} {
+		if _, ok := out[key]; !ok {
+			t.Fatalf("field %s lost", key)
+		}
+	}
+
+	resp, err := http.Get("http://" + h.ln.Addr().String() + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("readyz with degraded DNS = %d, want 200", resp.StatusCode)
+	}
+}
+
 // TestWebUIStatusAPIWithoutProvider: a dialer without TunnelTCPStats must
 // yield "tcp": null in /api/status, not fail the request.
 func TestWebUIStatusAPIWithoutProvider(t *testing.T) {
