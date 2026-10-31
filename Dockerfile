@@ -12,7 +12,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o ssh-gate .
 
 # Runtime stage
-FROM alpine:3.22.7
+FROM alpine:3.24.3
 WORKDIR /app
 COPY --from=builder /app/ssh-gate .
 # Fixed uid/gid: bind-mounted ./data keeps host ownership, so the README
