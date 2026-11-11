@@ -1,3 +1,15 @@
+ssh-gate (0.6.0-1) unstable; urgency=medium
+
+  * Resolve A and AAAA over SSH using RFC 8484 when DOH_HOST is set.
+    Google Public DNS and Cloudflare work with the existing hostname setting.
+  * Retry the first A query in JSON after HTTP 400, 406, or 415. All DoH
+    requests for one lookup share the same 3-second timeout.
+  * Limit cached binary DNS answers by DNS TTL and HTTP Age. Follow redirects
+    only over HTTPS on the original host and port.
+  * Build with Go 1.26.11 to fix GO-2026-6859 in net/http.
+
+ -- Nikita Kozlov <niakrisn@gmail.com>  Wed, 11 Nov 2026 23:09:55 +0300
+
 ssh-gate (0.5.0-1) unstable; urgency=medium
 
   * Tunnel names now always resolve inside the tunnel. TUNNEL_DNS lists DNS
