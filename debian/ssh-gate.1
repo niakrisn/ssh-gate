@@ -146,8 +146,20 @@ the server. If no server answers, the name goes to the local resolver. Default
 .BI "DOH_HOST=" host
 DNS-over-HTTPS server to use instead of
 .BR TUNNEL_DNS ,
-reached over HTTPS on port 443 through the tunnel. Empty by default. Setting
-both variables is a startup error.
+reached through the tunnel. Use a hostname with optional
+.BR :443 ,
+for example
+.B dns.google
+or
+.BR cloudflare-dns.com .
+An empty value uses
+.BR TUNNEL_DNS .
+Setting both variables is a startup error.
+Requests start at
+.B /dns-query
+with an RFC 8484 GET. HTTP 400, 406, or 415 on the first A request triggers
+one JSON retry. All DoH requests for the lookup share a 3-second budget.
+Redirects must use HTTPS on the original host and port.
 .TP
 .BI "LOCAL_DNS_ON_NXDOMAIN=" on|off
 Ask the local resolver when a tunnel resolver says a name does not exist, for

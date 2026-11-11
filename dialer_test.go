@@ -30,6 +30,20 @@ import (
 // of a transport with a live TCP but a stuck request layer.
 func startTestSSHServer(t *testing.T, listenAddr string, acceptChannels, drainRequests bool) (addr string, clientSigner ssh.Signer) {
 	t.Helper()
+	return startTestSSHServerWithChannelHandler(t, listenAddr, drainRequests, func(newCh ssh.NewChannel) error {
+		if !acceptChannels {
+			return nil // Leave the open request pending.
+		}
+		_, requests, err := newCh.Accept()
+		if err == nil {
+			go ssh.DiscardRequests(requests)
+		}
+		return err
+	})
+}
+
+func startTestSSHServerWithChannelHandler(t *testing.T, listenAddr string, drainRequests bool, handleChannel func(ssh.NewChannel) error) (addr string, clientSigner ssh.Signer) {
+	t.Helper()
 
 	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -80,15 +94,9 @@ func startTestSSHServer(t *testing.T, listenAddr string, acceptChannels, drainRe
 					go ssh.DiscardRequests(reqs)
 				}
 				for newCh := range chans {
-					if !acceptChannels {
-						continue // leave the open request pending
-					}
-					ch, requests, err := newCh.Accept()
-					if err != nil {
+					if err := handleChannel(newCh); err != nil {
 						return
 					}
-					go ssh.DiscardRequests(requests)
-					_ = ch
 				}
 			}()
 		}

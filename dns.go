@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -48,6 +49,7 @@ const (
 func (e *RuleEngine) SetDOH(host string, d dialer) {
 	e.dns.dohHost = host
 	e.dns.dohClient = tunnelHTTPClient(d, 0, nil)
+	e.dns.dohClient.CheckRedirect = checkDoHRedirect
 	e.dns.tunnel = []*upstream{{name: host, lookup: e.dns.dohLookup}}
 	e.dns.tunnelUp = d.Connected
 }
@@ -64,7 +66,11 @@ func (e *RuleEngine) SetTunnelDNS(servers []string, d dialer) {
 		if host, port, err := net.SplitHostPort(server); err == nil && port == "53" {
 			name = host
 		}
-		e.dns.tunnel = append(e.dns.tunnel, &upstream{name: name, lookup: dnsServerLookup(d, server)})
+		lookup := dnsServerLookup(d, server)
+		e.dns.tunnel = append(e.dns.tunnel, &upstream{name: name, lookup: func(ctx context.Context, host string) ([]netip.Addr, time.Time, error) {
+			addrs, err := lookup(ctx, host)
+			return addrs, time.Time{}, err
+		}})
 	}
 	e.dns.tunnelUp = d.Connected
 }
@@ -181,12 +187,9 @@ func (c *dnsCache) localResolveAll(ctx context.Context, host string) ([]netip.Ad
 // result. lookup must return unmapped addresses; its authoritative field
 // reports whether the answer is authoritative for the key's policy (see
 // lookupResult) — only authoritative answers are cached, so a degraded answer
-// degrades one connection instead of poisoning the whole TTL. An authoritative
-// NXDOMAIN is cached as a negative entry for negativeTTL: a dead name on a hot
-// path must not pay a full round-trip per connection. Concurrent misses of the
-// same key share one lookup through singleflight: they get one result (or one
-// error) and the resolver sees a single round-trip, not a thundering herd per
-// arriving connection burst.
+// degrades one connection instead of poisoning the whole TTL. Negative entries
+// use negativeTTL. Both cache lifetimes are capped by validUntil when supplied.
+// Concurrent misses of the same key share one lookup through singleflight.
 func (c *dnsCache) cachedLookup(ctx context.Context, key, host string, lookup func(context.Context, string) (lookupResult, error)) (lookupResult, error) {
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return lookupResult{addrs: []netip.Addr{ip.Unmap()}}, nil
@@ -212,20 +215,26 @@ func (c *dnsCache) cachedLookup(ctx context.Context, key, host string, lookup fu
 		c.lookups.Add(1)
 
 		res, err := lookup(ctx, host)
-		if err != nil {
-			// Only the tunnel policy treats NXDOMAIN as authoritative;
-			// local resolver errors are transient and never cached
-			// (authoritative marks exactly the answers worth caching).
-			if res.authoritative && errors.Is(err, errNotFound) {
-				c.store(key, cacheEntry{expires: time.Now().Add(c.negativeTTL), neg: true})
-			}
-			return lookupResult{}, NewDNSError(host, err)
-		}
-		if len(res.addrs) == 0 {
+		if err == nil && len(res.addrs) == 0 {
 			return lookupResult{}, fmt.Errorf("no address for %s", host)
 		}
-		if res.authoritative {
-			c.store(key, cacheEntry{addrs: res.addrs, localDirect: res.localDirect, expires: time.Now().Add(c.ttl)})
+		negative := errors.Is(err, errNotFound)
+		if res.authoritative && (err == nil || negative) {
+			ttl := c.ttl
+			if negative {
+				ttl = c.negativeTTL
+			}
+			now := time.Now()
+			expires := now.Add(ttl)
+			if !res.validUntil.IsZero() && res.validUntil.Before(expires) {
+				expires = res.validUntil
+			}
+			if now.Before(expires) {
+				c.store(key, cacheEntry{addrs: res.addrs, localDirect: res.localDirect, expires: expires, neg: negative})
+			}
+		}
+		if err != nil {
+			return lookupResult{}, NewDNSError(host, err)
 		}
 		return res, nil
 	})
@@ -273,6 +282,7 @@ var errUnreachable = errors.New("server unreachable")
 // whose private addresses may go direct (see notFound and lookup).
 type lookupResult struct {
 	addrs         []netip.Addr
+	validUntil    time.Time // Zero leaves the cache's fixed TTL in effect.
 	authoritative bool
 	localDirect   bool
 }
@@ -280,7 +290,7 @@ type lookupResult struct {
 // upstream is one tunnel resolver: a DNS server or the DoH endpoint.
 type upstream struct {
 	name   string
-	lookup func(context.Context, string) ([]netip.Addr, error)
+	lookup func(context.Context, string) ([]netip.Addr, time.Time, error)
 
 	mu sync.Mutex
 	// pausedUntil is when lookups may use this resolver again, the zero time
@@ -406,16 +416,16 @@ func (c *dnsCache) lookup(ctx context.Context, host string) (lookupResult, error
 		// the next one the same time.
 		uctx, ucancel := context.WithTimeout(tunnelCtx, time.Until(deadline)/time.Duration(len(active)-i))
 		start := time.Now()
-		addrs, err := u.lookup(uctx, host)
+		addrs, validUntil, err := u.lookup(uctx, host)
 		rtt := time.Since(start)
 		ucancel()
 		if err == nil {
 			c.upstreamAnswered(u, rtt)
-			return lookupResult{addrs: addrs, authoritative: true}, nil
+			return lookupResult{addrs: addrs, validUntil: validUntil, authoritative: true}, nil
 		}
 		if errors.Is(err, errNotFound) {
 			c.upstreamAnswered(u, rtt)
-			return c.notFound(ctx, host)
+			return c.notFound(ctx, host, validUntil)
 		}
 		c.upstreamFailed(u, err)
 	}
@@ -430,13 +440,13 @@ func (c *dnsCache) lookup(ctx context.Context, host string) (lookupResult, error
 // unless localOnNXDomain lets the local resolver answer for names public DNS
 // does not know. Asking was a policy choice, so that answer is authoritative,
 // and a local failure leaves the name not found.
-func (c *dnsCache) notFound(ctx context.Context, host string) (lookupResult, error) {
+func (c *dnsCache) notFound(ctx context.Context, host string, validUntil time.Time) (lookupResult, error) {
 	if c.localOnNXDomain {
 		if addrs, err := c.lookupLocal(ctx, host); err == nil {
 			return lookupResult{addrs: addrs, authoritative: true, localDirect: true}, nil
 		}
 	}
-	return lookupResult{authoritative: true}, errNotFound
+	return lookupResult{validUntil: validUntil, authoritative: true}, errNotFound
 }
 
 // upstreamAnswered records an answer of a resolver.
@@ -498,9 +508,9 @@ func toNetip(addrs []net.IPAddr) []netip.Addr {
 	return out
 }
 
-// dohResponse is an RFC 8484 dns-json answer subset.
+// dohResponse is the subset used by the legacy JSON API.
 type dohResponse struct {
-	Status int `json:"Status"`
+	Status *int `json:"Status"`
 	Answer []struct {
 		Type int    `json:"Type"`
 		Data string `json:"Data"`
@@ -519,8 +529,7 @@ var (
 	dohQueryAAAA = dohQuery{name: "AAAA", want: 28}
 )
 
-// dohJSONQuery performs one dns-json DoH query (RFC 8484 GET) on the
-// endpoint and returns the addresses of the wanted record type, unmapped.
+// dohJSONQuery queries the legacy JSON API for one record type.
 // errNotFound marks a definitive NXDOMAIN; any other error is a
 // transport or protocol failure.
 func dohJSONQuery(ctx context.Context, client *http.Client, endpoint, host string, q dohQuery) ([]netip.Addr, error) {
@@ -534,17 +543,29 @@ func dohJSONQuery(ctx context.Context, client *http.Client, endpoint, host strin
 	if err != nil {
 		return nil, err
 	}
-	var d dohResponse
-	err = json.NewDecoder(io.LimitReader(resp.Body, dohMaxResponse)).Decode(&d)
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, dohHTTPStatus(resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, dohMaxResponse+1))
 	if err != nil {
 		return nil, err
 	}
-	if d.Status == 3 { // NXDOMAIN
+	if len(body) > dohMaxResponse {
+		return nil, errors.New("doh: JSON response exceeds 1 MiB")
+	}
+	var d dohResponse
+	if err := json.Unmarshal(body, &d); err != nil {
+		return nil, err
+	}
+	if d.Status == nil {
+		return nil, errors.New("doh: JSON response has no Status")
+	}
+	if *d.Status == 3 { // NXDOMAIN
 		return nil, errNotFound
 	}
-	if resp.StatusCode != http.StatusOK || d.Status != 0 {
-		return nil, fmt.Errorf("doh: status %d/%d", resp.StatusCode, d.Status)
+	if *d.Status != 0 {
+		return nil, fmt.Errorf("doh: JSON DNS status %d", *d.Status)
 	}
 	var out []netip.Addr
 	for _, a := range d.Answer {
@@ -558,19 +579,57 @@ func dohJSONQuery(ctx context.Context, client *http.Client, endpoint, host strin
 	return out, nil
 }
 
-// dohLookup queries the DoH endpoint for A and AAAA records.
-func (c *dnsCache) dohLookup(ctx context.Context, host string) ([]netip.Addr, error) {
+// dohLookup selects a format for this lookup using the first A query.
+func (c *dnsCache) dohLookup(ctx context.Context, host string) ([]netip.Addr, time.Time, error) {
+	a, err := newDoHWireQuestion(host, dnsmessage.TypeA)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	aaaa, err := newDoHWireQuestion(host, dnsmessage.TypeAAAA)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
 	var connected atomic.Bool
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
 	})
+	first, err := dohWireQuery(ctx, c.dohClient, c.dohHost, a)
+	if status, ok := err.(dohHTTPStatus); ok && ctx.Err() == nil {
+		switch status {
+		case http.StatusBadRequest, http.StatusNotAcceptable, http.StatusUnsupportedMediaType:
+			addrs, jsonErr := c.lookupDoHJSON(ctx, host)
+			if jsonErr != nil && !errors.Is(jsonErr, errNotFound) {
+				jsonErr = fmt.Errorf("%v, JSON retry: %w", status, jsonErr)
+			}
+			return addrs, time.Time{}, jsonErr
+		}
+	}
+	if err != nil {
+		if !connected.Load() && !errors.Is(err, errNotFound) {
+			err = fmt.Errorf("%w: %v", errUnreachable, err)
+		}
+		return nil, first.validUntil, err
+	}
+	second, err := dohWireQuery(ctx, c.dohClient, c.dohHost, aaaa)
+	if err != nil {
+		return nil, second.validUntil, err
+	}
+	validUntil := first.validUntil
+	if second.validUntil.Before(validUntil) {
+		validUntil = second.validUntil
+	}
+	addrs := append(first.addrs, second.addrs...)
+	if len(addrs) == 0 {
+		return nil, validUntil, errNotFound
+	}
+	return addrs, validUntil, nil
+}
+
+func (c *dnsCache) lookupDoHJSON(ctx context.Context, host string) ([]netip.Addr, error) {
 	var out []netip.Addr
 	for _, q := range [2]dohQuery{dohQueryA, dohQueryAAAA} {
 		addrs, err := dohJSONQuery(ctx, c.dohClient, c.dohHost, host, q)
 		if err != nil {
-			if !connected.Load() && !errors.Is(err, errNotFound) {
-				return nil, fmt.Errorf("%w: %v", errUnreachable, err)
-			}
 			return nil, err
 		}
 		out = append(out, addrs...)

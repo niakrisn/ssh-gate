@@ -8,8 +8,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 // TestDoHAfterTunnelLoss: the DoH client keeps connections in a pool. When the
@@ -102,52 +107,39 @@ func TestDoHPause(t *testing.T) {
 	})
 }
 
-// TestResolveAllDOH: when a DoH endpoint is configured, cached resolution
-// asks the endpoint (dialing it through the SSH dialer, here a testDialer
-// that redirects to a local TLS server) instead of the local resolver. A
-// definitive DoH answer wins even when the local resolver would fail
-// (.example is reserved, so the local lookup is NXDOMAIN), the answer is
-// cached, and a DoH NXDOMAIN is authoritative (no local fallback).
 func TestResolveAllDOH(t *testing.T) {
 	var reqs atomic.Int64
-	mux := http.NewServeMux()
-	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
+	srv := startFakeDoHServer(t, func(name, qtype string) dohAnswer {
 		reqs.Add(1)
-		name, qtype := r.URL.Query().Get("name"), r.URL.Query().Get("type")
-		w.Header().Set("Content-Type", "application/dns-json")
 		switch {
 		case name == "blocked.example" && qtype == "A":
-			io.WriteString(w, `{"Status":0,"Answer":[{"Type":1,"Data":"203.0.113.7"}]}`)
+			return dohAnswer{a: []string{"203.0.113.7"}}
 		case name == "v6only.example" && qtype == "AAAA":
-			io.WriteString(w, `{"Status":0,"Answer":[{"Type":28,"Data":"2001:db8::7"}]}`)
-		case name == "missing.example":
-			io.WriteString(w, `{"Status":3,"Answer":[]}`)
+			return dohAnswer{aaaa: []string{"2001:db8::7"}}
+		case name == "missing.example" || name == "other-missing.example":
+			return dohAnswer{status: 3}
 		default:
-			io.WriteString(w, `{"Status":0,"Answer":[]}`)
+			return dohAnswer{}
 		}
 	})
-	srv := httptest.NewTLSServer(mux)
-	defer srv.Close()
-
 	rules, err := NewRuleEngine("")
 	if err != nil {
-		t.Fatalf("NewRuleEngine: %v", err)
+		t.Fatal(err)
 	}
-	// The testDialer stands in for the SSH tunnel: it redirects the dial to
-	// the local DoH server, whose certificate matches the 127.0.0.1 hostname
-	// used in the URL.
-	rules.SetDOH(srv.Listener.Addr().String(), testDialer{Target: srv.Listener.Addr().String()})
-	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig
+	d, b := setBootstrap(t, srv)
+	rules.SetDOH(b.addr, d)
+	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
+	var localCalls int
+	local := netip.MustParseAddr("192.0.2.9")
+	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
+		localCalls++
+		return []net.IPAddr{{IP: local.AsSlice()}}, nil
+	}
 
 	addrs, err := rules.ResolveAll(context.Background(), "blocked.example")
-	if err != nil {
-		t.Fatalf("ResolveAll via DoH: %v", err)
+	if err != nil || len(addrs) != 1 || addrs[0] != netip.MustParseAddr("203.0.113.7") {
+		t.Fatalf("ResolveAll via DoH: (%v, %v)", addrs, err)
 	}
-	if len(addrs) != 1 || addrs[0] != netip.MustParseAddr("203.0.113.7") {
-		t.Fatalf("addrs = %v, want [203.0.113.7]", addrs)
-	}
-
-	// A repeat within the TTL is served from the cache: no further DoH query.
 	before := reqs.Load()
 	if _, err := rules.ResolveAll(context.Background(), "blocked.example"); err != nil {
 		t.Fatalf("cached ResolveAll: %v", err)
@@ -156,44 +148,46 @@ func TestResolveAllDOH(t *testing.T) {
 		t.Fatalf("cache miss: DoH requests %d -> %d", before, got)
 	}
 
-	// A v6-only host: the A query is NOERROR with an empty answer, the AAAA
-	// query carries the record — dohLookup must merge both queries.
+	// NODATA for A still allows the AAAA lookup.
 	v6, err := rules.ResolveAll(context.Background(), "v6only.example")
-	if err != nil {
-		t.Fatalf("ResolveAll v6-only via DoH: %v", err)
+	if err != nil || len(v6) != 1 || v6[0] != netip.MustParseAddr("2001:db8::7") {
+		t.Fatalf("ResolveAll v6-only: (%v, %v)", v6, err)
 	}
-	if len(v6) != 1 || v6[0] != netip.MustParseAddr("2001:db8::7") {
-		t.Fatalf("addrs = %v, want [2001:db8::7]", v6)
+	if _, err := rules.ResolveAll(context.Background(), "missing.example"); !errors.Is(err, errNotFound) || localCalls != 0 {
+		t.Fatalf("NXDOMAIN: err=%v, local calls=%d", err, localCalls)
 	}
-
-	// A definitive DoH NXDOMAIN is authoritative: no local fallback.
-	if _, err := rules.ResolveAll(context.Background(), "missing.example"); err == nil {
-		t.Fatal("NXDOMAIN via DoH: want error, got success")
+	rules.dns.localOnNXDomain = true
+	addrs, localDirect, err := rules.dns.resolveTunnel(context.Background(), "other-missing.example")
+	if err != nil || len(addrs) != 1 || addrs[0] != local || !localDirect || localCalls != 1 {
+		t.Fatalf("NXDOMAIN with local DNS: (%v, %t, %v), local calls=%d", addrs, localDirect, err, localCalls)
 	}
 }
 
-// TestResolveAllDOHServerFallback: a non-definitive DoH failure (SERVFAIL)
-// is not authoritative, unlike a definitive NXDOMAIN: resolution falls back
-// to the local resolver. example.com resolves locally, so success proves the
-// fallback happened (a treated-as-definitive SERVFAIL would fail the lookup).
 func TestResolveAllDOHServerFallback(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/dns-json")
-		io.WriteString(w, `{"Status":2,"Answer":[]}`) // SERVFAIL
+	srv := startFakeDoHServer(t, func(_, _ string) dohAnswer {
+		return dohAnswer{status: int(dnsmessage.RCodeServerFailure)}
 	})
-	srv := httptest.NewTLSServer(mux)
-	defer srv.Close()
-
 	rules, err := NewRuleEngine("")
 	if err != nil {
-		t.Fatalf("NewRuleEngine: %v", err)
+		t.Fatal(err)
 	}
-	rules.SetDOH(srv.Listener.Addr().String(), testDialer{Target: srv.Listener.Addr().String()})
-	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig
+	d, b := setBootstrap(t, srv)
+	rules.SetDOH(b.addr, d)
+	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
+	var localCalls int
+	local := netip.MustParseAddr("192.0.2.9")
+	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
+		localCalls++
+		return []net.IPAddr{{IP: local.AsSlice()}}, nil
+	}
 
-	if _, err := rules.ResolveAll(context.Background(), "example.com"); err != nil {
-		t.Skipf("local resolver unavailable: %v", err)
+	addrs, err := rules.ResolveAll(context.Background(), "broken.example")
+	if err != nil || len(addrs) != 1 || addrs[0] != local || localCalls != 1 {
+		t.Fatalf("SERVFAIL fallback: (%v, %v), local calls=%d", addrs, err, localCalls)
+	}
+	server := rules.DNSStatus().Servers[0]
+	if server.Fail != 1 || !strings.Contains(server.Error, dnsmessage.RCodeServerFailure.String()) {
+		t.Fatalf("DoH status = %+v, want DNS SERVFAIL", server)
 	}
 }
 
@@ -215,5 +209,143 @@ func TestResolveAllDOHFallback(t *testing.T) {
 	rules.SetDOH(closed, testDialer{})
 	if _, err := rules.ResolveAll(context.Background(), "example.com"); err != nil {
 		t.Skipf("local resolver unavailable: %v", err)
+	}
+}
+
+func TestDoHRedirect(t *testing.T) {
+	var plaintext atomic.Int64
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		plaintext.Add(1)
+		io.WriteString(w, "plaintext")
+	}))
+	defer httpServer.Close()
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dns-query":
+			http.Redirect(w, r, "/answer?dns=example", http.StatusFound)
+		case "/answer":
+			if r.URL.RawQuery != "dns=example" {
+				t.Errorf("redirect query = %s", r.URL.RawQuery)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/downgrade":
+			http.Redirect(w, r, httpServer.URL, http.StatusFound)
+		case "/loop":
+			http.Redirect(w, r, "/loop", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer tlsServer.Close()
+
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules.SetDOH(tlsServer.Listener.Addr().String(), testDialer{})
+	client := rules.dns.dohClient
+	client.Transport.(*http.Transport).TLSClientConfig = tlsServer.Client().Transport.(*http.Transport).TLSClientConfig
+	resp, err := client.Get(tlsServer.URL + "/dns-query")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("same-origin redirect returned %d", resp.StatusCode)
+	}
+
+	for _, accept := range []string{dohWireMediaType, "application/dns-json"} {
+		for _, path := range []string{"/downgrade", "/loop"} {
+			req, err := http.NewRequest(http.MethodGet, tlsServer.URL+path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Accept", accept)
+			if resp, err := client.Do(req); err == nil {
+				resp.Body.Close()
+				t.Errorf("redirect %s succeeded for %s", path, accept)
+			}
+		}
+	}
+	if got := plaintext.Load(); got != 0 {
+		t.Fatalf("plaintext endpoint received %d requests", got)
+	}
+}
+
+func TestDoHOverSSH(t *testing.T) {
+	const host = "ssh-doh.example"
+	var queries, channels atomic.Int64
+	srv := startFakeDoHServer(t, func(name, _ string) dohAnswer {
+		queries.Add(1)
+		if name != host {
+			t.Errorf("DNS name = %s, want %s", name, host)
+		}
+		return dohAnswer{a: []string{"192.0.2.1"}, aaaa: []string{"2001:db8::1"}}
+	})
+	target := srv.Listener.Addr().(*net.TCPAddr)
+	sshAddr, signer := startTestSSHServerWithChannelHandler(t, "", true, func(incoming ssh.NewChannel) error {
+		var request struct {
+			Host       string
+			Port       uint32
+			OriginHost string
+			OriginPort uint32
+		}
+		err := ssh.Unmarshal(incoming.ExtraData(), &request)
+		if err != nil || incoming.ChannelType() != "direct-tcpip" ||
+			request.Host != target.IP.String() || request.Port != uint32(target.Port) {
+			t.Errorf("SSH channel %s: destination %+v, error %v", incoming.ChannelType(), request, err)
+			return incoming.Reject(ssh.Prohibited, "unexpected test destination")
+		}
+		conn, err := net.DialTCP("tcp", nil, target)
+		if err != nil {
+			t.Errorf("dial test HTTPS server: %v", err)
+			return incoming.Reject(ssh.ConnectionFailed, "test HTTPS server unavailable")
+		}
+		ch, requests, err := incoming.Accept()
+		if err != nil {
+			conn.Close()
+			return err
+		}
+		channels.Add(1)
+		go ssh.DiscardRequests(requests)
+		go func() {
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				io.Copy(conn, ch)
+				conn.CloseWrite()
+			}()
+			io.Copy(ch, conn)
+			ch.Close()
+			conn.Close()
+			<-done
+		}()
+		return nil
+	})
+
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &sshDialer{client: connectTestSSHClient(t, sshAddr, signer)}
+	rules.SetDOH(target.String(), d)
+	transport := rules.dns.dohClient.Transport.(*http.Transport)
+	transport.TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig
+	t.Cleanup(transport.CloseIdleConnections)
+	var localCalls int
+	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
+		localCalls++
+		return nil, errors.New("unexpected local DNS")
+	}
+
+	want := []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")}
+	for range 2 {
+		got, err := rules.ResolveAll(context.Background(), host)
+		if err != nil || !slices.Equal(got, want) {
+			t.Fatalf("ResolveAll over SSH = (%v, %v), want %v", got, err, want)
+		}
+		if channels.Load() < 1 || queries.Load() != 2 || localCalls != 0 {
+			t.Fatalf("SSH channels=%d, HTTPS queries=%d, local calls=%d", channels.Load(), queries.Load(), localCalls)
+		}
 	}
 }

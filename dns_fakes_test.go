@@ -4,63 +4,70 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
-type fakeDohRecord struct {
-	Type int    `json:"Type"`
-	Data string `json:"Data"`
-}
-
-// dohAnswer is one fake server response: a dns-json RCODE plus the record
+// dohAnswer is one fake server response: a DNS RCODE plus the record
 // lists returned on NOERROR.
 type dohAnswer struct {
-	status int // 0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN
+	status int
 	a      []string
 	aaaa   []string
 }
 
-// startFakeDoHServer starts an in-process dns-json DoH server; reply picks
-// the answer per question (name and type A/AAAA).
+// startFakeDoHServer starts a local RFC 8484 server with one answer per question.
 func startFakeDoHServer(t *testing.T, reply func(name, qtype string) dohAnswer) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
-		name, qtype := r.URL.Query().Get("name"), r.URL.Query().Get("type")
-		ans := reply(name, qtype)
-		var recs []fakeDohRecord
-		if ans.status == 0 {
-			if qtype == "AAAA" {
-				for _, s := range ans.aaaa {
-					recs = append(recs, fakeDohRecord{Type: 28, Data: s})
+		msg, err := readDoHWireQuery(r)
+		if err != nil {
+			t.Errorf("invalid DoH request: %v", err)
+			http.Error(w, "invalid test request", http.StatusBadRequest)
+			return
+		}
+		q := msg.Questions[0]
+		name := q.Name.String()
+		qtype := "A"
+		switch q.Type {
+		case dnsmessage.TypeA:
+		case dnsmessage.TypeAAAA:
+			qtype = "AAAA"
+		default:
+			t.Errorf("unexpected question type %v", q.Type)
+			http.Error(w, "invalid test question", http.StatusBadRequest)
+			return
+		}
+		ans := reply(strings.TrimSuffix(name, "."), qtype)
+		msg.Response = true
+		msg.RCode = dnsmessage.RCode(ans.status)
+		if msg.RCode == dnsmessage.RCodeSuccess {
+			if q.Type == dnsmessage.TypeA {
+				for _, s := range ans.a {
+					msg.Answers = append(msg.Answers, doHRecord(name, 60, &dnsmessage.AResource{A: netip.MustParseAddr(s).As4()}))
 				}
 			} else {
-				for _, s := range ans.a {
-					recs = append(recs, fakeDohRecord{Type: 1, Data: s})
+				for _, s := range ans.aaaa {
+					msg.Answers = append(msg.Answers, doHRecord(name, 60, &dnsmessage.AAAAResource{AAAA: netip.MustParseAddr(s).As16()}))
 				}
 			}
 		}
-		body, err := json.Marshal(struct {
-			Status int             `json:"Status"`
-			Answer []fakeDohRecord `json:"Answer"`
-		}{Status: ans.status, Answer: recs})
-		if err != nil {
-			t.Errorf("marshal fake answer: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		if len(msg.Answers) == 0 && (msg.RCode == dnsmessage.RCodeSuccess || msg.RCode == dnsmessage.RCodeNameError) {
+			msg.Authorities = []dnsmessage.Resource{doHSOA(name, 60, 60)}
 		}
-		w.Header().Set("Content-Type", "application/dns-json")
-		w.Write(body)
+		writeDoHWireResponse(t, w, msg)
 	})
 	srv := httptest.NewTLSServer(mux)
 	t.Cleanup(srv.Close)

@@ -141,7 +141,7 @@ func (e *RuleEngine) Decide(ctx context.Context, host string, port int) (Route, 
 }
 
 // ResolveAll resolves host through the engine's cached resolver,
-// sharing the rule-matching cache (TTL 30 s, 5 s lookup timeout).
+// sharing the rule-matching cache (up to 30 s, 5 s lookup timeout).
 // Returns all IPv4 and IPv6 addresses; IP literals are returned as-is.
 func (e *RuleEngine) ResolveAll(ctx context.Context, host string) ([]netip.Addr, error) {
 	return e.dns.ResolveAll(ctx, host)

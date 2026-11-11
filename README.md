@@ -80,7 +80,7 @@ line is `Stopping, draining connections`.
 | `DIRECT_RULES` | no | — | Comma-separated rules for direct connections (see below) |
 | `DIRECT_IP_FAMILY` | no | `both` | Address families for direct: `ipv4`, `ipv6`, `both` (compose sets `ipv4`) |
 | `TUNNEL_DNS` | no | `1.1.1.1,8.8.8.8` | DNS servers for tunnel destinations: comma-separated IPs with an optional port, queried over TCP through the SSH tunnel (see [DNS](#dns)) |
-| `DOH_HOST` | no | — | DNS-over-HTTPS endpoint to use instead of `TUNNEL_DNS`, also through the SSH tunnel. Hostname only, port 443 only. Setting both variables is a startup error |
+| `DOH_HOST` | no | — | DNS-over-HTTPS endpoint to use instead of `TUNNEL_DNS`, also through the SSH tunnel. Use a hostname with optional `:443`. Setting both variables is a startup error |
 | `LOCAL_DNS_ON_NXDOMAIN` | no | `off` | Ask the local resolver when a tunnel resolver says a name does not exist (`on`, `off`, see [DNS](#dns)) |
 | `HEALTH_LISTEN` | no | `127.0.0.1:9090` | Health + Web UI listen address (compose sets `0.0.0.0:9090` inside the container and maps it to `127.0.0.1:9090` on the host) |
 | `UI_ALLOWED_HOSTS` | no | — | Comma-separated hostnames or IPs (no port) the Web UI and API answer to, in addition to `localhost`, `127.0.0.1`, `::1` and the `HEALTH_LISTEN` host. Needed only to open the UI under a LAN name or address (see [Web UI](#web-ui)) |
@@ -104,6 +104,8 @@ Private addresses: an IP literal in a private, loopback, link-local, CGNAT (`100
 ### DNS
 
 There are two resolvers. The local one is the resolver of this machine. The tunnel one is either the servers of `TUNNEL_DNS` or the endpoint of `DOH_HOST`, reached through the SSH tunnel, so the local network neither sees these queries nor can forge the answers. `127.0.0.53` in `TUNNEL_DNS` is the resolver of the VPS itself when it runs systemd-resolved.
+
+Set `DOH_HOST=dns.google` or `DOH_HOST=cloudflare-dns.com` to use DoH. Requests start at `/dns-query` with an RFC 8484 GET. If the first A request gets HTTP 400, 406, or 415, ssh-gate retries that A request in JSON on `/dns-query`. After a `NOERROR` response to A, ssh-gate queries AAAA in the same format. All DoH requests for one lookup share a 3 s budget. Redirects must use HTTPS on the original host and port. If `DOH_HOST` is empty, ssh-gate uses `TUNNEL_DNS`.
 
 | Name | Resolver | Route |
 |------|----------|-------|
