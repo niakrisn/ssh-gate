@@ -26,7 +26,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 PLATFORM="${PLATFORM:-linux/amd64}"
-BASE_IMAGE="${BASE_IMAGE:-golang:1.26.10-bookworm}"
+BASE_IMAGE="${BASE_IMAGE:-golang:1.26.11-bookworm}"
 VERSION="${VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')}"
 VERSION="${VERSION:-0.0.0}"
 read -r -a REVISIONS <<<"${REVISIONS:-1~deb12u1 1~deb13u1 1~ubuntu22.04u1 1~ubuntu24.04u1}"

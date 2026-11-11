@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=golang:1.26.10-bookworm
+ARG BASE_IMAGE=golang:1.26.11-bookworm
 FROM ${BASE_IMAGE}
 
 # dpkg-buildpackage lives in dpkg-dev, dh in debhelper, and dpkg expects
