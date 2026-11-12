@@ -168,17 +168,55 @@ func ctxWithNoTrack(ctx context.Context) context.Context {
 
 // tunnelHTTPClient builds an HTTP client whose dials go through the SSH
 // tunnel (untracked), for internal clients like DoH transports. A timeout
-// of 0 leaves requests unbounded; a nil tlsCfg uses the system roots.
-func tunnelHTTPClient(d dialer, timeout time.Duration, tlsCfg *tls.Config) *http.Client {
+// of 0 disables the overall request timeout; connection setup stays bounded.
+// A nil tlsCfg uses the system roots.
+func tunnelHTTPClient(lifetime context.Context, d dialer, timeout time.Duration, tlsCfg *tls.Config) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
-			TLSClientConfig: tlsCfg,
+			TLSClientConfig:     tlsCfg,
+			TLSHandshakeTimeout: 3 * time.Second,
+			IdleConnTimeout:     30 * time.Second,
+			MaxConnsPerHost:     32,
+			MaxIdleConnsPerHost: 8,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return d.DialContext(ctxWithNoTrack(ctx), network, addr)
+				// Transport detaches this context from the request. Bound
+				// our wait even after the original caller has returned.
+				ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				defer cancel()
+				stop := context.AfterFunc(lifetime, cancel)
+				defer stop()
+				if err := lifetime.Err(); err != nil {
+					return nil, err
+				}
+				conn, err := d.DialContext(ctxWithNoTrack(ctx), network, addr)
+				if err != nil {
+					return nil, err
+				}
+				// Keep an established connection tied to its owner, not to
+				// the request or the shorter dial context.
+				owned := &lifetimeConn{Conn: conn}
+				owned.stop = context.AfterFunc(lifetime, func() { conn.Close() })
+				if err := lifetime.Err(); err != nil {
+					owned.Close()
+					return nil, err
+				}
+				return owned, nil
 			},
 		},
 	}
+}
+
+// lifetimeConn releases its owner's close callback when the connection
+// closes normally, so the owner does not retain dead connections.
+type lifetimeConn struct {
+	net.Conn
+	stop func() bool
+}
+
+func (c *lifetimeConn) Close() error {
+	c.stop()
+	return c.Conn.Close()
 }
 
 // trackDial performs the dial and, when a tracker is set, registers the

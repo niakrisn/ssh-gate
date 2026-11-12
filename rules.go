@@ -59,13 +59,16 @@ func (e *RuleEngine) Stop() {
 }
 
 func NewRuleEngine(direct string) (*RuleEngine, error) {
+	ctx, cancel := context.WithCancel(context.Background())
 	e := &RuleEngine{
 		dns: &dnsCache{
 			mu:          sync.Mutex{},
 			cache:       make(map[string]cacheEntry),
 			ttl:         dnsCacheTTL,
 			negativeTTL: dnsNegativeTTL,
-			done:        make(chan struct{}),
+			ctx:         ctx,
+			cancel:      cancel,
+			stopped:     make(chan struct{}),
 			now:         time.Now,
 		},
 		private: []netip.Prefix{

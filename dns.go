@@ -48,7 +48,7 @@ const (
 // SetTunnelDNS.
 func (e *RuleEngine) SetDOH(host string, d dialer) {
 	e.dns.dohHost = host
-	e.dns.dohClient = tunnelHTTPClient(d, 0, nil)
+	e.dns.dohClient = tunnelHTTPClient(e.dns.ctx, d, 0, nil)
 	e.dns.dohClient.CheckRedirect = checkDoHRedirect
 	e.dns.tunnel = []*upstream{{name: host, lookup: e.dns.dohLookup}}
 	e.dns.tunnelUp = d.Connected
@@ -81,8 +81,11 @@ type dnsCache struct {
 	cache       map[string]cacheEntry
 	ttl         time.Duration
 	negativeTTL time.Duration
-	done        chan struct{}
+	ctx         context.Context
+	cancel      context.CancelFunc
 	closeOnce   sync.Once
+	stopped     chan struct{}
+	workers     sync.WaitGroup
 	// lookups counts real resolver queries (cache hits and IP literals
 	// excluded); tests use it to assert caching without timing tricks.
 	lookups   atomic.Int64
@@ -112,15 +115,18 @@ type dnsCache struct {
 
 // startPurge launches a background goroutine that purges expired entries every TTL.
 func (c *dnsCache) startPurge(ctx context.Context) {
+	if !c.beginWork() {
+		return
+	}
 	go func() {
+		defer c.workers.Done()
 		ticker := time.NewTicker(c.ttl)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
-				c.closeOnce.Do(func() { close(c.done) })
 				return
-			case <-c.done:
+			case <-c.ctx.Done():
 				return
 			case <-ticker.C:
 				c.purge()
@@ -129,8 +135,46 @@ func (c *dnsCache) startPurge(ctx context.Context) {
 	}()
 }
 
+// Admission and stop share the mutex so no worker can enter after Wait starts.
+func (c *dnsCache) beginWork() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ctx.Err() != nil {
+		return false
+	}
+	c.workers.Add(1)
+	return true
+}
+
 func (c *dnsCache) stop() {
-	c.closeOnce.Do(func() { close(c.done) })
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.cancel()
+		c.mu.Unlock()
+		// Closing an SSH channel can wait on the shared transport writer.
+		// Do not prevent the caller from stopping that transport next.
+		go func() {
+			if c.dohClient != nil {
+				c.dohClient.CloseIdleConnections()
+			}
+			c.workers.Wait()
+			close(c.stopped)
+		}()
+	})
+}
+
+func (c *dnsCache) waitStopped(ctx context.Context) error {
+	select {
+	case <-c.stopped:
+		return nil
+	default:
+	}
+	select {
+	case <-c.stopped:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (c *dnsCache) purge() {
@@ -191,6 +235,12 @@ func (c *dnsCache) localResolveAll(ctx context.Context, host string) ([]netip.Ad
 // use negativeTTL. Both cache lifetimes are capped by validUntil when supplied.
 // Concurrent misses of the same key share one lookup through singleflight.
 func (c *dnsCache) cachedLookup(ctx context.Context, key, host string, lookup func(context.Context, string) (lookupResult, error)) (lookupResult, error) {
+	if err := ctx.Err(); err != nil {
+		return lookupResult{}, err
+	}
+	if err := c.ctx.Err(); err != nil {
+		return lookupResult{}, err
+	}
 	if ip, err := netip.ParseAddr(host); err == nil {
 		return lookupResult{addrs: []netip.Addr{ip.Unmap()}}, nil
 	}
@@ -205,16 +255,28 @@ func (c *dnsCache) cachedLookup(ctx context.Context, key, host string, lookup fu
 	}
 	c.mu.Unlock()
 
-	v, err, _ := c.sf.Do(key, func() (any, error) {
+	result := c.sf.DoChan(key, func() (any, error) {
+		if !c.beginWork() {
+			return lookupResult{}, c.ctx.Err()
+		}
+		defer c.workers.Done()
 		// The shared lookup runs on a context detached from the caller
 		// that happened to win the race — one caller hanging up must not
 		// kill the lookup the others are waiting on. It keeps the same
 		// 5 s bound.
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
+		stop := context.AfterFunc(c.ctx, cancel)
+		defer stop()
+		if err := c.ctx.Err(); err != nil {
+			return lookupResult{}, err
+		}
 		c.lookups.Add(1)
 
 		res, err := lookup(ctx, host)
+		if ctx.Err() != nil {
+			return lookupResult{}, ctx.Err()
+		}
 		if err == nil && len(res.addrs) == 0 {
 			return lookupResult{}, fmt.Errorf("no address for %s", host)
 		}
@@ -238,10 +300,23 @@ func (c *dnsCache) cachedLookup(ctx context.Context, key, host string, lookup fu
 		}
 		return res, nil
 	})
-	if err != nil {
-		return lookupResult{}, err
+	select {
+	case <-ctx.Done():
+		return lookupResult{}, ctx.Err()
+	case <-c.ctx.Done():
+		return lookupResult{}, c.ctx.Err()
+	case r := <-result:
+		if err := ctx.Err(); err != nil {
+			return lookupResult{}, err
+		}
+		if err := c.ctx.Err(); err != nil {
+			return lookupResult{}, err
+		}
+		if r.Err != nil {
+			return lookupResult{}, r.Err
+		}
+		return r.Val.(lookupResult), nil
 	}
-	return v.(lookupResult), nil
 }
 
 // store writes entry under key, evicting the oldest entry when full.

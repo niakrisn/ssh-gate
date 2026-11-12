@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
@@ -13,6 +14,81 @@ import (
 	"testing"
 	"time"
 )
+
+// Observes when a waiter has installed its select without relying on sleeps.
+type observedWaitContext struct {
+	context.Context
+	waiting chan struct{}
+	once    sync.Once
+}
+
+func (c *observedWaitContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
+
+func TestDNSWaiterCancellation(t *testing.T) {
+	rules, err := NewRuleEngine("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rules.Stop()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	var calls atomic.Int64
+	rules.dns.localLookup = func(ctx context.Context, _ string) ([]net.IPAddr, error) {
+		if calls.Add(1) == 1 {
+			close(entered)
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return []net.IPAddr{{IP: net.ParseIP("203.0.113.1")}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := make(chan error, 1)
+	go func() { _, err := rules.dns.localResolveAll(ctx, "wait.example"); first <- err }()
+	<-entered
+	cancel()
+	select {
+	case err := <-first:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("waiter=%v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("canceled waiter still blocks on shared lookup")
+	}
+	secondCtx := &observedWaitContext{Context: context.Background(), waiting: make(chan struct{})}
+	second := make(chan error, 1)
+	go func() {
+		addrs, err := rules.dns.localResolveAll(secondCtx, "wait.example")
+		if err == nil && (len(addrs) != 1 || addrs[0].String() != "203.0.113.1") {
+			err = fmt.Errorf("addresses=%v", addrs)
+		}
+		second <- err
+	}()
+	select {
+	case <-secondCtx.waiting:
+	case <-time.After(time.Second):
+		t.Fatal("second waiter never joined")
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shared result did not arrive")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("shared lookups=%d", calls.Load())
+	}
+}
 
 // TestDNSServerLookup covers one query to a DNS server through the tunnel.
 func TestDNSServerLookup(t *testing.T) {
