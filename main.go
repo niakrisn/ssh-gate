@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -74,9 +73,10 @@ func (c config) missing() []string {
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	// log.Fatal is used only for startup errors.
-	zerolog.FatalExitFunc = func() { os.Exit(exitConfig) }
 	accessOn, accessErr := parseOnOff(getEnv("ACCESS_LOG", "on"))
-	setupLogging(parseLogLevel(getEnv("LOG_LEVEL", "info")), accessOn)
+	logs := setupLogging(parseLogLevel(getEnv("LOG_LEVEL", "info")), accessOn)
+	defer logs.stop()
+	zerolog.FatalExitFunc = logs.exitFatal
 	if accessErr != nil {
 		log.Fatal().Err(accessErr).Msg("invalid ACCESS_LOG")
 	}
@@ -516,14 +516,14 @@ const (
 // logger, not globally, so the access log stays on at LOG_LEVEL=warn. Under
 // systemd the lines go to journald natively (priority and identifier per
 // line); elsewhere (Docker, a terminal) both loggers write JSON to stderr.
-func setupLogging(level zerolog.Level, access bool) {
-	var appOut, accessOut io.Writer = os.Stderr, os.Stderr
+func setupLogging(level zerolog.Level, access bool) *logging {
+	var conn *net.UnixConn
 	if stderrIsJournal() {
-		if conn, err := dialJournal(); err == nil {
-			appOut = &journalWriter{conn: conn, ident: journalIdent, fallback: os.Stderr}
-			accessOut = &journalWriter{conn: conn, ident: journalAccessIdent, fallback: os.Stderr}
-		}
+		conn, _ = dialJournal()
 	}
+	owner := newLogging(conn, os.Stderr)
+	appOut := &journalWriter{owner: owner, ident: journalIdent}
+	accessOut := &journalWriter{owner: owner, ident: journalAccessIdent}
 
 	log.Logger = zerolog.New(appOut).Level(level).With().Timestamp().Caller().Logger()
 	if access {
@@ -531,6 +531,7 @@ func setupLogging(level zerolog.Level, access bool) {
 	} else {
 		accessLog = zerolog.Nop()
 	}
+	return owner
 }
 
 func parseLogLevel(level string) zerolog.Level {

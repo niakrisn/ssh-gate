@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -271,10 +272,17 @@ type switchWriter struct {
 }
 
 func (s *switchWriter) Write(p []byte) (int, error) {
+	return s.WriteLevel(zerolog.NoLevel, p)
+}
+
+func (s *switchWriter) WriteLevel(level zerolog.Level, p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.w == nil {
 		return os.Stderr.Write(p)
+	}
+	if w, ok := s.w.(zerolog.LevelWriter); ok {
+		return w.WriteLevel(level, p)
 	}
 	return s.w.Write(p)
 }
@@ -288,15 +296,37 @@ func (s *switchWriter) set(w io.Writer) io.Writer {
 }
 
 // captureLogs points the service and access loggers at buffers for one test.
-func captureLogs(t *testing.T) (app, access *syncBuffer) {
+func captureLogs(t *testing.T) (app, access *syncBuffer, flush func()) {
 	t.Helper()
 	app, access = &syncBuffer{}, &syncBuffer{}
-	prevApp, prevAccess := testAppLog.set(app), testAccessLog.set(access)
+	owner := newLogging(nil, capturedLogWriter{app, access})
+	prevApp := testAppLog.set(&journalWriter{owner: owner, ident: journalIdent})
+	prevAccess := testAccessLog.set(&journalWriter{owner: owner, ident: journalAccessIdent})
 	t.Cleanup(func() {
 		testAppLog.set(prevApp)
 		testAccessLog.set(prevAccess)
+		shutdownTestLogging(t, owner)
 	})
-	return app, access
+	flush = func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := owner.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return app, access, flush
+}
+
+type capturedLogWriter struct{ app, access *syncBuffer }
+
+func (w capturedLogWriter) Write(p []byte) (int, error) {
+	var event struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(p, &event) == nil && event.Message == "access" {
+		return w.access.Write(p)
+	}
+	return w.app.Write(p)
 }
 
 // syncBuffer is a log sink that is safe to read while server goroutines
@@ -329,7 +359,7 @@ func (s *syncBuffer) String() string {
 // and now leaves an access line marked resolve_error plus the error in the
 // service log under the same conn_id.
 func TestSOCKS5ResolveFailureLogged(t *testing.T) {
-	app, access := captureLogs(t)
+	app, access, flush := captureLogs(t)
 
 	rules, err := NewRuleEngine("")
 	if err != nil {
@@ -356,6 +386,7 @@ func TestSOCKS5ResolveFailureLogged(t *testing.T) {
 		Result string `json:"result"`
 		Error  string `json:"error"`
 	}
+	flush()
 	if err := json.Unmarshal(access.Bytes(), &acc); err != nil {
 		t.Fatalf("access line %q: %v", access.String(), err)
 	}

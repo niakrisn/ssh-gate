@@ -469,16 +469,18 @@ func (c *dnsCache) upstreamFailed(u *upstream, err error) {
 	}
 	reachable := !errors.Is(err, errUnreachable)
 	u.mu.Lock()
-	defer u.mu.Unlock()
 	u.fail++
 	u.lastFailed = true
 	u.lastErr = err.Error()
 	if reachable {
 		u.pausedUntil = time.Time{}
+		u.mu.Unlock()
 		return
 	}
 	u.pausedUntil = c.now().Add(upstreamPause)
-	log.Warn().Str("resolver", u.name).Err(err).Dur("pause", upstreamPause).Msg("tunnel DNS unreachable, pausing the resolver")
+	name := u.name
+	u.mu.Unlock()
+	log.Warn().Str("resolver", name).Err(err).Dur("pause", upstreamPause).Msg("tunnel DNS unreachable, pausing the resolver")
 }
 
 // lookupLocal resolves host through the local resolver. Unlike lookup it
