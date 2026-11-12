@@ -101,13 +101,18 @@ func NewHealthServer(listen, sshHost string, sshPort int, d dialer, tracker *Con
 
 	h.srv.Handler = mux
 	h.srv.ErrorLog = stdlog.New(httpLogWriter{}, "", 0)
+	h.srv.ReadHeaderTimeout = 5 * time.Second
+	h.srv.ReadTimeout = 5 * time.Second
+	h.srv.WriteTimeout = 5 * time.Second
+	h.srv.IdleTimeout = 30 * time.Second
+	h.srv.MaxHeaderBytes = 64 << 10
 
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	h.ln = ln
+	h.ln = limitConns(ln, newConnLimiter(128))
 
 	return h, nil
 }
