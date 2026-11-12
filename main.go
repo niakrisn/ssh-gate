@@ -206,7 +206,7 @@ func startProxies(cfg config, tracker *ConnTracker, status *sdStatus) (*sshDiale
 	// One Opener per process: both proxy protocols share the route/resolve
 	// policy (direct via local DNS, tunnel via the tunnel resolvers) and the
 	// SSH dialer.
-	opener := &Opener{rules: rules, d: dialer, family: cfg.directIPFamily}
+	opener := &Opener{rules: rules, d: dialer, family: cfg.directIPFamily, dialTimeout: cfg.dialTimeout}
 
 	var servers []server
 

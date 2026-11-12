@@ -9,8 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 type Route int
@@ -122,25 +120,38 @@ func normalizeHost(host string) string {
 	return strings.TrimSuffix(strings.ToLower(host), ".")
 }
 
-func (e *RuleEngine) Decide(ctx context.Context, host string, port int) (Route, string) {
+// decideHost applies rules that need no DNS. CIDRs use the one prepared
+// tunnel-policy answer in matchCIDR.
+func (e *RuleEngine) decideHost(host string) (Route, string) {
 	host = normalizeHost(host)
 	// 1. RFC 1918 / loopback / link-local — always direct
 	if ip, err := netip.ParseAddr(host); err == nil && e.isPrivate(ip) {
-		log.Debug().Str("host", host).Int("port", port).Str("reason", "private").Msg("route")
 		return RouteDirect, "private"
 	}
 
 	// 2. Check direct rules
 	for _, r := range e.rules {
-		if r.matches(ctx, host, e.dns) {
-			log.Debug().Str("host", host).Int("port", port).Str("reason", "direct:"+r.raw).Msg("route")
+		if r.matchesHost(host) {
 			return RouteDirect, "direct:" + r.raw
 		}
 	}
 
 	// 3. Fallback: tunnel
-	log.Debug().Str("host", host).Int("port", port).Str("reason", "fallback").Msg("route")
 	return RouteTunnel, "fallback"
+}
+
+func (e *RuleEngine) matchCIDR(addrs []netip.Addr) string {
+	for _, r := range e.rules {
+		if r.ipPrefix == nil {
+			continue
+		}
+		for _, a := range addrs {
+			if r.ipPrefix.Contains(a) {
+				return "direct:" + r.raw
+			}
+		}
+	}
+	return ""
 }
 
 // ResolveAll resolves host through the engine's cached resolver,
@@ -194,28 +205,7 @@ func (e *RuleEngine) isPrivate(ip netip.Addr) bool {
 	return false
 }
 
-func (r ruleEntry) matches(ctx context.Context, host string, dns *dnsCache) bool {
-	if r.ipPrefix != nil {
-		// Resolve per the tunnel policy, not locally: the name is not yet
-		// known to be direct, and asking the local resolver here would show
-		// every destination name - the tunneled ones too - to the local
-		// network, and let a forged local answer inside the CIDR send
-		// traffic direct. The answer shares
-		// the cache entry the tunnel dial uses, so a tunneled name costs
-		// no extra lookup. Only a name that ends up direct is resolved
-		// locally again, by the direct dial. Split-horizon intranet names
-		// unknown to public DNS need a domain rule or localOnNXDomain.
-		addrs, err := dns.ResolveAll(ctx, host)
-		if err != nil {
-			return false
-		}
-		for _, a := range addrs {
-			if r.ipPrefix.Contains(a) {
-				return true
-			}
-		}
-		return false
-	}
+func (r ruleEntry) matchesHost(host string) bool {
 	if r.re != nil {
 		return r.re.MatchString(host)
 	}
@@ -246,7 +236,7 @@ func parseRuleEntry(raw string) (ruleEntry, error) {
 		return ruleEntry{raw: raw, re: re}, nil
 	}
 	// Match canonical against canonical: the request host is normalized by
-	// Decide, so the rule must be too - a mixed-case or root-dotted entry
+	// decideHost, so the rule must be too - a mixed-case or root-dotted entry
 	// means the same name to the operator. raw keeps the config spelling
 	// for logs.
 	domain := normalizeHost(strings.TrimPrefix(raw, "."))

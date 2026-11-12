@@ -70,7 +70,7 @@ line is `Stopping, draining connections`.
 | `SSH_HOST` | yes | — | VPS hostname or IPv4 address. The tunnel connects over IPv4 only: an IPv6 address is rejected at startup, a hostname needs an A record. Empty: the service runs not configured (see [Tunnel state](#tunnel-state)) |
 | `SSH_PORT` | no | `22` | SSH port |
 | `SSH_USER` | yes | — | SSH username |
-| `SSH_DIAL_TIMEOUT` | no | `30s` | Max duration of a single destination dial through the tunnel (Go duration, must be positive and below 10m — the connection history window). A dial to a blackholed host fails with a deadline error instead of hanging |
+| `SSH_DIAL_TIMEOUT` | no | `30s` | One total dial budget for all resolved destination addresses through the tunnel, after a separate resolve budget of up to 5s (Go duration, positive and below 10m). Previously applied separately to each IP. Direct connections share a 5s dial budget. An earlier caller deadline always wins |
 | `SSH_KEEPALIVE_PERIOD` | no | `10s` | Tunnel liveness period (Go duration): OS TCP keepalive idle period plus the SSH-layer `keepalive@openssh.com` probe interval that drops a stuck-but-TCP-alive transport (unanswered probe closes the tunnel within ~2 x period; the monitor reconnects). `0` disables both |
 | `SSH_KEEPALIVE_INTERVAL` | no | `1s` | Keepalive probe retransmission interval (Go duration, rounded to whole seconds). `0` keeps the kernel default |
 | `SSH_KEEPALIVE_PROBES` | no | `5` | Unanswered keepalive probes before the connection is declared dead. `0` keeps the kernel default. Worst-case silent-death detection = `PERIOD + INTERVAL x PROBES` (defaults: 15 s) |

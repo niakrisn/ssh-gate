@@ -389,14 +389,15 @@ func TestIPRuleMatchesViaDoH(t *testing.T) {
 		return []net.IPAddr{{IP: net.ParseIP("10.9.9.9")}}, nil
 	}
 
-	if route, reason := rules.Decide(context.Background(), "intranet.example", 443); route != RouteDirect || reason != "direct:ip:10.0.0.0/8" {
-		t.Fatalf("Decide(intranet.example) = %s (%s), want direct (direct:ip:10.0.0.0/8)", route, reason)
+	o := newTestOpener(rules, &fallbackDialer{})
+	if dst, err := o.prepare(context.Background(), "intranet.example", 443); err != nil || dst.route != RouteDirect || dst.reason != "direct:ip:10.0.0.0/8" {
+		t.Fatalf("prepare(intranet.example) = %+v, %v", dst, err)
 	}
-	if route, _ := rules.Decide(context.Background(), "public.example", 443); route != RouteTunnel {
-		t.Fatalf("Decide(public.example) = %s, want tunnel: the forged local answer must not count", route)
+	if dst, err := o.prepare(context.Background(), "public.example", 443); err != nil || dst.route != RouteTunnel {
+		t.Fatalf("prepare(public.example) = %+v, %v: forged local answer must not count", dst, err)
 	}
-	if n := local.Load(); n != 0 {
-		t.Fatalf("local lookups = %d, want 0: deciding a route must not leak names to local DNS", n)
+	if n := local.Load(); n != 1 {
+		t.Fatalf("local lookups = %d, want only the selected direct destination", n)
 	}
 }
 
@@ -420,7 +421,7 @@ func TestDomainRuleBeatsIPRuleOrder(t *testing.T) {
 			return nil, nil
 		}
 
-		route, reason := rules.Decide(context.Background(), "internal.local", 443)
+		route, reason := rules.decideHost("internal.local")
 		want := "direct:" + strings.Split(raw, ",")[1]
 		if route != RouteDirect || reason != want {
 			t.Fatalf("%q: Decide = (%s, %s), want (direct, %s)", raw, route, reason, want)
@@ -443,7 +444,7 @@ func TestHostNormalization(t *testing.T) {
 			t.Fatalf("NewRuleEngine: %v", err)
 		}
 		for _, host := range []string{"example.com", "EXAMPLE.COM", "example.com.", "Example.Com."} {
-			route, reason := rules.Decide(context.Background(), host, 443)
+			route, reason := rules.decideHost(host)
 			if route != RouteDirect || reason != "direct:example.com" {
 				t.Fatalf("Decide(%q) = %s (%s), want direct (direct:example.com)", host, route, reason)
 			}
@@ -489,14 +490,13 @@ func TestDomainRuleCaseInsensitive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
-	ctx := context.Background()
 	for _, tc := range []struct{ rule, host string }{
 		{"Example.COM.", "example.com"},
 		{"Example.COM.", "EXAMPLE.com"},
 		{"Example.COM.", "www.example.com"},
 		{"Other.Local", "other.local"},
 	} {
-		if got, _ := rules.Decide(ctx, tc.host, 443); got != RouteDirect {
+		if got, _ := rules.decideHost(tc.host); got != RouteDirect {
 			t.Errorf("Decide(%q) with rule %q = %v, want direct", tc.host, tc.rule, got)
 		}
 	}
@@ -529,12 +529,12 @@ func TestDecidePrivateLiterals(t *testing.T) {
 		"127.0.0.1", "::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.1.2.3",
 		"0.0.0.0", "::", "100.64.0.1", "fc00::1", "fd12:3456::1", "fe80::1%eth0", "::1",
 	} {
-		if route, reason := rules.Decide(context.Background(), host, 80); route != RouteDirect || reason != "private" {
+		if route, reason := rules.decideHost(host); route != RouteDirect || reason != "private" {
 			t.Errorf("Decide(%s) = %s (%s), want direct (private)", host, route, reason)
 		}
 	}
 	for _, host := range []string{"203.0.113.1", "2001:db8::1", "::ffff:203.0.113.1", "100.128.0.1"} {
-		if route, _ := rules.Decide(context.Background(), host, 80); route != RouteTunnel {
+		if route, _ := rules.decideHost(host); route != RouteTunnel {
 			t.Errorf("Decide(%s) = %s, want tunnel", host, route)
 		}
 	}

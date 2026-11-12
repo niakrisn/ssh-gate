@@ -46,7 +46,7 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 	}
 
 	s.srv = socks5.NewServer(
-		socks5.WithDialAndRequest(func(ctx context.Context, network, addr string, request *socks5.Request) (net.Conn, error) {
+		socks5.WithDialAndRequest(func(_ context.Context, network, addr string, request *socks5.Request) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, fmt.Errorf("invalid destination address %q: %w", addr, err)
@@ -72,13 +72,7 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 			info := connInfo{id: nextConnID(), proto: "socks5", src: src, host: host, port: portInt, family: s.opener.family}
 			log.Debug().Uint64("conn_id", info.id).Str("proto", "socks5").Str("src", src).Str("host", host).Int("port", portInt).Msg("request")
 
-			if rf, ok := ctx.Value(resolveFailureKey{}).(*resolveFailure); ok {
-				info.route, info.reason = rf.route, rf.reason
-				info.logFailure("resolve_error", rf.err)
-				return nil, errResolveFailed
-			}
-
-			ctx = client.ctx
+			ctx := client.ctx
 
 			start := time.Now()
 			upstream, dst, route, reason, err := s.opener.Open(ctx, src, "socks5", host, portInt)
@@ -86,6 +80,11 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 			info.dialMS = time.Since(start).Milliseconds()
 
 			if err != nil {
+				var dnsErr *DNSError
+				if errors.As(err, &dnsErr) {
+					info.logFailure("resolve_error", err)
+					return nil, errResolveFailed
+				}
 				info.logFailure("dial_error", err)
 				return nil, err
 			}
@@ -98,11 +97,8 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 				connInfo: info,
 			}, nil
 		}),
-		// FQDNs are resolved through the shared Opener (route policy: direct
-		// via local DNS, tunnel via the tunnel resolvers; cached, 5 s lookup
-		// timeout) instead of the library default, which is unbounded and
-		// uncached.
-		socks5.WithResolver(openerResolver{opener: s.opener}),
+		// Keep the original FQDN until Open owns route selection and DNS.
+		socks5.WithResolver(deferredResolver{}),
 		// The library default for ASSOCIATE dials the target with plain
 		// net.Dial (it never consults the dial-with-request or resolver
 		// hooks), i.e. a direct UDP relay that bypasses the route rules,
@@ -329,33 +325,10 @@ func (l *logConn) Close() error {
 // the library answers host unreachable, as for a failed Resolve.
 var errResolveFailed = errors.New("destination name not resolved")
 
-type resolveFailureKey struct{}
+// go-socks5 preserves the FQDN in AddrSpec.String when IP is nil. Every
+// CONNECT then reaches WithDialAndRequest; no library DNS or dial is used.
+type deferredResolver struct{}
 
-type resolveFailure struct {
-	route  Route
-	reason string
-	err    error
-}
-
-// openerResolver adapts the shared Opener's resolution to the go-socks5
-// NameResolver interface. The SOCKS5 handshake must return an IP before the
-// dial callback runs, so it resolves per the same route policy Open applies:
-// direct hosts through the local resolver, tunnel hosts through the tunnel
-// resolvers.
-type openerResolver struct {
-	opener *Opener
-}
-
-func (r openerResolver) Resolve(ctx context.Context, host string) (context.Context, net.IP, error) {
-	// Rules do not depend on the port; the interface only carries the name.
-	ip, route, reason, err := r.opener.Resolve(ctx, host, 0)
-	if err != nil {
-		// Not returned to the library: it would answer the client and drop
-		// the request before the dial callback, the only place that knows
-		// the client address, so the failure would miss the access log.
-		// The callback reports it and fails with errResolveFailed.
-		rf := &resolveFailure{route: route, reason: reason, err: err}
-		return context.WithValue(ctx, resolveFailureKey{}, rf), net.IPv4zero, nil
-	}
-	return ctx, ip, nil
+func (deferredResolver) Resolve(ctx context.Context, _ string) (context.Context, net.IP, error) {
+	return ctx, nil, nil
 }

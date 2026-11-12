@@ -193,7 +193,8 @@ func TestLocalPrivateRoute(t *testing.T) {
 			rules.dns.localLookup = local(c.answer...)
 			o := &Opener{rules: rules, d: &fallbackDialer{}, family: c.family}
 
-			addrs, route, reason, err := o.candidates(context.Background(), "intranet.example", 443)
+			dst, err := o.prepare(context.Background(), "intranet.example", 443)
+			addrs, route, reason := dst.addrs, dst.route, dst.reason
 			if c.want == nil {
 				if err == nil {
 					t.Fatalf("candidates = %v, want refusal", addrs)
@@ -225,8 +226,8 @@ func TestPrivateFromTunnelResolverRefused(t *testing.T) {
 	rules, _ := tunnelServers(t, &channelDialer{}, f.addr)
 	rules.dns.localOnNXDomain = true
 	o := &Opener{rules: rules, d: &fallbackDialer{}, family: FamilyBoth}
-	if addrs, _, _, err := o.candidates(context.Background(), "rebind.example", 443); err == nil {
-		t.Fatalf("candidates = %v, want refusal", addrs)
+	if dst, err := o.prepare(context.Background(), "rebind.example", 443); err == nil {
+		t.Fatalf("prepare = %+v, want refusal", dst)
 	}
 }
 
@@ -277,8 +278,7 @@ func localPrivateAddr(t *testing.T) netip.Addr {
 	return netip.Addr{}
 }
 
-// TestSOCKS5LocalPrivate runs the whole SOCKS5 path, which resolves twice:
-// on the handshake and in Open. Both must agree on the route.
+// TestSOCKS5LocalPrivate runs the whole SOCKS5 route through one Open.
 func TestSOCKS5LocalPrivate(t *testing.T) {
 	nx := func(string) (byte, netip.Addr) { return 3, netip.Addr{} }
 	servfail := func(string) (byte, netip.Addr) { return 2, netip.Addr{} }
@@ -329,7 +329,7 @@ func TestSOCKS5LocalPrivate(t *testing.T) {
 		if got := stub.dialed(); len(got) != 0 {
 			t.Fatalf("tunnel dials = %v, want none", got)
 		}
-		// The second resolve is a cache hit: one tunnel not-found, one local answer.
+		// One tunnel not-found and one local answer prepare this request.
 		if rules.dns.lookups.Load() != 1 || local.Load() != 1 {
 			t.Fatalf("lookups = %d, local calls = %d, want 1 and 1", rules.dns.lookups.Load(), local.Load())
 		}

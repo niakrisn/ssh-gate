@@ -629,15 +629,16 @@ func TestIPRuleMatchesLocalAnswerOnNXDomain(t *testing.T) {
 	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("198.51.100.1")}}, nil
 	}
-	if route, _ := rules.Decide(context.Background(), "intranet.example", 443); route != RouteTunnel {
-		t.Fatalf("setting off: Decide = %s, want tunnel", route)
+	o := newTestOpener(rules, &fallbackDialer{})
+	if dst, err := o.prepare(context.Background(), "intranet.example", 443); dst.route != RouteTunnel || !errors.Is(err, errNotFound) {
+		t.Fatalf("setting off: prepare = %+v, %v", dst, err)
 	}
 	rules.dns.mu.Lock()
 	clear(rules.dns.cache)
 	rules.dns.mu.Unlock()
 	rules.dns.localOnNXDomain = true
-	if route, reason := rules.Decide(context.Background(), "intranet.example", 443); route != RouteDirect || reason != "direct:ip:198.51.100.0/24" {
-		t.Fatalf("setting on: Decide = (%s, %s)", route, reason)
+	if dst, err := o.prepare(context.Background(), "intranet.example", 443); err != nil || dst.route != RouteDirect || dst.reason != "direct:ip:198.51.100.0/24" {
+		t.Fatalf("setting on: prepare = %+v, %v", dst, err)
 	}
 }
 
@@ -681,8 +682,8 @@ func TestIPRuleUsesLocalFallback(t *testing.T) {
 	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("10.1.2.3")}}, nil
 	}
-	if route, _ := rules.Decide(context.Background(), "intranet.example", 443); route != RouteDirect {
-		t.Fatalf("Decide(intranet.example) = %s, want direct", route)
+	if dst, err := newTestOpener(rules, &fallbackDialer{}).prepare(context.Background(), "intranet.example", 443); err != nil || dst.route != RouteDirect {
+		t.Fatalf("prepare(intranet.example) = %+v, %v", dst, err)
 	}
 }
 
