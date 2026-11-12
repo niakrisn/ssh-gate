@@ -208,6 +208,77 @@ func TestConnTrackerRingEviction(t *testing.T) {
 	}
 }
 
+func TestConnTrackerHistoryReleasesLive(t *testing.T) {
+	for _, readErr := range []error{nil, errors.New("connection reset")} {
+		name := "closed"
+		if readErr != nil {
+			name = "error"
+		}
+		t.Run(name, func(t *testing.T) {
+			tr := NewConnTracker(3, time.Minute)
+			id := tr.Begin(ConnMeta{Proto: "http"}, "example.org", 443)
+			conn := tr.Done(id, &fakeHalfCloseConn{readErr: readErr})
+			conn.Write([]byte("request"))
+			conn.Read(make([]byte, 8))
+			active, _, err := tr.List("active", "", "", 1, 50)
+			if err != nil || len(active) != 1 || active[0].BytesUp != 7 {
+				t.Fatalf("active counters: %v, %v", active, err)
+			}
+			conn.Close()
+			conn.Close()
+			views, total, err := tr.List("history", "", "", 1, 50)
+			if err != nil || total != 1 || views[0].BytesUp != 7 || views[0].ID != id {
+				t.Fatalf("history snapshot: %v, total=%d err=%v", views, total, err)
+			}
+			if readErr != nil && (views[0].Status != StateError || views[0].Reason != readErr.Error()) {
+				t.Fatalf("lost error metadata: %+v", views[0])
+			}
+			tr.mu.Lock()
+			defer tr.mu.Unlock()
+			for _, rec := range tr.ring {
+				if rec.live != nil {
+					t.Fatalf("history retains connection %d", rec.id)
+				}
+			}
+		})
+	}
+}
+
+func TestConnTrackerPruneClearsSlots(t *testing.T) {
+	tr := NewConnTracker(3, time.Minute)
+	for range 5 {
+		id := tr.Begin(ConnMeta{Proto: "http", Src: "client"}, "example.org", 443)
+		tr.Fail(id, errors.New("failed destination"))
+	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	now := time.Now()
+	var expired []int
+	for i := range 2 {
+		idx := (tr.ringHead + i) % tr.capacity
+		tr.ring[idx].closedAt = now.Add(-2 * time.Minute)
+		expired = append(expired, idx)
+	}
+	tr.pruneRing(now)
+	if tr.ringCount != 1 {
+		t.Fatalf("remaining records = %d, want 1", tr.ringCount)
+	}
+	for _, idx := range expired {
+		if tr.ring[idx] != (connRecord{}) {
+			t.Fatalf("expired slot %d retains metadata: %+v", idx, tr.ring[idx])
+		}
+	}
+	tr.pruneRing(now.Add(2 * time.Minute))
+	if tr.ringCount != 0 {
+		t.Fatalf("remaining records = %d, want 0", tr.ringCount)
+	}
+	for i, rec := range tr.ring {
+		if rec != (connRecord{}) {
+			t.Fatalf("empty ring retains slot %d: %+v", i, rec)
+		}
+	}
+}
+
 func TestConnTrackerPruneByAge(t *testing.T) {
 	tr := NewConnTracker(8, 30*time.Millisecond)
 	id := tr.Begin(ConnMeta{}, "h", 1)

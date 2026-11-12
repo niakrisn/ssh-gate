@@ -238,7 +238,8 @@ func (t *ConnTracker) List(tab, q, proto string, page, pageSize int) ([]ConnView
 	return views, total, nil
 }
 
-// pushRing appends a record to the ring buffer, overwriting the oldest.
+// pushRing appends metadata only, overwriting the oldest record. History
+// must never retain a connection and its underlying channel buffers.
 // Call with mu held.
 func (t *ConnTracker) pushRing(rec *connRecord) {
 	t.pruneRing(time.Now())
@@ -249,6 +250,7 @@ func (t *ConnTracker) pushRing(rec *connRecord) {
 	} else {
 		t.ringCount++
 	}
+	rec.live = nil
 	t.ring[idx] = *rec
 }
 
@@ -260,6 +262,7 @@ func (t *ConnTracker) pruneRing(now time.Time) {
 		if now.Sub(oldest.closedAt) <= t.maxAge {
 			break
 		}
+		t.ring[t.ringHead] = connRecord{}
 		t.ringHead = (t.ringHead + 1) % t.capacity
 		t.ringCount--
 	}
