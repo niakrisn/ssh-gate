@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -88,9 +89,10 @@ type dnsCache struct {
 	workers     sync.WaitGroup
 	// lookups counts real resolver queries (cache hits and IP literals
 	// excluded); tests use it to assert caching without timing tricks.
-	lookups   atomic.Int64
-	dohHost   string
-	dohClient *http.Client
+	lookups            atomic.Int64
+	dohHost            string
+	dohClient          *http.Client
+	lastPartialWarning atomic.Int64
 	// tunnel holds the resolvers reached through the SSH tunnel, tried in
 	// order.
 	tunnel []*upstream
@@ -624,6 +626,10 @@ func dohJSONQuery(ctx context.Context, client *http.Client, endpoint, host strin
 	if resp.StatusCode != http.StatusOK {
 		return nil, dohHTTPStatus(resp.StatusCode)
 	}
+	media, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || media != "application/dns-json" && media != "application/json" {
+		return nil, errors.New("doh: expected JSON media type")
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, dohMaxResponse+1))
 	if err != nil {
 		return nil, err
@@ -638,26 +644,30 @@ func dohJSONQuery(ctx context.Context, client *http.Client, endpoint, host strin
 	if d.Status == nil {
 		return nil, errors.New("doh: JSON response has no Status")
 	}
-	if *d.Status == 3 { // NXDOMAIN
-		return nil, errNotFound
+	if *d.Status < 0 || *d.Status > 15 {
+		return nil, errors.New("doh: invalid JSON DNS status")
 	}
 	if *d.Status != 0 {
-		return nil, fmt.Errorf("doh: JSON DNS status %d", *d.Status)
+		return nil, fmt.Errorf("doh: JSON %w", dnsRCodeError(*d.Status))
 	}
 	var out []netip.Addr
 	for _, a := range d.Answer {
 		if a.Type != q.want {
 			continue
 		}
-		if ip, perr := netip.ParseAddr(a.Data); perr == nil {
-			out = append(out, ip.Unmap())
+		ip, err := netip.ParseAddr(a.Data)
+		if err != nil || ip.Zone() != "" || q.want == 1 && !ip.Is4() || q.want == 28 && !ip.Is6() {
+			return nil, fmt.Errorf("doh: invalid JSON %s address %q", q.name, a.Data)
 		}
+		out = append(out, ip.Unmap())
 	}
 	return out, nil
 }
 
-// dohLookup selects a format for this lookup using the first A query.
-func (c *dnsCache) dohLookup(ctx context.Context, host string) ([]netip.Addr, time.Time, error) {
+// dohLookup selects a format for this lookup using only its first wire A.
+func (c *dnsCache) dohLookup(ctx context.Context, host string) (addrs []netip.Addr, validUntil time.Time, err error) {
+	ctx, cancel := context.WithTimeout(ctx, tunnelLookupTimeout)
+	defer cancel()
 	a, err := newDoHWireQuestion(host, dnsmessage.TypeA)
 	if err != nil {
 		return nil, time.Time{}, err
@@ -667,54 +677,76 @@ func (c *dnsCache) dohLookup(ctx context.Context, host string) ([]netip.Addr, ti
 		return nil, time.Time{}, err
 	}
 	var connected atomic.Bool
-	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
-	})
-	first, err := dohWireQuery(ctx, c.dohClient, c.dohHost, a)
-	if status, ok := err.(dohHTTPStatus); ok && ctx.Err() == nil {
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) { connected.Store(true) }})
+	defer func() {
+		if err != nil && !connected.Load() && !errors.Is(err, errNotFound) {
+			err = fmt.Errorf("%w: %w", errUnreachable, err)
+		}
+	}()
+	first := firstDoHFamily(ctx, func(ctx context.Context) (dnsAnswer, error) { return dohWireQuery(ctx, c.dohClient, c.dohHost, a) })
+	if status, ok := first.err.(dohHTTPStatus); ok && ctx.Err() == nil {
 		switch status {
 		case http.StatusBadRequest, http.StatusNotAcceptable, http.StatusUnsupportedMediaType:
-			addrs, jsonErr := c.lookupDoHJSON(ctx, host)
-			if jsonErr != nil && !errors.Is(jsonErr, errNotFound) {
-				jsonErr = fmt.Errorf("%v, JSON retry: %w", status, jsonErr)
+			addrs, validUntil, err = c.lookupDoHJSON(ctx, host)
+			if err != nil && !errors.Is(err, errNotFound) {
+				err = fmt.Errorf("%v, JSON retry: %w", status, err)
 			}
-			return addrs, time.Time{}, jsonErr
+			return addrs, validUntil, err
 		}
 	}
-	if err != nil {
-		if !connected.Load() && !errors.Is(err, errNotFound) {
-			err = fmt.Errorf("%w: %v", errUnreachable, err)
-		}
-		return nil, first.validUntil, err
-	}
-	second, err := dohWireQuery(ctx, c.dohClient, c.dohHost, aaaa)
-	if err != nil {
-		return nil, second.validUntil, err
-	}
-	validUntil := first.validUntil
-	if second.validUntil.Before(validUntil) {
-		validUntil = second.validUntil
-	}
-	addrs := append(first.addrs, second.addrs...)
-	if len(addrs) == 0 {
-		return nil, validUntil, errNotFound
-	}
-	return addrs, validUntil, nil
+	answer, err := c.completeDoHFamilies(ctx, host, first, func(ctx context.Context) (dnsAnswer, error) { return dohWireQuery(ctx, c.dohClient, c.dohHost, aaaa) })
+	return answer.addrs, answer.validUntil, err
 }
 
-func (c *dnsCache) lookupDoHJSON(ctx context.Context, host string) ([]netip.Addr, error) {
-	var out []netip.Addr
-	for _, q := range [2]dohQuery{dohQueryA, dohQueryAAAA} {
+// A gets half the remaining budget, so a temporary failure leaves time for
+// AAAA. This is repeated after a permitted format switch, not a fresh budget.
+func firstDoHFamily(ctx context.Context, query func(context.Context) (dnsAnswer, error)) dnsFamilyResult {
+	deadline, _ := ctx.Deadline()
+	first, cancel := context.WithTimeout(ctx, time.Until(deadline)/2)
+	defer cancel()
+	answer, err := query(first)
+	return dnsFamilyResult{answer, err}
+}
+
+func (c *dnsCache) completeDoHFamilies(ctx context.Context, host string, first dnsFamilyResult, querySecond func(context.Context) (dnsAnswer, error)) (dnsAnswer, error) {
+	if err := ctx.Err(); err != nil {
+		return dnsAnswer{}, err
+	}
+	// NXDOMAIN and protocol/trust failures are final; only a temporary
+	// failure or NODATA leaves the second family useful.
+	if first.err != nil && !temporaryDNSFailure(first.err) {
+		return first.answer, first.err
+	}
+	secondCtx := ctx
+	if len(first.answer.addrs) > 0 {
+		var cancel context.CancelFunc
+		secondCtx, cancel = context.WithTimeout(ctx, 250*time.Millisecond)
+		defer cancel()
+	}
+	answer, err := querySecond(secondCtx)
+	second := dnsFamilyResult{answer, err}
+	if err := ctx.Err(); err != nil {
+		return dnsAnswer{}, err
+	}
+	answer, err = combineDNSFamilies(first, second, time.Now())
+	if err == nil && (first.err != nil || second.err != nil) {
+		warnDNSPartial(&c.lastPartialWarning, c.dohHost, host, errors.Join(first.err, second.err))
+	}
+	return answer, err
+}
+
+func (c *dnsCache) lookupDoHJSON(ctx context.Context, host string) ([]netip.Addr, time.Time, error) {
+	query := func(ctx context.Context, q dohQuery) (dnsAnswer, error) {
 		addrs, err := dohJSONQuery(ctx, c.dohClient, c.dohHost, host, q)
-		if err != nil {
-			return nil, err
+		ttl := dnsCacheTTL
+		if errors.Is(err, errNotFound) {
+			ttl = dnsNegativeTTL
 		}
-		out = append(out, addrs...)
+		return dnsAnswer{addrs: addrs, validUntil: time.Now().Add(ttl)}, err
 	}
-	if len(out) == 0 {
-		return nil, errNotFound
-	}
-	return out, nil
+	first := firstDoHFamily(ctx, func(ctx context.Context) (dnsAnswer, error) { return query(ctx, dohQueryA) })
+	answer, err := c.completeDoHFamilies(ctx, host, first, func(ctx context.Context) (dnsAnswer, error) { return query(ctx, dohQueryAAAA) })
+	return answer.addrs, answer.validUntil, err
 }
 
 // dnsServerLookup returns a lookup that asks one DNS server over TCP through

@@ -354,15 +354,15 @@ func TestDoHFormatSelection(t *testing.T) {
 		{name: "retry 406", steps: []step{{format: "wire", qtype: "A", status: 406}, jsonStepA, jsonStepAAAA}},
 		{name: "retry 415", steps: []step{{format: "wire", qtype: "A", status: 415}, jsonStepA, jsonStepAAAA}},
 		{name: "nxdomain", steps: []step{{format: "wire", qtype: "A", rcode: dnsmessage.RCodeNameError}}, nx: true},
-		{name: "servfail", steps: []step{{format: "wire", qtype: "A", rcode: dnsmessage.RCodeServerFailure}}, failed: dnsmessage.RCodeServerFailure.String()},
-		{name: "refused", steps: []step{{format: "wire", qtype: "A", rcode: dnsmessage.RCodeRefused}}, failed: dnsmessage.RCodeRefused.String()},
-		{name: "rate limit", steps: []step{{format: "wire", qtype: "A", status: 429}}, failed: "HTTP status 429"},
-		{name: "http error", steps: []step{{format: "wire", qtype: "A", status: 503}}, failed: "HTTP status 503"},
+		{name: "servfail", steps: []step{{format: "wire", qtype: "A", rcode: dnsmessage.RCodeServerFailure}, {format: "wire", qtype: "AAAA", rcode: dnsmessage.RCodeServerFailure}}, failed: dnsmessage.RCodeServerFailure.String()},
+		{name: "refused", steps: []step{{format: "wire", qtype: "A", rcode: dnsmessage.RCodeRefused}, {format: "wire", qtype: "AAAA", rcode: dnsmessage.RCodeRefused}}, failed: dnsmessage.RCodeRefused.String()},
+		{name: "rate limit", steps: []step{{format: "wire", qtype: "A", status: 429}, {format: "wire", qtype: "AAAA", status: 429}}, failed: "HTTP status 429"},
+		{name: "http error", steps: []step{{format: "wire", qtype: "A", status: 503}, {format: "wire", qtype: "AAAA", status: 503}}, failed: "HTTP status 503"},
 		{name: "bad DNS body", steps: []step{{format: "wire", qtype: "A", body: "broken"}}, failed: "invalid DNS response"},
 		{name: "blocked redirect", steps: []step{{format: "wire", qtype: "A", redirect: true}}, failed: "redirect must use HTTPS"},
 		{name: "JSON response to wire query", steps: []step{{format: "wire", qtype: "A", json: jsonA}}, failed: "expected application/dns-message"},
 		{name: "AAAA rejects wire", steps: []step{wireA, {format: "wire", qtype: "AAAA", status: 400}}, failed: "HTTP status 400"},
-		{name: "JSON HTTP error is not nxdomain", steps: []step{rejectWire, {format: "json", qtype: "A", status: 502, json: `{"Status":3}`}}, failed: "HTTP status 400, JSON retry: doh: HTTP status 502"},
+		{name: "JSON HTTP error is not nxdomain", steps: []step{rejectWire, {format: "json", qtype: "A", status: 502, json: `{"Status":3}`}, {format: "json", qtype: "AAAA", status: 502, json: `{"Status":3}`}}, failed: "HTTP status 400, JSON retry: doh: HTTP status 502"},
 		{name: "JSON status missing", steps: []step{rejectWire, {format: "json", qtype: "A", json: "{}"}}, failed: "HTTP status 400, JSON retry:"},
 		{name: "JSON nxdomain", steps: []step{rejectWire, {format: "json", qtype: "A", json: `{"Status":3}`}}, nx: true},
 	} {
@@ -480,22 +480,32 @@ func TestDoHFormatSelectionDeadline(t *testing.T) {
 	rules.SetDOH("dns.example", testDialer{})
 	cache := rules.dns
 	var calls, localCalls int
-	var firstDeadline time.Time
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	overall, _ := ctx.Deadline()
 	cache.dohClient.Transport = doHRoundTripper(func(r *http.Request) (*http.Response, error) {
 		calls++
 		deadline, ok := r.Context().Deadline()
 		switch calls {
 		case 1:
-			firstDeadline = deadline
+			if !ok || deadline.After(time.Now().Add(time.Until(overall)/2)) {
+				t.Errorf("first A consumed more than half the remaining budget: %v", deadline)
+			}
 			if !ok || r.Header.Get("Accept") != dohWireMediaType {
 				t.Errorf("first request: deadline present=%t, Accept=%s", ok, r.Header.Get("Accept"))
 			}
 			return &http.Response{StatusCode: 406, Body: io.NopCloser(strings.NewReader(""))}, nil
 		case 2:
-			if !ok || !deadline.Equal(firstDeadline) || r.URL.Query().Get("type") != "A" ||
+			if !ok || deadline.After(time.Now().Add(time.Until(overall)/2)) || r.URL.Query().Get("type") != "A" ||
 				r.Header.Get("Accept") != "application/dns-json" {
-				t.Errorf("unexpected retry: deadline=%v (first %v), request=%v", deadline, firstDeadline, r.URL)
+				t.Errorf("unexpected retry: deadline=%v (overall %v), request=%v", deadline, overall, r.URL)
 				return nil, errors.New("unexpected retry")
+			}
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		case 3:
+			if !ok || !deadline.Equal(overall) || r.URL.Query().Get("type") != "AAAA" {
+				t.Errorf("AAAA renewed deadline or changed format: %v %v", deadline, r.URL)
 			}
 			<-r.Context().Done()
 			return nil, r.Context().Err()
@@ -508,12 +518,9 @@ func TestDoHFormatSelectionDeadline(t *testing.T) {
 		localCalls++
 		return []net.IPAddr{{IP: net.IPv4(192, 0, 2, 9)}}, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
 	result, err := cache.lookup(ctx, "deadline.example")
 	server := rules.DNSStatus().Servers[0]
-	if err != nil || len(result.addrs) != 1 || result.authoritative || calls != 2 || localCalls != 1 ||
+	if err != nil || len(result.addrs) != 1 || result.authoritative || calls != 3 || localCalls != 1 ||
 		server.Fail != 1 || !strings.Contains(server.Error, context.DeadlineExceeded.Error()) {
 		t.Fatalf("lookup = (%+v, %v), requests=%d, local calls=%d, status=%+v", result, err, calls, localCalls, server)
 	}

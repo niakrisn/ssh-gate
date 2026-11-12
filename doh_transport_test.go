@@ -104,8 +104,9 @@ func startSilentTLSPeer(t *testing.T, count int) (string, <-chan struct{}, <-cha
 
 func TestDoHTLSHandshakeBounded(t *testing.T) {
 	const count = 3
-	// Detached TLS dials must finish within their own handshake deadline.
-	const channels = count
+	// A temporary A failure now also tries AAAA; both detached TLS dials
+	// must finish within their own handshake deadline.
+	const channels = 2 * count
 	target, hellos, closed := startSilentTLSPeer(t, channels)
 	f := startForwardingSSH(t, target)
 	rules, err := NewRuleEngine("")
