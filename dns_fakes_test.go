@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -139,45 +138,43 @@ func (f *fakeDNSServer) serve(conn net.Conn, reply func(string) (byte, netip.Add
 		io.Copy(io.Discard, conn)
 		return
 	}
-	var size [2]byte
-	if _, err := io.ReadFull(conn, size[:]); err != nil {
-		return
+	for {
+		msg, err := readTCPDNSQuery(conn)
+		if err != nil {
+			return
+		}
+		q := msg.Questions[0]
+		name := q.Name.String()
+		f.mu.Lock()
+		f.names = append(f.names, name)
+		f.mu.Unlock()
+		rcode, addr := reply(name)
+		if rcode == silentRcode {
+			io.Copy(io.Discard, conn)
+			return
+		}
+		msg.Response = true
+		msg.RecursionAvailable = true
+		msg.RCode = dnsmessage.RCode(rcode)
+		msg.Answers = nil
+		msg.Authorities = nil
+		if rcode == 0 && addr.IsValid() {
+			switch {
+			case addr.Is4() && q.Type == dnsmessage.TypeA:
+				msg.Answers = []dnsmessage.Resource{doHRecord(name, 30, &dnsmessage.AResource{A: addr.As4()})}
+			case addr.Is6() && q.Type == dnsmessage.TypeAAAA:
+				msg.Answers = []dnsmessage.Resource{doHRecord(name, 30, &dnsmessage.AAAAResource{AAAA: addr.As16()})}
+			}
+		}
+		if len(msg.Answers) == 0 && (rcode == 0 || rcode == 3) {
+			// Existing cache tests model an authoritative, cacheable negative.
+			// Missing SOA and zero TTL have separate TCP regression cases.
+			msg.Authorities = []dnsmessage.Resource{doHSOA(".", 10, 10)}
+		}
+		if err := writeTCPDNSAnswer(conn, msg); err != nil {
+			return
+		}
 	}
-	query := make([]byte, binary.BigEndian.Uint16(size[:]))
-	if _, err := io.ReadFull(conn, query); err != nil {
-		return
-	}
-	name, off := "", 12
-	for query[off] != 0 {
-		n := int(query[off])
-		name += string(query[off+1:off+1+n]) + "."
-		off += n + 1
-	}
-	off++
-	qtype := binary.BigEndian.Uint16(query[off:])
-	f.mu.Lock()
-	f.names = append(f.names, name)
-	f.mu.Unlock()
-
-	rcode, addr := reply(name)
-	if rcode == silentRcode {
-		io.Copy(io.Discard, conn)
-		return
-	}
-	resp := append([]byte(nil), query[:off+4]...)
-	resp[2], resp[3] = 0x81, 0x80|rcode
-	binary.BigEndian.PutUint16(resp[6:], 0)
-	binary.BigEndian.PutUint16(resp[8:], 0)
-	binary.BigEndian.PutUint16(resp[10:], 0)
-	if addr.IsValid() && (addr.Is4() && qtype == 1 || addr.Is6() && qtype == 28) {
-		binary.BigEndian.PutUint16(resp[6:], 1)
-		resp = append(resp, 0xc0, 12)
-		resp = binary.BigEndian.AppendUint16(resp, qtype)
-		resp = append(resp, 0, 1, 0, 0, 0, 30)
-		resp = binary.BigEndian.AppendUint16(resp, uint16(addr.BitLen()/8))
-		resp = append(resp, addr.AsSlice()...)
-	}
-	conn.Write(append(binary.BigEndian.AppendUint16(nil, uint16(len(resp))), resp...))
 }
 
 // losableDialer dials a fixed target and can drop all its connections at once,

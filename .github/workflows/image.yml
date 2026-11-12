@@ -31,6 +31,13 @@ jobs:
       - name: test
         run: go test -race -count=1 ./...
 
+      - name: tunnel DNS ignores hosts
+        run: |
+          docker run --rm --add-host hosts-conflict.example:127.0.0.9 \
+            -e GOTOOLCHAIN=go1.26.11 -e TMPDIR=/tmp -e SSH_GATE_TEST_HOSTS_FIXTURE=1 \
+            -v "$PWD:/src:ro" -w /src golang:1.26.11-bookworm \
+            go test -race -count=1 -run '^TestDNSTCPIgnoresHosts$' .
+
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 

@@ -97,12 +97,12 @@ func TestDNSServerLookup(t *testing.T) {
 
 	t.Run("A and AAAA", func(t *testing.T) {
 		f := startFakeDNSServer(t, func(string) (byte, netip.Addr) { return 0, v4 })
-		addrs, err := dnsServerLookup(d, f.addr)(context.Background(), "example.org")
+		addrs, _, err := dnsServerLookup(d, f.addr)(context.Background(), "example.org")
 		if err != nil || len(addrs) != 1 || addrs[0] != v4 {
 			t.Fatalf("A: (%v, %v)", addrs, err)
 		}
 		f = startFakeDNSServer(t, func(string) (byte, netip.Addr) { return 0, v6 })
-		addrs, err = dnsServerLookup(d, f.addr)(context.Background(), "example.org")
+		addrs, _, err = dnsServerLookup(d, f.addr)(context.Background(), "example.org")
 		if err != nil || len(addrs) != 1 || addrs[0] != v6 {
 			t.Fatalf("AAAA: (%v, %v)", addrs, err)
 		}
@@ -111,7 +111,7 @@ func TestDNSServerLookup(t *testing.T) {
 	t.Run("NXDOMAIN and an empty answer are not found", func(t *testing.T) {
 		for _, rcode := range []byte{3, 0} {
 			f := startFakeDNSServer(t, func(string) (byte, netip.Addr) { return rcode, netip.Addr{} })
-			if _, err := dnsServerLookup(d, f.addr)(context.Background(), "example.org"); !errors.Is(err, errNotFound) {
+			if _, _, err := dnsServerLookup(d, f.addr)(context.Background(), "example.org"); !errors.Is(err, errNotFound) {
 				t.Fatalf("rcode %d: err = %v, want errNotFound", rcode, err)
 			}
 		}
@@ -119,7 +119,7 @@ func TestDNSServerLookup(t *testing.T) {
 
 	t.Run("SERVFAIL is a failure without the local server name", func(t *testing.T) {
 		f := startFakeDNSServer(t, func(string) (byte, netip.Addr) { return 2, netip.Addr{} })
-		_, err := dnsServerLookup(d, f.addr)(context.Background(), "example.org")
+		_, _, err := dnsServerLookup(d, f.addr)(context.Background(), "example.org")
 		if err == nil || errors.Is(err, errNotFound) {
 			t.Fatalf("err = %v, want a failure", err)
 		}
@@ -132,7 +132,7 @@ func TestDNSServerLookup(t *testing.T) {
 		f := startFakeDNSServer(t, func(string) (byte, netip.Addr) { return 0, v4 })
 		lookup := dnsServerLookup(d, f.addr)
 		for _, name := range []string{"singlelabel", "localhost"} {
-			addrs, err := lookup(context.Background(), name)
+			addrs, _, err := lookup(context.Background(), name)
 			if err != nil || len(addrs) != 1 || addrs[0] != v4 {
 				t.Fatalf("%s: (%v, %v)", name, addrs, err)
 			}
@@ -154,7 +154,7 @@ func TestDNSServerSilentLeavesNoChannels(t *testing.T) {
 	lookup := dnsServerLookup(d, f.addr)
 	for i := range 20 {
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		if _, err := lookup(ctx, "n"+strconv.Itoa(i)+".example.org"); err == nil || errors.Is(err, errNotFound) {
+		if _, _, err := lookup(ctx, "n"+strconv.Itoa(i)+".example.org"); err == nil || errors.Is(err, errNotFound) {
 			t.Fatalf("lookup %d: err = %v, want a timeout", i, err)
 		}
 		cancel()

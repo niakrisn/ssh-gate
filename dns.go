@@ -67,11 +67,7 @@ func (e *RuleEngine) SetTunnelDNS(servers []string, d dialer) {
 		if host, port, err := net.SplitHostPort(server); err == nil && port == "53" {
 			name = host
 		}
-		lookup := dnsServerLookup(d, server)
-		e.dns.tunnel = append(e.dns.tunnel, &upstream{name: name, lookup: func(ctx context.Context, host string) ([]netip.Addr, time.Time, error) {
-			addrs, err := lookup(ctx, host)
-			return addrs, time.Time{}, err
-		}})
+		e.dns.tunnel = append(e.dns.tunnel, &upstream{name: name, lookup: dnsServerLookup(d, server)})
 	}
 	e.dns.tunnelUp = d.Connected
 }
@@ -747,43 +743,4 @@ func (c *dnsCache) lookupDoHJSON(ctx context.Context, host string) ([]netip.Addr
 	first := firstDoHFamily(ctx, func(ctx context.Context) (dnsAnswer, error) { return query(ctx, dohQueryA) })
 	answer, err := c.completeDoHFamilies(ctx, host, first, func(ctx context.Context) (dnsAnswer, error) { return query(ctx, dohQueryAAAA) })
 	return answer.addrs, answer.validUntil, err
-}
-
-// dnsServerLookup returns a lookup that asks one DNS server over TCP through
-// the SSH tunnel. The Go resolver gets host as a rooted name, so the search
-// domains and /etc/hosts of this machine stay out of it, and it picks TCP
-// framing by itself: an SSH channel is no PacketConn. An SSH channel has no
-// deadlines either and the resolver ignores that error, so the channel is
-// closed with the context; otherwise a silent server would keep it and its
-// reader goroutine forever.
-func dnsServerLookup(d dialer, server string) func(context.Context, string) ([]netip.Addr, error) {
-	return func(ctx context.Context, host string) ([]netip.Addr, error) {
-		var opened atomic.Bool
-		r := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			conn, err := d.DialContext(ctxWithNoTrack(ctx), "tcp", server)
-			if err != nil {
-				return nil, err
-			}
-			opened.Store(true)
-			context.AfterFunc(ctx, func() { conn.Close() })
-			return conn, nil
-		}}
-		addrs, err := r.LookupIPAddr(ctx, host+".")
-		if err != nil {
-			var dnsErr *net.DNSError
-			if !errors.As(err, &dnsErr) {
-				return nil, err
-			}
-			if dnsErr.IsNotFound {
-				return nil, errNotFound
-			}
-			// Not dnsErr.Error(): it names the server from the local
-			// resolv.conf, which this query never went to.
-			if !opened.Load() {
-				return nil, fmt.Errorf("%w: %s", errUnreachable, dnsErr.Err)
-			}
-			return nil, errors.New(dnsErr.Err)
-		}
-		return toNetip(addrs), nil
-	}
 }
