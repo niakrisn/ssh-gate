@@ -24,12 +24,8 @@ type SOCKS5Server struct {
 	ln        net.Listener
 	shutCh    chan struct{}
 	closeOnce sync.Once
-	conns     sync.WaitGroup // CONNECT relays: one logConn per dial
+	clients   *clientRegistry
 	opener    *Opener
-	// handshakes maps the client address of a connection still in the
-	// SOCKS5 handshake to its conn, so the dial callback (which only gets
-	// the request) can lift the handshake deadline.
-	handshakes sync.Map
 	// handshakeTimeout is socks5HandshakeTimeout at construction.
 	handshakeTimeout time.Duration
 }
@@ -45,6 +41,7 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 	s := &SOCKS5Server{
 		shutCh:           make(chan struct{}),
 		opener:           opener,
+		clients:          newClientRegistry(),
 		handshakeTimeout: socks5HandshakeTimeout,
 	}
 
@@ -66,9 +63,11 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 			// The handshake is over: the relay that follows is unbounded,
 			// like a CONNECT tunnel. Lifted before the dial so a slow dial
 			// does not make the reply write fail.
-			if c, ok := s.handshakes.Load(src); ok {
-				_ = c.(net.Conn).SetDeadline(time.Time{})
+			client := s.clients.find(src)
+			if client == nil {
+				return nil, context.Canceled
 			}
+			_ = client.SetDeadline(time.Time{})
 
 			info := connInfo{id: nextConnID(), proto: "socks5", src: src, host: host, port: portInt, family: s.opener.family}
 			log.Debug().Uint64("conn_id", info.id).Str("proto", "socks5").Str("src", src).Str("host", host).Int("port", portInt).Msg("request")
@@ -78,6 +77,8 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 				info.logFailure("resolve_error", rf.err)
 				return nil, errResolveFailed
 			}
+
+			ctx = client.ctx
 
 			start := time.Now()
 			upstream, dst, route, reason, err := s.opener.Open(ctx, src, "socks5", host, portInt)
@@ -91,13 +92,8 @@ func NewSOCKS5Server(listen string, opener *Opener) (*SOCKS5Server, error) {
 
 			log.Debug().Uint64("conn_id", info.id).Str("dst", dst).Int64("dial_ms", info.dialMS).Msg("dial done")
 
-			// The library closes the returned conn when its relay ends,
-			// so counting here tracks in-flight relays exactly (UDP
-			// ASSOCIATE is rejected, so every logConn is a CONNECT relay).
-			s.conns.Add(1)
 			return &logConn{
 				Conn:     upstream,
-				onClose:  s.conns.Done,
 				t0:       time.Now(),
 				connInfo: info,
 			}, nil
@@ -140,6 +136,7 @@ func (s *SOCKS5Server) SetConnLimit(l *connLimiter) {
 // connection gets the handshake deadline before the library reads from it.
 func (s *SOCKS5Server) Start() {
 	log.Info().Str("listen", s.ln.Addr().String()).Msg("SOCKS5 server starting")
+	s.ln = &clientListener{Listener: s.ln, clients: s.clients}
 
 	go func() {
 		for {
@@ -152,54 +149,45 @@ func (s *SOCKS5Server) Start() {
 				}
 				return
 			}
-			go s.serveConn(conn)
+			go s.serveConn(conn.(*clientConn))
 		}
 	}()
 }
 
-func (s *SOCKS5Server) serveConn(conn net.Conn) {
+func (s *SOCKS5Server) serveConn(conn *clientConn) {
+	defer conn.finish()
 	src := conn.RemoteAddr().String()
 	_ = conn.SetDeadline(time.Now().Add(s.handshakeTimeout))
-	s.handshakes.Store(src, conn)
-	defer s.handshakes.Delete(src)
 	// ServeConn closes conn when it returns.
 	if err := s.srv.ServeConn(conn); err != nil {
 		log.Debug().Str("proto", "socks5").Str("src", src).Err(err).Msg("connection ended")
 	}
 }
 
-// Shutdown stops the accept loop, then waits (bounded by ctx) for
-// in-flight CONNECT relays to finish. The listener close runs once; the
-// drain wait runs on every call, mirroring HTTPProxyServer.Shutdown. Stuck
-// relays left behind at timeout are killed when the SSH dialer stops.
-func (s *SOCKS5Server) Shutdown(ctx context.Context) error {
+func (s *SOCKS5Server) StopAccept() error {
 	var err error
 	s.closeOnce.Do(func() {
+		s.clients.stop()
 		close(s.shutCh)
 		err = s.ln.Close()
 	})
-	if err != nil {
+	return err
+}
+
+func (s *SOCKS5Server) Drain(ctx context.Context) error { return s.clients.drain(ctx) }
+
+func (s *SOCKS5Server) ForceClose() { s.clients.forceClose() }
+
+// Shutdown includes handshake and dial work as well as established relays.
+func (s *SOCKS5Server) Shutdown(ctx context.Context) error {
+	if err := s.StopAccept(); err != nil {
 		return err
 	}
-	done := make(chan struct{})
-	go func() {
-		s.conns.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		// With the shared drain deadline already spent on an earlier
-		// server, a server drained at the same instant must report
-		// success, not a spurious timeout.
-		select {
-		case <-done:
-			return nil
-		default:
-			return ctx.Err()
-		}
+	if err := s.Drain(ctx); err != nil {
+		s.ForceClose()
+		return err
 	}
+	return nil
 }
 
 // connIDs numbers proxied connections over both proxies. conn_id links a
@@ -254,11 +242,6 @@ type logConn struct {
 	firstErr error // first relayErr error from Read/Write
 	t0       time.Time
 	closed   atomic.Bool
-	// onClose runs exactly once, after the first Close (successful or not —
-	// a failed Close still retires the relay, otherwise the shutdown drain
-	// could wait forever on a dead transport). The SOCKS5 server uses it to
-	// retire an in-flight relay from its shutdown drain counter.
-	onClose func()
 	connInfo
 }
 
@@ -291,15 +274,25 @@ func (l *logConn) CloseWrite() error {
 	return nil
 }
 
+// recordError includes failures on the client side of a relay, which do
+// not pass through this upstream connection's Read or Write methods.
+func (l *logConn) recordError(err error) {
+	if !relayErr(err) {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.firstErr == nil {
+		l.firstErr = err
+	}
+}
+
 func (l *logConn) Close() error {
 	if !l.closed.CompareAndSwap(false, true) {
 		return l.Conn.Close()
 	}
 
 	err := l.Conn.Close()
-	if l.onClose != nil {
-		l.onClose()
-	}
 
 	l.mu.Lock()
 	up := l.up

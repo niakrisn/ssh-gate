@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	stdlog "log"
 	"math"
 	"net"
 	"net/http"
@@ -53,7 +55,9 @@ type HealthServer struct {
 
 	probeMu   sync.Mutex
 	probe     sshProbe
-	done      chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
+	probeDone chan struct{}
 	closeOnce sync.Once
 
 	// allowedHosts are the Host header names (no port) the Web UI and the
@@ -65,12 +69,13 @@ type HealthServer struct {
 // /api/connections and /api/status attached to the same mux. sshHost/
 // sshPort is the tunnel endpoint, probed in the background for /api/status.
 func NewHealthServer(listen, sshHost string, sshPort int, d dialer, tracker *ConnTracker) (*HealthServer, error) {
+	ctx, cancel := context.WithCancel(context.Background())
 	h := &HealthServer{
 		dialer:  d,
 		tracker: tracker,
 		sshHost: sshHost,
 		sshPort: sshPort,
-		done:    make(chan struct{}),
+		ctx:     ctx, cancel: cancel, probeDone: make(chan struct{}),
 		allowedHosts: map[string]bool{
 			"localhost": true,
 			"127.0.0.1": true,
@@ -95,9 +100,11 @@ func NewHealthServer(listen, sshHost string, sshPort int, d dialer, tracker *Con
 	mux.Handle("/", h.uiGuard(http.HandlerFunc(handleUI)))
 
 	h.srv.Handler = mux
+	h.srv.ErrorLog = stdlog.New(httpLogWriter{}, "", 0)
 
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	h.ln = ln
@@ -146,33 +153,68 @@ func (h *HealthServer) Start() {
 	if !h.started.CompareAndSwap(false, true) {
 		return
 	}
-	if h.sshHost != "" {
-		go h.probeLoop()
-	}
+	go h.probeLoop()
 	go func() {
 		log.Info().Str("listen", h.ln.Addr().String()).Msg("health server starting")
-		if err := h.srv.Serve(h.ln); err != nil {
+		if err := h.srv.Serve(h.ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			log.Warn().Err(err).Msg("health server stopped")
 		}
 	}()
 }
 
-// Shutdown gracefully stops the health server and the probe loop.
-func (h *HealthServer) Shutdown(ctx context.Context) error {
-	err := h.srv.Shutdown(ctx)
-	h.closeOnce.Do(func() { close(h.done) })
+func (h *HealthServer) StopAccept() error {
+	var err error
+	h.closeOnce.Do(func() { h.cancel(); err = h.ln.Close() })
 	return err
+}
+
+func (h *HealthServer) Drain(ctx context.Context) error {
+	err := h.srv.Shutdown(ctx)
+	if errors.Is(err, net.ErrClosed) {
+		err = nil
+	}
+	if !h.started.Load() {
+		return err
+	}
+	select {
+	case <-h.probeDone:
+		return err
+	default:
+	}
+	select {
+	case <-h.probeDone:
+		return err
+	case <-ctx.Done():
+		return errors.Join(err, ctx.Err())
+	}
+}
+
+func (h *HealthServer) ForceClose() { _ = h.srv.Close() }
+
+func (h *HealthServer) Shutdown(ctx context.Context) error {
+	if err := h.StopAccept(); err != nil {
+		return err
+	}
+	if err := h.Drain(ctx); err != nil {
+		h.ForceClose()
+		return err
+	}
+	return nil
 }
 
 // probeLoop dials the SSH server port in the background and caches the
 // result, so /api/status never blocks on the dial.
 func (h *HealthServer) probeLoop() {
+	defer close(h.probeDone)
+	if h.sshHost == "" || h.ctx.Err() != nil {
+		return
+	}
 	h.runProbe()
 	ticker := time.NewTicker(probeInterval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-h.done:
+		case <-h.ctx.Done():
 			return
 		case <-ticker.C:
 			h.runProbe()
@@ -199,6 +241,9 @@ func (h *HealthServer) liveSessionStats() *tcpStats {
 // unauthenticated connection that sshd logs as [preauth] and that
 // fail2ban-style tools may count against the client address.
 func (h *HealthServer) runProbe() {
+	if h.ctx.Err() != nil {
+		return
+	}
 	if h.liveSessionStats() != nil {
 		h.probeMu.Lock()
 		h.probe = sshProbe{reachable: true, at: time.Now(), fromSession: true}
@@ -207,12 +252,16 @@ func (h *HealthServer) runProbe() {
 	}
 	addr := net.JoinHostPort(h.sshHost, strconv.Itoa(h.sshPort))
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp4", addr, probeTimeout)
+	probe := net.Dialer{Timeout: probeTimeout}
+	conn, err := probe.DialContext(h.ctx, "tcp4", addr)
 	result := sshProbe{at: time.Now()}
 	if err == nil {
 		conn.Close()
 		result.reachable = true
 		result.rttMs = time.Since(start).Milliseconds()
+	}
+	if h.ctx.Err() != nil {
+		return
 	}
 	h.probeMu.Lock()
 	h.probe = result

@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -77,8 +76,7 @@ func readStatus(t *testing.T, r *bufio.Reader) string {
 	return string(line)
 }
 
-// oneShotHTTPServer accepts a single raw HTTP request, captures the body
-// (by Content-Length or until EOF for close-delimited bodies) and replies 200.
+// oneShotHTTPServer accepts one framed HTTP request and captures its body.
 func oneShotHTTPServer(t *testing.T, bodyOut chan []byte) net.Listener {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -92,28 +90,14 @@ func oneShotHTTPServer(t *testing.T, bodyOut chan []byte) net.Listener {
 			return
 		}
 		defer c.Close()
-		r := bufio.NewReader(c)
-		if _, err := r.ReadString('\n'); err != nil {
+		c.SetDeadline(time.Now().Add(3 * time.Second))
+		req, err := http.ReadRequest(bufio.NewReader(c))
+		if err != nil {
 			return
 		}
-		var contentLength int64 = -1
-		for {
-			line, err := r.ReadString('\n')
-			if err != nil || line == "\r\n" {
-				break
-			}
-			if v, ok := strings.CutPrefix(strings.ToLower(line), "content-length:"); ok {
-				contentLength, _ = strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-			}
-		}
-		var body []byte
-		if contentLength >= 0 {
-			body = make([]byte, contentLength)
-			if _, err := io.ReadFull(r, body); err != nil {
-				return
-			}
-		} else {
-			body, _ = io.ReadAll(r)
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return
 		}
 		bodyOut <- body
 		io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
@@ -264,7 +248,7 @@ func TestHTTPProxyPOSTContentLength(t *testing.T) {
 	}
 }
 
-// TestHTTPProxyPOSTChunked de-chunks the body and terminates it with EOF.
+// TestHTTPProxyPOSTChunked preserves the body with streaming HTTP framing.
 func TestHTTPProxyPOSTChunked(t *testing.T) {
 	bodyOut := make(chan []byte, 1)
 	ln := oneShotHTTPServer(t, bodyOut)
@@ -371,8 +355,7 @@ func TestHTTPProxyNonHTTPSchemeRejected(t *testing.T) {
 	expectStatus(t, bufio.NewReader(c), "400")
 }
 
-// TestHTTPProxyTransferEncodingRejected returns 400 for Transfer-Encoding
-// values other than plain chunked (RFC 9112 6.3: we can only re-frame chunked).
+// Unsupported transfer codings are rejected by http.Server with 501.
 func TestHTTPProxyTransferEncodingRejected(t *testing.T) {
 	s := startTestProxy(t, "")
 
@@ -382,7 +365,7 @@ func TestHTTPProxyTransferEncodingRejected(t *testing.T) {
 			t.Fatalf("dial proxy: %v", err)
 		}
 		fmt.Fprintf(c, "POST http://127.0.0.1:9/submit HTTP/1.1\r\nHost: 127.0.0.1:9\r\nTransfer-Encoding: %s\r\n\r\n", te)
-		expectStatus(t, bufio.NewReader(c), "400")
+		expectStatus(t, bufio.NewReader(c), "501")
 		c.Close()
 	}
 }

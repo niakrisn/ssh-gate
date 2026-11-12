@@ -1,15 +1,14 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"math"
+	stdlog "log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,20 +28,14 @@ var httpIdleTimeout = 5 * time.Minute
 // headerReadTimeout bounds reading the request line and headers.
 const headerReadTimeout = 30 * time.Second
 
-// maxReframedBody bounds the buffer for bodies that must be re-framed with
-// Content-Length (chunked or close-delimited): forwarding them requires
-// reading the whole body into memory first, so the limit caps the memory a
-// single request can make the proxy hold. Larger bodies are rejected with
-// 413 rather than buffered unboundedly.
-const maxReframedBody = 32 << 20
-
 // HTTPProxyServer is a minimal HTTP forward proxy: CONNECT tunneling plus
 // one absolute-form request (GET/POST/...) per connection.
 type HTTPProxyServer struct {
+	srv       *http.Server
 	ln        net.Listener
 	shutCh    chan struct{}
 	closeOnce sync.Once
-	wg        sync.WaitGroup // in-flight handleConn goroutines
+	clients   *clientRegistry
 	opener    *Opener
 	// idleTimeout is httpIdleTimeout at construction.
 	idleTimeout time.Duration
@@ -53,16 +46,34 @@ func NewHTTPProxyServer(listen string, opener *Opener) (*HTTPProxyServer, error)
 	if err != nil {
 		return nil, err
 	}
-	return &HTTPProxyServer{
+	s := &HTTPProxyServer{
 		// keepalive on accepted sockets bounds the lifetime of a
 		// half-dead CONNECT relay (see keepAliveListener); the resilient
 		// wrapper keeps the accept loop alive through transient errors,
 		// so an error here only ever means shutdown.
 		ln:          &resilientListener{Listener: keepAliveListener{Listener: ln}},
 		shutCh:      make(chan struct{}),
+		clients:     newClientRegistry(),
 		opener:      opener,
 		idleTimeout: httpIdleTimeout,
-	}, nil
+	}
+	s.srv = &http.Server{Handler: http.HandlerFunc(s.serveHTTP), ReadHeaderTimeout: headerReadTimeout, MaxHeaderBytes: http.DefaultMaxHeaderBytes,
+		ErrorLog: stdlog.New(httpLogWriter{}, "", 0),
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			owned := c.(*clientConn)
+			// Keep net/http's server value while forced client close cancels
+			// work even before a read detects the closed socket.
+			ctx = context.WithValue(owned.ctx, http.ServerContextKey, ctx.Value(http.ServerContextKey))
+			return context.WithValue(ctx, httpConnKey{}, owned)
+		},
+		ConnState: func(c net.Conn, state http.ConnState) {
+			if state == http.StateClosed {
+				c.(*clientConn).finish()
+			}
+		},
+	}
+	s.srv.SetKeepAlivesEnabled(false)
+	return s, nil
 }
 
 // SetConnLimit applies the shared connection limit. Call before Start.
@@ -72,97 +83,71 @@ func (s *HTTPProxyServer) SetConnLimit(l *connLimiter) {
 
 func (s *HTTPProxyServer) Start() {
 	log.Info().Str("listen", s.ln.Addr().String()).Msg("HTTP proxy starting")
+	s.ln = &clientListener{Listener: s.ln, clients: s.clients}
 
 	go func() {
-		for {
-			conn, err := s.ln.Accept()
-			if err != nil {
-				select {
-				case <-s.shutCh:
-					return
-				default:
-					log.Error().Err(err).Msg("HTTP proxy accept failed")
-					return
-				}
+		if err := s.srv.Serve(s.ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			select {
+			case <-s.shutCh:
+			default:
+				log.Error().Err(err).Msg("HTTP proxy accept failed")
 			}
-			s.wg.Add(1)
-			go s.handleConn(conn)
 		}
 	}()
 }
 
-// Shutdown stops accepting, then waits (bounded by ctx) for in-flight
-// connections to finish proxying. The listener close runs once; the drain
-// wait runs on every call, so a Shutdown that timed out can be retried to
-// confirm the remaining relays have finished (nil) or wait again (ctx.Err()).
-// Stuck relays left behind at timeout are killed when the SSH dialer stops.
-func (s *HTTPProxyServer) Shutdown(ctx context.Context) error {
+func (s *HTTPProxyServer) StopAccept() error {
 	var err error
 	s.closeOnce.Do(func() {
+		s.clients.stop()
 		close(s.shutCh)
 		err = s.ln.Close()
 	})
-	if err != nil {
-		return err
-	}
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		// With the shared drain deadline already spent on an earlier
-		// server, a server drained at the same instant must report
-		// success, not a spurious timeout.
-		select {
-		case <-done:
-			return nil
-		default:
-			return ctx.Err()
-		}
-	}
+	return err
 }
 
-func (s *HTTPProxyServer) handleConn(client net.Conn) {
-	defer s.wg.Done()
-	defer client.Close()
+func (s *HTTPProxyServer) Drain(ctx context.Context) error { return s.clients.drain(ctx) }
 
-	// One reader for the whole connection: ReadRequest buffers a whole
-	// socket segment, so payload pipelined behind the headers (TLS
-	// ClientHello right after CONNECT, GET body) lives in this buffer and
-	// must be drained by the same reader the relay copies from.
-	// http.ReadRequest has no header size limit (http.Server adds one
-	// through MaxHeaderBytes), so the limited reader caps what a client
-	// can make us buffer within the read deadline; the limit is lifted
-	// once the headers are parsed, the body and the CONNECT relay read
-	// through the same reader.
-	lr := &io.LimitedReader{R: client, N: http.DefaultMaxHeaderBytes}
-	br := bufio.NewReader(lr)
-	_ = client.SetReadDeadline(time.Now().Add(headerReadTimeout))
-	req, err := http.ReadRequest(br)
-	if err != nil {
-		log.Warn().Str("client", client.RemoteAddr().String()).Err(err).Msg("http: bad request")
-		if lr.N <= 0 {
-			writeHTTPErr(client, http.StatusRequestHeaderFieldsTooLarge, "Request Header Fields Too Large")
-			return
-		}
-		writeHTTPErr(client, http.StatusBadRequest, "Bad Request")
+func (s *HTTPProxyServer) ForceClose() {
+	s.clients.forceClose()
+	_ = s.srv.Close()
+}
+
+func (s *HTTPProxyServer) Shutdown(ctx context.Context) error {
+	if err := s.StopAccept(); err != nil {
+		return err
+	}
+	if err := s.Drain(ctx); err != nil {
+		s.ForceClose()
+		return err
+	}
+	return nil
+}
+
+type httpConnKey struct{}
+
+func (s *HTTPProxyServer) serveHTTP(w http.ResponseWriter, req *http.Request) {
+	// http.Server must not drain an unfinished upload while finalizing a
+	// response. Interrupt reads after the handler, leaving writes available
+	// until the server flushes the complete final response.
+	client := req.Context().Value(httpConnKey{}).(net.Conn)
+	defer func() { _ = client.SetReadDeadline(time.Now()) }()
+	if req.Method != http.MethodConnect && (req.URL == nil || !req.URL.IsAbs() || req.URL.Scheme != "http") {
+		http.Error(w, "HTTP absolute-form or CONNECT requests only", http.StatusBadRequest)
 		return
 	}
-	lr.N = math.MaxInt64
-	_ = client.SetReadDeadline(time.Time{})
-
-	switch {
-	case req.Method == http.MethodConnect:
-		s.handleConnect(client, br, req)
-	case req.URL != nil && req.URL.IsAbs() && req.URL.Scheme == "http":
-		s.handleHTTP(client, req)
-	default:
-		writeHTTPErr(client, http.StatusBadRequest, "HTTP absolute-form or CONNECT requests only")
+	if req.Method != http.MethodConnect {
+		s.handleHTTP(w, req)
+		return
 	}
+	client, rw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		return
+	}
+	// Hijack transfers completion ownership away from http.Server.
+	defer client.(*clientConn).finish()
+	_ = client.SetDeadline(time.Time{})
+	s.handleConnect(client, rw.Reader, req)
 }
 
 // statusForDialErr maps an upstream dial error to a proxy status code:
@@ -215,33 +200,54 @@ func (s *HTTPProxyServer) handleConnect(client net.Conn, src io.Reader, req *htt
 		return
 	}
 
-	lc, err := s.openUpstream(context.Background(), client.RemoteAddr().String(), "CONNECT", host, portInt)
+	lc, err := s.openUpstream(req.Context(), client.RemoteAddr().String(), "CONNECT", host, portInt)
 	if err != nil {
 		writeHTTPErr(client, statusForDialErr(err), "Connect failed")
 		return
 	}
 
-	io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n")
+	defer lc.Close()
+	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		lc.recordError(err)
+		client.Close()
+		return
+	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	results := make(chan error, 2)
 	go func() {
-		defer wg.Done()
-		io.Copy(lc, src)
-		lc.CloseWrite()
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(client, lc)
-		if cw, ok := client.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
+		_, err := io.Copy(lc, src)
+		if err == nil {
+			err = lc.CloseWrite()
 		}
+		results <- err
 	}()
-	wg.Wait()
-	lc.Close()
+	go func() {
+		_, err := io.Copy(client, lc)
+		if err == nil {
+			if cw, ok := client.(interface{ CloseWrite() error }); ok {
+				err = cw.CloseWrite()
+			}
+		}
+		results <- err
+	}()
+	failed := false
+	for range 2 {
+		if err := <-results; err != nil && !failed {
+			failed = true
+			lc.recordError(err)
+			client.Close()
+			// Unblock the other direction now; log the final counters only
+			// after both copies have finished, in the deferred lc.Close.
+			lc.Conn.Close()
+		}
+	}
 }
 
-func (s *HTTPProxyServer) handleHTTP(client net.Conn, req *http.Request) {
+func (s *HTTPProxyServer) handleHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Header.Get("Upgrade") != "" {
+		http.Error(w, "Use CONNECT for protocol upgrades", http.StatusBadRequest)
+		return
+	}
 	u := req.URL
 	host := u.Hostname()
 	port := 80
@@ -249,103 +255,95 @@ func (s *HTTPProxyServer) handleHTTP(client net.Conn, req *http.Request) {
 		var err error
 		port, err = strconv.Atoi(p)
 		if err != nil || validatePort(port) != nil {
-			writeHTTPErr(client, http.StatusBadRequest, "Bad target port")
+			http.Error(w, "Bad target port", http.StatusBadRequest)
 			return
 		}
 	}
 
-	// Only plain "chunked" is re-framable; any other Transfer-Encoding
-	// (or chunked not last) would have to be decoded by us (RFC 9112 6.3).
-	if len(req.TransferEncoding) > 0 &&
-		!(len(req.TransferEncoding) == 1 && req.TransferEncoding[0] == "chunked") {
-		writeHTTPErr(client, http.StatusBadRequest, "Unsupported Transfer-Encoding")
+	if err := http.NewResponseController(w).EnableFullDuplex(); err != nil {
+		http.Error(w, "Full duplex HTTP unavailable", http.StatusInternalServerError)
 		return
 	}
-
-	lc, err := s.openUpstream(context.Background(), client.RemoteAddr().String(), req.Method, host, port)
-	if err != nil {
-		writeHTTPErr(client, statusForDialErr(err), "Connect failed")
-		return
-	}
-	defer lc.Close()
-
-	// One request per connection. The SSH channel has no deadlines, so a
-	// watchdog closes both sides after idleTimeout without progress.
-	raw := client
+	client := req.Context().Value(httpConnKey{}).(net.Conn)
+	ctx, cancel := context.WithCancel(req.Context())
+	defer cancel()
 	g := newIdleGuard(s.idleTimeout, func() {
-		log.Info().Str("src", raw.RemoteAddr().String()).Str("host", host).Msg("http: idle timeout")
-		raw.Close()
-		lc.Close()
+		log.Info().Str("src", req.RemoteAddr).Str("host", host).Msg("http: idle timeout")
+		cancel()
+		client.Close()
 	})
 	defer g.stop()
-	client = &guardedConn{Conn: client, g: g}
-	upstream := &guardedConn{Conn: lc, g: g}
-	reqBody := &guardedReader{r: req.Body, g: g}
-
-	// Rewrite the request to origin form. One request per connection: force
-	// Connection: close so the upstream closes after replying and the
-	// response relay terminates cleanly.
-	// ReadRequest removes Transfer-Encoding (and Content-Length when the
-	// body is chunked) from req.Header; for requests it leaves Connection
-	// in place (shouldClose only strips it on the response path) — the
-	// header loop below skips whatever remains of those names anyway.
-	// Bodies without Content-Length (chunked, close-delimited) are
-	// de-framed and re-sent with Content-Length: the forwarded request
-	// stays self-delimiting without chunk re-encoding or close-delimited
-	// framing on a channel we keep open for the response.
-	chunked := len(req.TransferEncoding) > 0
-	closeDelimited := req.ContentLength < 0 // body until connection close
-	hasBody := req.ContentLength != 0
-
-	var body []byte
-	if hasBody && (chunked || closeDelimited) {
-		b, err := io.ReadAll(io.LimitReader(reqBody, maxReframedBody+1))
-		if err != nil {
-			writeHTTPErr(client, http.StatusRequestEntityTooLarge, "Body read failed")
-			return
-		}
-		if int64(len(b)) > maxReframedBody {
-			writeHTTPErr(client, http.StatusRequestEntityTooLarge, "Body too large")
-			return
-		}
-		body = b
+	transport := &http.Transport{
+		Proxy: nil, DisableKeepAlives: true, DisableCompression: true,
+		ExpectContinueTimeout: time.Second, MaxResponseHeaderBytes: 1 << 20,
+		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+			// Transport detaches dial cancellation. Retain the original
+			// request/owner instead so canceled clients cannot leave a dial.
+			lc, err := s.openUpstream(ctx, req.RemoteAddr, req.Method, host, port)
+			if err != nil {
+				return nil, err
+			}
+			owned := &lifetimeConn{Conn: &guardedConn{Conn: lc, g: g}}
+			owned.stop = context.AfterFunc(ctx, func() { lc.Close() })
+			if err := ctx.Err(); err != nil {
+				owned.Close()
+				return nil, err
+			}
+			return owned, nil
+		},
 	}
+	defer transport.CloseIdleConnections()
+	request := req.WithContext(ctx)
+	if req.Body != nil && req.Body != http.NoBody {
+		// ReverseProxy and Transport both close the outbound body. Reading
+		// the remaining inbound body here could block an early final reply.
+		// The server owns the real body and closes it after our read deadline.
+		request.Body = io.NopCloser(&guardedReader{r: req.Body, g: g})
+	}
+	proxy := &httputil.ReverseProxy{
+		Transport: transport,
+		ErrorLog:  stdlog.New(httpLogWriter{}, "", 0),
+		Rewrite: func(p *httputil.ProxyRequest) {
+			p.Out.URL = req.URL
+			p.Out.Host = req.Host
+			// Clone snapshots the trailer map before the body has filled it.
+			// Transport writes these values only after reading the same body.
+			p.Out.Trailer = req.Trailer
+			p.Out.Header.Del("Proxy-Authorization")
+		},
+		ModifyResponse: func(r *http.Response) error {
+			if r.StatusCode == http.StatusSwitchingProtocols {
+				return errors.New("upstream protocol upgrade not supported")
+			}
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			http.Error(w, "Connect failed", statusForDialErr(err))
+		},
+	}
+	proxy.ServeHTTP(&guardedResponseWriter{ResponseWriter: w, g: g}, request)
+}
 
-	head := &bytes.Buffer{}
-	fmt.Fprintf(head, "%s %s HTTP/1.1\r\n", req.Method, u.RequestURI())
-	if req.Host == "" {
-		req.Host = u.Host
-	}
-	fmt.Fprintf(head, "Host: %s\r\n", req.Host)
-	if body != nil {
-		fmt.Fprintf(head, "Content-Length: %d\r\n", len(body))
-	}
-	for k, vs := range req.Header {
-		lk := strings.ToLower(k)
-		switch lk {
-		case "host", "connection", "proxy-connection", "proxy-authorization", "transfer-encoding":
-			continue
-		}
-		for _, v := range vs {
-			fmt.Fprintf(head, "%s: %s\r\n", k, v)
-		}
-	}
-	io.WriteString(head, "Connection: close\r\n\r\n")
-	io.WriteString(upstream, head.String())
+type guardedResponseWriter struct {
+	http.ResponseWriter
+	g *idleGuard
+}
 
-	if body != nil {
-		if _, err := upstream.Write(body); err != nil {
-			writeHTTPErr(client, http.StatusBadGateway, "Body transfer failed")
-			return
-		}
-	} else if hasBody {
-		if _, err := io.Copy(upstream, reqBody); err != nil {
-			writeHTTPErr(client, http.StatusBadGateway, "Body transfer failed")
-			return
-		}
+func (w *guardedResponseWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if n > 0 {
+		w.g.touch()
 	}
+	return n, err
+}
 
-	io.Copy(client, upstream)
+func (w *guardedResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+type httpLogWriter struct{}
+
+func (httpLogWriter) Write(p []byte) (int, error) {
+	log.Warn().Str("component", "http").Msg(strings.TrimSpace(string(p)))
+	return len(p), nil
 }
 
 func writeHTTPErr(w io.Writer, code int, msg string) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -40,8 +41,10 @@ type config struct {
 }
 
 type server struct {
-	Name     string
-	Shutdown func(context.Context) error
+	Name       string
+	StopAccept func() error
+	Drain      func(context.Context) error
+	ForceClose func()
 }
 
 // connHistoryMaxAge bounds the in-memory connection history window.
@@ -131,7 +134,7 @@ func main() {
 		hs.SetDNSStatus(rules.DNSStatus)
 	}
 	hs.Start()
-	servers = append(servers, server{Name: "health", Shutdown: hs.Shutdown})
+	servers = append(servers, server{Name: "health", StopAccept: hs.StopAccept, Drain: hs.Drain, ForceClose: hs.ForceClose})
 
 	// Graceful shutdown on SIGTERM/SIGINT
 	ctx, cancel := context.WithCancel(context.Background())
@@ -156,11 +159,9 @@ func main() {
 	const shutdownDrainTimeout = 5 * time.Second
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 	defer cancelDrain()
-	shutdownServers(drainCtx, servers)
-	if rules != nil {
-		rules.Stop()
+	if err := shutdownServers(drainCtx, servers, rules, d); err != nil {
+		log.Warn().Err(err).Msg("shutdown")
 	}
-	d.stop()
 }
 
 // configureDNS routes tunnel-destination resolution through the configured
@@ -223,7 +224,7 @@ func startProxies(cfg config, tracker *ConnTracker, status *sdStatus) (*sshDiale
 			}
 			s5.SetConnLimit(limit)
 			s5.Start()
-			servers = append(servers, server{Name: "SOCKS5 " + addr, Shutdown: s5.Shutdown})
+			servers = append(servers, server{Name: "SOCKS5 " + addr, StopAccept: s5.StopAccept, Drain: s5.Drain, ForceClose: s5.ForceClose})
 		}
 	}
 
@@ -235,20 +236,67 @@ func startProxies(cfg config, tracker *ConnTracker, status *sdStatus) (*sshDiale
 			}
 			hp.SetConnLimit(limit)
 			hp.Start()
-			servers = append(servers, server{Name: "HTTP " + addr, Shutdown: hp.Shutdown})
+			servers = append(servers, server{Name: "HTTP " + addr, StopAccept: hp.StopAccept, Drain: hp.Drain, ForceClose: hp.ForceClose})
 		}
 	}
 	return dialer, rules, servers
 }
 
-func shutdownServers(ctx context.Context, servers []server) {
+func shutdownServers(ctx context.Context, servers []server, rules *RuleEngine, d dialer) error {
+	var errs []error
 	for _, s := range servers {
-		if err := s.Shutdown(ctx); err != nil {
-			log.Warn().Str("server", s.Name).Err(err).Msg("shutdown")
-		} else {
-			log.Info().Str("server", s.Name).Msg("stopped")
+		if err := s.StopAccept(); err != nil {
+			errs = append(errs, fmt.Errorf("%s stop: %w", s.Name, err))
 		}
 	}
+	if err := drainServers(ctx, servers); err != nil {
+		errs = append(errs, err)
+		for _, s := range servers {
+			s.ForceClose()
+		}
+	}
+	// Accepted work keeps DNS and SSH alive until drain completes or the
+	// common deadline forces every client closed.
+	if rules != nil {
+		rules.Stop()
+	}
+	d.stop()
+	cleanup, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := drainServers(cleanup, servers); err != nil {
+		errs = append(errs, err)
+	}
+	if rules != nil {
+		if err := rules.dns.waitStopped(cleanup); err != nil {
+			errs = append(errs, fmt.Errorf("DNS cleanup: %w", err))
+		}
+	}
+	if owner, ok := d.(*sshDialer); ok {
+		if err := owner.waitStopped(cleanup); err != nil {
+			errs = append(errs, fmt.Errorf("SSH cleanup: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func drainServers(ctx context.Context, servers []server) error {
+	results := make(chan error, len(servers))
+	for _, s := range servers {
+		go func() {
+			err := s.Drain(ctx)
+			if err != nil {
+				err = fmt.Errorf("%s drain: %w", s.Name, err)
+			}
+			results <- err
+		}()
+	}
+	var errs []error
+	for range servers {
+		if err := <-results; err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func loadConfig() (config, error) {
