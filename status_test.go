@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -121,7 +122,7 @@ func TestConnectSSHFailStates(t *testing.T) {
 	t.Run("key rejected", func(t *testing.T) {
 		host, port := startRejectingSSHServer(t)
 		cfg := sshDialerCfg{host: host, port: port, user: "test", keyPath: writeTestKey(t)}
-		_, _, _, err := connectSSH(cfg)
+		_, _, _, err := connectSSH(context.Background(), cfg)
 		if got := failState(err); got != stateKeyRejected {
 			t.Fatalf("state = %q, want %q (err %v)", got, stateKeyRejected, err)
 		}
@@ -135,7 +136,7 @@ func TestConnectSSHFailStates(t *testing.T) {
 		addr, _ := startStoppableSSHServer(t, "127.0.0.1:0", newTestHostSigner(t))
 		host, port := splitTestAddr(t, addr)
 		cfg := sshDialerCfg{host: host, port: port, user: "test", keyPath: writeTestKey(t), fingerprint: "SHA256:old"}
-		_, _, _, err := connectSSH(cfg)
+		_, _, _, err := connectSSH(context.Background(), cfg)
 		if got := failState(err); got != stateHostKeyMismatch {
 			t.Fatalf("state = %q, want %q (err %v)", got, stateHostKeyMismatch, err)
 		}
@@ -154,7 +155,7 @@ func TestConnectSSHFailStates(t *testing.T) {
 		host, port := splitTestAddr(t, l.Addr().String())
 		l.Close()
 		cfg := sshDialerCfg{host: host, port: port, user: "test", keyPath: writeTestKey(t)}
-		_, _, _, err = connectSSH(cfg)
+		_, _, _, err = connectSSH(context.Background(), cfg)
 		if got := failState(err); got != stateUnreachable {
 			t.Fatalf("state = %q, want %q (err %v)", got, stateUnreachable, err)
 		}
@@ -167,7 +168,7 @@ func TestConnectSSHFailStates(t *testing.T) {
 
 	t.Run("unreadable key", func(t *testing.T) {
 		cfg := sshDialerCfg{host: "127.0.0.1", port: 1, user: "test", keyPath: filepath.Join(t.TempDir(), "none")}
-		_, _, _, err := connectSSH(cfg)
+		_, _, _, err := connectSSH(context.Background(), cfg)
 		if got := failState(err); got != stateSSHError {
 			t.Fatalf("state = %q, want %q (err %v)", got, stateSSHError, err)
 		}

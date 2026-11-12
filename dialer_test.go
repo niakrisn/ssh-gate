@@ -339,7 +339,7 @@ func TestConnectSSHCapturesRawConn(t *testing.T) {
 		t.Fatalf("port: %v", err)
 	}
 
-	client, fp, raw, err := connectSSH(sshDialerCfg{
+	client, fp, raw, err := connectSSH(context.Background(), sshDialerCfg{
 		host:    host,
 		port:    port,
 		user:    "test",
@@ -388,7 +388,7 @@ func TestConnectSSHKeepaliveProbeOpts(t *testing.T) {
 		t.Fatalf("port: %v", err)
 	}
 
-	client, _, raw, err := connectSSH(sshDialerCfg{
+	client, _, raw, err := connectSSH(context.Background(), sshDialerCfg{
 		host:              host,
 		port:              port,
 		user:              "test",
@@ -540,7 +540,7 @@ func TestConnectSSHHandshakeTimeout(t *testing.T) {
 	}
 
 	start := time.Now()
-	client, _, _, err := connectSSH(sshDialerCfg{
+	client, _, _, err := connectSSH(context.Background(), sshDialerCfg{
 		host:             host,
 		port:             port,
 		user:             "test",
@@ -594,7 +594,7 @@ func TestKeepaliveKeepsLiveTunnel(t *testing.T) {
 
 	d := &sshDialer{cfg: sshDialerCfg{keepalivePeriod: 50 * time.Millisecond}}
 	d.client = client
-	go d.keepalive(client)
+	go d.keepalive(d.lifetimeContext(), client)
 
 	waited := make(chan struct{})
 	go func() {
@@ -618,7 +618,7 @@ func TestKeepaliveDropsStuckTransport(t *testing.T) {
 
 	d := &sshDialer{cfg: sshDialerCfg{keepalivePeriod: 50 * time.Millisecond}}
 	d.client = client
-	go d.keepalive(client)
+	go d.keepalive(d.lifetimeContext(), client)
 
 	waited := make(chan struct{})
 	go func() {
@@ -730,7 +730,7 @@ func TestMonitorStopsDuringBackoff(t *testing.T) {
 
 	d := &sshDialer{
 		cfg: sshDialerCfg{host: "127.0.0.1", port: 1, user: "test"},
-		connect: func(sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) {
+		connect: func(context.Context, sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) {
 			calls.Add(1)
 			once.Do(func() { close(firstRound) })
 			return nil, "", nil, errors.New("dial refused")
@@ -889,8 +889,8 @@ func TestMonitorPinsHostKeyAfterTOFU(t *testing.T) {
 	errs := make(chan error, 16)
 	d := &sshDialer{
 		cfg: sshDialerCfg{host: host, port: port, user: "test", keyPath: keyPath},
-		connect: func(cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) {
-			c, fp, raw, err := connectSSH(cfg)
+		connect: func(ctx context.Context, cfg sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error) {
+			c, fp, raw, err := connectSSH(ctx, cfg)
 			errs <- err
 			return c, fp, raw, err
 		},
@@ -955,7 +955,7 @@ func TestConnectSSHFailsWhenPinCannotBeSaved(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(filepath.Dir(keyPath), sshKnownHostsFile), 0700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	client, _, _, err := connectSSH(sshDialerCfg{host: host, port: port, user: "test", keyPath: keyPath})
+	client, _, _, err := connectSSH(context.Background(), sshDialerCfg{host: host, port: port, user: "test", keyPath: keyPath})
 	if err == nil {
 		client.Close()
 		t.Fatal("connectSSH succeeded without saving the host key")
