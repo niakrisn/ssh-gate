@@ -223,14 +223,11 @@ func (t *ConnTracker) List(tab, q, proto string, page, pageSize int) ([]ConnView
 	})
 
 	total := len(recs)
-	start := (page - 1) * pageSize
-	if start >= total {
+	if total == 0 || page > 1+(total-1)/pageSize {
 		return []ConnView{}, total, nil
 	}
-	end := start + pageSize
-	if end > total {
-		end = total
-	}
+	start := (page - 1) * pageSize
+	end := start + min(pageSize, total-start)
 	views := make([]ConnView, 0, end-start)
 	for _, r := range recs[start:end] {
 		views = append(views, toView(r, now))
