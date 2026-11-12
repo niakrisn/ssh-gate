@@ -1,3 +1,34 @@
+ssh-gate (0.6.1-1) unstable; urgency=medium
+
+  * Bound DoH connection setup and TLS handshakes, and close transport
+    connections when the resolver stops.
+  * Forward HTTP responses during uploads, including 100 Continue,
+    informational responses, and early final responses.
+  * Close both CONNECT relay directions on transfer errors and release
+    connection slots without losing data on a normal half-close.
+  * Keep only metadata in closed-connection history and clear expired slots.
+  * Bound pending SSH channel opens, reserve capacity for DNS, and close
+    late successful opens after caller cancellation.
+  * Stream chunked HTTP bodies and trailers without buffering the full body
+    or rejecting valid uploads above the former 32 MiB limit.
+  * Share one destination dial timeout across all address attempts, with
+    bounded overlapping attempts and cancellation of losing connections.
+  * Reuse one DNS result per required routing policy and let canceled
+    callers stop waiting for shared lookups.
+  * Exchange DNS messages directly over tunnel TCP so local hosts entries
+    cannot replace tunnel answers; validate responses and honor DNS TTLs.
+  * Preserve useful A or AAAA answers when the other family temporarily
+    fails, without caching partial answers or false negative results.
+  * Stop all listeners before draining accepted clients, then cancel
+    remaining connections, DNS work, SSH reconnects, and health probes.
+  * Limit health and UI connections, header size, and slow-client timeouts.
+  * Queue logs with bounded memory so blocked sinks do not stall traffic
+    or DNS status; report dropped records and bound shutdown flushing.
+  * Reject out-of-range connection-history pages before offset arithmetic
+    can overflow, with boundary and fuzz regression coverage.
+
+ -- Nikita Kozlov <niakrisn@gmail.com>  Thu, 12 Nov 2026 09:52:39 +0300
+
 ssh-gate (0.6.0-1) unstable; urgency=medium
 
   * Resolve A and AAAA over SSH using RFC 8484 when DOH_HOST is set.
