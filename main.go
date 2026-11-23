@@ -433,10 +433,6 @@ func drainServers(ctx context.Context, servers []server) error {
 	return errors.Join(errs...)
 }
 
-func loadConfig() (config, error) {
-	return loadConfigFile("/etc/ssh-gate/config.yaml")
-}
-
 func loadConfigFile(path string) (config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -701,24 +697,6 @@ func validateDOHHost(raw string) error {
 		return fmt.Errorf("invalid %q: %s", raw, want)
 	}
 	return nil
-}
-
-func parseListenList(name, raw string) ([]string, error) {
-	var addrs []string
-	for _, addr := range strings.Split(raw, ",") {
-		addr = strings.TrimSpace(addr)
-		if addr == "" {
-			continue
-		}
-		if err := validateHostPort(addr); err != nil {
-			return nil, fmt.Errorf("invalid %s address %q: %w", name, addr, err)
-		}
-		addrs = append(addrs, addr)
-	}
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("invalid %s %q: no listen addresses", name, raw)
-	}
-	return addrs, nil
 }
 
 // parseHostList parses a comma-separated list of host names or IP

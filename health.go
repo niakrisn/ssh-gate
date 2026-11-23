@@ -177,20 +177,6 @@ func (h *HealthServer) readyHandler(w http.ResponseWriter, r *http.Request) {
 
 func (h *HealthServer) SetReady(ready bool) { h.ready.Store(ready) }
 
-// tunnelStatus returns the dialer's tunnel state. A dialer without a state
-// (test fakes) is connected or connecting by Connected().
-func (h *HealthServer) tunnelStatus() tunnelStatus {
-	if p, ok := h.dialer.(statusProvider); ok {
-		if st := p.Status(); st.State != "" {
-			return st
-		}
-	}
-	if h.dialer.Connected() {
-		return tunnelStatus{State: stateConnected}
-	}
-	return tunnelStatus{State: stateConnecting}
-}
-
 // SetDNSStatus sets the source of the dns field of /api/status. Call it
 // before Start.
 func (h *HealthServer) SetDNSStatus(f func() dnsStatus) {
