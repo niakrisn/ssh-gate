@@ -1,3 +1,25 @@
+ssh-gate (0.7.0-1) unstable; urgency=medium
+
+  * Replace environment settings with a strict YAML configuration file.
+    Existing deployments must migrate configuration and host key pins.
+  * Add multiple SSH server pools with stable destination selection,
+    per-server connection limits, and bounded channel-open retries.
+  * Check each server with HTTPS probes and exclude failed transports
+    and servers until they recover.
+  * Keep tunnel DNS answers, resolver pauses, and statistics isolated
+    by server; never fall back to local DNS for tunnel destinations.
+  * Preserve CONNECT half-closes, stop retries on quota exhaustion,
+    and bound shutdown of probes and SSH transports.
+  * Store host fingerprints by server ID, reject empty pin files,
+    and report how to replace only the affected server's fingerprint.
+  * Show server health, quotas, transport load, and TCP statistics in
+    the Web UI; report listener readiness independently of SSH health.
+  * Install /etc/ssh-gate/config.yaml as a conffile and support both
+    systemd unit paths used by Debian packaging tools.
+  * Update third-party license notices for the YAML dependency.
+
+ -- Nikita Kozlov <niakrisn@gmail.com>  Mon, 23 Nov 2026 18:11:55 +0300
+
 ssh-gate (0.6.1-1) unstable; urgency=medium
 
   * Bound DoH connection setup and TLS handshakes, and close transport
