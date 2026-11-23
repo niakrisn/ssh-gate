@@ -28,7 +28,7 @@ func (c *observedWaitContext) Done() <-chan struct{} {
 }
 
 func TestDNSWaiterCancellation(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,17 +198,19 @@ func TestTunnelServerOrder(t *testing.T) {
 		}
 	})
 
-	t.Run("no server answers: the local answer is not cached", func(t *testing.T) {
+	t.Run("no server answers: the failure is not cached", func(t *testing.T) {
 		f := startFakeDNSServer(t, servfail)
 		rules, local := tunnelServers(t, &channelDialer{}, f.addr)
 		for range 2 {
-			addrs, err := rules.ResolveAll(context.Background(), "a.example")
-			if err != nil || len(addrs) != 1 {
-				t.Fatalf("ResolveAll = (%v, %v)", addrs, err)
+			if _, err := rules.ResolveAll(context.Background(), "a.example"); !errors.Is(err, errUnreachable) {
+				t.Fatalf("ResolveAll err = %v, want errUnreachable", err)
 			}
 		}
-		if local.Load() != 2 {
-			t.Fatalf("local calls = %d, want 2", local.Load())
+		if got := len(f.asked()); got != 4 {
+			t.Fatalf("server queries = %d, want 4 (two lookups x A+AAAA): a failure must not be cached", got)
+		}
+		if local.Load() != 0 {
+			t.Fatalf("local calls = %d, want 0", local.Load())
 		}
 	})
 }
@@ -224,6 +226,14 @@ func TestTunnelServerPause(t *testing.T) {
 		t.Helper()
 		if _, err := rules.ResolveAll(context.Background(), name); err != nil {
 			t.Fatalf("ResolveAll(%s): %v", name, err)
+		}
+	}
+	// resolveFail covers the lookups no tunnel resolver answers: the name
+	// fails here instead of reaching the local resolver.
+	resolveFail := func(t *testing.T, rules *RuleEngine, name string) {
+		t.Helper()
+		if _, err := rules.ResolveAll(context.Background(), name); !errors.Is(err, errUnreachable) {
+			t.Fatalf("ResolveAll(%s) = %v, want errUnreachable", name, err)
 		}
 	}
 	// flaky is a server behind d whose channel opens only while blocked is
@@ -275,14 +285,14 @@ func TestTunnelServerPause(t *testing.T) {
 		}
 	})
 
-	t.Run("all paused: the local resolver answers at once", func(t *testing.T) {
+	t.Run("all paused: the lookup fails without dialing again", func(t *testing.T) {
 		d := &channelDialer{}
 		f := flakyServer(t, d)
 		rules, local := engine(t, d, f.addr)
-		resolve(t, rules, "a.example")
+		resolveFail(t, rules, "a.example")
 		asked := f.dials.Load()
-		resolve(t, rules, "b.example")
-		if f.dials.Load() != asked || local.Load() != 2 {
+		resolveFail(t, rules, "b.example")
+		if f.dials.Load() != asked || local.Load() != 0 {
 			t.Fatalf("server dialed %d more times, local calls = %d", f.dials.Load()-asked, local.Load())
 		}
 	})
@@ -299,7 +309,7 @@ func TestTunnelServerPause(t *testing.T) {
 			return ctx.Err()
 		}
 		rules, local := engine(t, d, addr)
-		resolve(t, rules, "first.example")
+		resolveFail(t, rules, "first.example")
 		if rules.DNSStatus().Servers[0].Fail != 1 {
 			t.Fatalf("status = %+v", rules.DNSStatus())
 		}
@@ -319,8 +329,8 @@ func TestTunnelServerPause(t *testing.T) {
 		if got := dials.Load() - before; got >= 20 {
 			t.Fatalf("dials after the pause = %d, want the probe only", got)
 		}
-		if got := local.Load(); got != 21 {
-			t.Fatalf("local calls = %d, want 21", got)
+		if got := local.Load(); got != 0 {
+			t.Fatalf("local calls = %d, want 0", got)
 		}
 		u := rules.dns.tunnel[0]
 		if u.probing || !u.pausedUntil.After(time.Unix(0, clock.Load())) {
@@ -332,7 +342,7 @@ func TestTunnelServerPause(t *testing.T) {
 		d := &channelDialer{}
 		f := flakyServer(t, d)
 		rules, _ := engine(t, d, f.addr)
-		resolve(t, rules, "a.example")
+		resolveFail(t, rules, "a.example")
 		clock.Add(int64(upstreamPause))
 		f.blocked.Store(false)
 		resolve(t, rules, "b.example")
@@ -356,10 +366,10 @@ func TestTunnelServerPause(t *testing.T) {
 		d := &channelDialer{}
 		f := flakyServer(t, d)
 		rules, _ := engine(t, d, f.addr)
-		resolve(t, rules, "a.example")
+		resolveFail(t, rules, "a.example")
 		clock.Add(int64(upstreamPause))
 		d.down.Store(true)
-		resolve(t, rules, "b.example")
+		resolveFail(t, rules, "b.example")
 		d.down.Store(false)
 		f.blocked.Store(false)
 		asked := f.dials.Load()
@@ -374,7 +384,7 @@ func TestTunnelServerPause(t *testing.T) {
 		d := &channelDialer{}
 		d.down.Store(true)
 		rules, _ := engine(t, d, good.addr)
-		resolve(t, rules, "a.example")
+		resolveFail(t, rules, "a.example")
 		d.down.Store(false)
 		asked := len(good.asked())
 		resolve(t, rules, "b.example")
@@ -386,7 +396,7 @@ func TestTunnelServerPause(t *testing.T) {
 
 // TestFailedNameDoesNotPauseServer: a failure on an open channel is about the
 // name. A web page asking for a broken domain must not switch the tunnel
-// resolvers off and send every other name to the local resolver.
+// resolvers off and leave every other name without a resolver.
 func TestFailedNameDoesNotPauseServer(t *testing.T) {
 	answer := netip.MustParseAddr("93.184.216.34")
 	for _, c := range []struct {
@@ -403,17 +413,17 @@ func TestFailedNameDoesNotPauseServer(t *testing.T) {
 			first, second := startFakeDNSServer(t, reply), startFakeDNSServer(t, reply)
 			rules, local := tunnelServers(t, &channelDialer{}, first.addr, second.addr)
 
-			if _, err := rules.ResolveAll(context.Background(), "broken.example"); err != nil {
-				t.Fatalf("broken name: %v", err)
+			if _, err := rules.ResolveAll(context.Background(), "broken.example"); !errors.Is(err, errUnreachable) {
+				t.Fatalf("broken name: %v, want errUnreachable", err)
 			}
-			if local.Load() != 1 {
-				t.Fatalf("local calls = %d, want 1 for the broken name", local.Load())
+			if local.Load() != 0 {
+				t.Fatalf("local calls = %d, want 0 for the broken name", local.Load())
 			}
 			addrs, err := rules.ResolveAll(context.Background(), "good.example")
 			if err != nil || len(addrs) != 1 || addrs[0] != answer {
 				t.Fatalf("good name = (%v, %v)", addrs, err)
 			}
-			if local.Load() != 1 {
+			if local.Load() != 0 {
 				t.Fatal("the good name went to the local resolver")
 			}
 			if s := rules.DNSStatus().Servers[1]; s.Fail != 1 {
@@ -434,54 +444,45 @@ func TestFailedNameDoesNotPauseServer(t *testing.T) {
 	})
 }
 
-// TestLocalDNSOnNXDomain covers the setting that lets the local resolver
-// answer after a tunnel not-found.
-func TestLocalDNSOnNXDomain(t *testing.T) {
-	nx := func(string) (byte, netip.Addr) { return 3, netip.Addr{} }
+// Tunnel NXDOMAIN and failures never consult the local resolver.
+func TestTunnelDNSNeverFallsBackToLocal(t *testing.T) {
+	rules, err := NewRuleEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var localCalls atomic.Int64
+	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
+		localCalls.Add(1)
+		return []net.IPAddr{{IP: net.ParseIP("192.0.2.8")}}, nil
+	}
+	rules.dns.tunnelUp = func() bool { return true }
+	rules.dns.tunnel = []*upstream{{name: "dns", lookup: func(context.Context, string) ([]netip.Addr, time.Time, error) { return nil, time.Time{}, errNotFound }}}
+	if _, err := rules.ResolveAll(context.Background(), "missing.example"); !errors.Is(err, errNotFound) {
+		t.Fatalf("NXDOMAIN err=%v", err)
+	}
+	if localCalls.Load() != 0 {
+		t.Fatalf("local DNS calls=%d", localCalls.Load())
+	}
 
-	t.Run("off: not found stands", func(t *testing.T) {
-		rules, local := tunnelServers(t, &channelDialer{}, startFakeDNSServer(t, nx).addr)
-		if _, err := rules.ResolveAll(context.Background(), "a.example"); !errors.Is(err, errNotFound) {
-			t.Fatalf("err = %v, want errNotFound", err)
+	failed, err := NewRuleEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed.dns.localLookup = rules.dns.localLookup
+	failed.dns.tunnelUp = func() bool { return true }
+	failed.dns.tunnel = []*upstream{{name: "dns", lookup: func(context.Context, string) ([]netip.Addr, time.Time, error) {
+		return nil, time.Time{}, fmt.Errorf("%w: connect failed", errUnreachable)
+	}}}
+	for range 2 {
+		if _, err := failed.ResolveAll(context.Background(), "broken.example"); err == nil {
+			t.Fatal("expected tunnel DNS error")
 		}
-		if local.Load() != 0 {
-			t.Fatal("local resolver asked")
-		}
-	})
-
-	t.Run("on: the local answer is cached", func(t *testing.T) {
-		f := startFakeDNSServer(t, nx)
-		rules, local := tunnelServers(t, &channelDialer{}, f.addr)
-		rules.dns.localOnNXDomain = true
-		for range 2 {
-			addrs, localDirect, err := rules.dns.resolveTunnel(context.Background(), "a.example")
-			if err != nil || !localDirect || len(addrs) != 1 || addrs[0].String() != "198.51.100.1" {
-				t.Fatalf("resolveTunnel = (%v, %v, %v)", addrs, localDirect, err)
-			}
-		}
-		if local.Load() != 1 || rules.dns.lookups.Load() != 1 {
-			t.Fatalf("local calls = %d, lookups = %d, want 1 and 1", local.Load(), rules.dns.lookups.Load())
-		}
-	})
-
-	t.Run("on: a local failure is cached as not found", func(t *testing.T) {
-		rules, _ := tunnelServers(t, &channelDialer{}, startFakeDNSServer(t, nx).addr)
-		rules.dns.localOnNXDomain = true
-		rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
-			return nil, errors.New("local resolver down")
-		}
-		for range 2 {
-			if _, err := rules.ResolveAll(context.Background(), "a.example"); !errors.Is(err, errNotFound) {
-				t.Fatalf("err = %v, want errNotFound", err)
-			}
-		}
-		if got := rules.dns.lookups.Load(); got != 1 {
-			t.Fatalf("lookups = %d, want 1 (negative cache)", got)
-		}
-	})
+	}
+	if localCalls.Load() != 0 {
+		t.Fatalf("local DNS calls after resolver failure=%d", localCalls.Load())
+	}
 }
 
-// TestDNSStatus covers what counts in the resolver statistics.
 func TestDNSStatus(t *testing.T) {
 	answer := netip.MustParseAddr("93.184.216.34")
 	ok := func(name string) (byte, netip.Addr) {
@@ -498,7 +499,7 @@ func TestDNSStatus(t *testing.T) {
 			rules.ResolveAll(context.Background(), name)
 		}
 		st := rules.DNSStatus()
-		if st.Mode != "servers" || st.Degraded || st.LocalFallbacks != 0 || len(st.Servers) != 1 {
+		if st.Mode != "servers" || st.Degraded || len(st.Servers) != 1 {
 			t.Fatalf("status = %+v", st)
 		}
 		if s := st.Servers[0]; s.OK != 2 || s.Fail != 0 || s.LastOKAt == 0 || s.LastFailed {
@@ -522,8 +523,8 @@ func TestDNSStatus(t *testing.T) {
 		if strings.Contains(s.Error, " on ") {
 			t.Fatalf("error %q names a server of the local resolv.conf", s.Error)
 		}
-		if st.LocalFallbacks != 2 || !st.Degraded {
-			t.Fatalf("status = %+v, want 2 fallbacks and degraded", st)
+		if !st.Degraded {
+			t.Fatalf("status = %+v, want no local fallback and a paused resolver", st)
 		}
 	})
 
@@ -538,7 +539,7 @@ func TestDNSStatus(t *testing.T) {
 		rules, _ := tunnelServers(t, &channelDialer{}, first.addr, second.addr)
 		rules.ResolveAll(context.Background(), "broken.example")
 		rules.ResolveAll(context.Background(), "good.example")
-		rules.dns.now = func() time.Time { return time.Now().Add(dnsDegradedWindow) }
+		rules.dns.now = func() time.Time { return time.Now().Add(upstreamPause) }
 		st := rules.DNSStatus()
 		if !st.Servers[1].LastFailed || st.Degraded {
 			t.Fatalf("status = %+v, want the failure shown and not degraded", st)
@@ -576,7 +577,7 @@ func TestDNSStatus(t *testing.T) {
 		}
 	})
 
-	t.Run("a down tunnel counts only the fallback", func(t *testing.T) {
+	t.Run("a down tunnel does not count as a resolver failure", func(t *testing.T) {
 		d := &channelDialer{}
 		d.down.Store(true)
 		rules, _ := tunnelServers(t, d, startFakeDNSServer(t, ok).addr)
@@ -585,27 +586,27 @@ func TestDNSStatus(t *testing.T) {
 		if s := st.Servers[0]; s.Fail != 0 || s.LastFailed || s.Error != "" {
 			t.Fatalf("server = %+v", s)
 		}
-		if st.LocalFallbacks != 1 {
-			t.Fatalf("fallbacks = %d, want 1", st.LocalFallbacks)
+		if st.Degraded {
+			t.Fatalf("status = %+v, want no local fallback or degradation", st)
 		}
 	})
 
-	t.Run("a fallback degrades for a minute", func(t *testing.T) {
+	t.Run("a down tunnel does not degrade DNS status", func(t *testing.T) {
 		d := &channelDialer{}
 		d.down.Store(true)
 		rules, _ := tunnelServers(t, d, startFakeDNSServer(t, ok).addr)
 		rules.ResolveAll(context.Background(), "a.example")
-		if !rules.DNSStatus().Degraded {
-			t.Fatal("not degraded right after a fallback")
-		}
-		rules.dns.now = func() time.Time { return time.Now().Add(dnsDegradedWindow) }
 		if rules.DNSStatus().Degraded {
-			t.Fatal("still degraded after the window")
+			t.Fatal("down tunnel was counted as local fallback")
+		}
+		rules.dns.now = func() time.Time { return time.Now().Add(upstreamPause) }
+		if rules.DNSStatus().Degraded {
+			t.Fatal("down tunnel changed DNS status")
 		}
 	})
 
 	t.Run("DoH reports its own mode", func(t *testing.T) {
-		rules, err := NewRuleEngine("")
+		rules, err := NewRuleEngine(nil)
 		if err != nil {
 			t.Fatalf("NewRuleEngine: %v", err)
 		}
@@ -617,150 +618,36 @@ func TestDNSStatus(t *testing.T) {
 	})
 }
 
-// TestIPRuleMatchesLocalAnswerOnNXDomain: with the setting on, an ip: rule sees
-// the local answer for a name public DNS does not know.
-func TestIPRuleMatchesLocalAnswerOnNXDomain(t *testing.T) {
-	f := startFakeDNSServer(t, func(string) (byte, netip.Addr) { return 3, netip.Addr{} })
-	rules, err := NewRuleEngine("ip:198.51.100.0/24")
+// TestTunnelDNSFailureDoesNotUseLocalDNS: an unreachable tunnel resolver is the
+// end of the lookup. The local resolver stays untouched, and the failure is not
+// cached, so the next request retries instead of inheriting a stale answer.
+func TestTunnelDNSFailureDoesNotUseLocalDNS(t *testing.T) {
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
-		t.Fatalf("NewRuleEngine: %v", err)
+		t.Fatal(err)
 	}
-	rules.SetTunnelDNS([]string{f.addr}, &channelDialer{})
+	var localCalls atomic.Int64
 	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
-		return []net.IPAddr{{IP: net.ParseIP("198.51.100.1")}}, nil
-	}
-	o := newTestOpener(rules, &fallbackDialer{})
-	if dst, err := o.prepare(context.Background(), "intranet.example", 443); dst.route != RouteTunnel || !errors.Is(err, errNotFound) {
-		t.Fatalf("setting off: prepare = %+v, %v", dst, err)
-	}
-	rules.dns.mu.Lock()
-	clear(rules.dns.cache)
-	rules.dns.mu.Unlock()
-	rules.dns.localOnNXDomain = true
-	if dst, err := o.prepare(context.Background(), "intranet.example", 443); err != nil || dst.route != RouteDirect || dst.reason != "direct:ip:198.51.100.0/24" {
-		t.Fatalf("setting on: prepare = %+v, %v", dst, err)
-	}
-}
-
-// TestLocalFallbackAfterSilentTunnelResolver: a silent tunnel resolver must
-// leave the local resolver time to answer. Before the tunnel step had its own
-// bound the local lookup got the expired context of the whole lookup.
-func TestLocalFallbackAfterSilentTunnelResolver(t *testing.T) {
-	rules, err := NewRuleEngine("")
-	if err != nil {
-		t.Fatalf("NewRuleEngine: %v", err)
-	}
-	rules.SetDOH(silentListener(t), testDialer{})
-	want := netip.MustParseAddr("93.184.216.34")
-	rules.dns.localLookup = func(ctx context.Context, _ string) ([]net.IPAddr, error) {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		return []net.IPAddr{{IP: want.AsSlice()}}, nil
-	}
-
-	start := time.Now()
-	addrs, err := rules.ResolveAll(context.Background(), "example.org")
-	if err != nil || len(addrs) != 1 || addrs[0] != want {
-		t.Fatalf("ResolveAll = (%v, %v), want the local answer", addrs, err)
-	}
-	if took := time.Since(start); took >= 5*time.Second {
-		t.Fatalf("took %v, want the tunnel step bound", took)
-	}
-}
-
-// TestIPRuleUsesLocalFallback: while no tunnel resolver answers, ip: rules keep
-// working through the local answer.
-func TestIPRuleUsesLocalFallback(t *testing.T) {
-	rules, err := NewRuleEngine("ip:10.0.0.0/8")
-	if err != nil {
-		t.Fatalf("NewRuleEngine: %v", err)
-	}
-	d := &channelDialer{}
-	d.down.Store(true)
-	rules.SetTunnelDNS([]string{"192.0.2.1:53"}, d)
-	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
+		localCalls.Add(1)
 		return []net.IPAddr{{IP: net.ParseIP("10.1.2.3")}}, nil
 	}
-	if dst, err := newTestOpener(rules, &fallbackDialer{}).prepare(context.Background(), "intranet.example", 443); err != nil || dst.route != RouteDirect {
-		t.Fatalf("prepare(intranet.example) = %+v, %v", dst, err)
+	rules.dns.tunnelUp = func() bool { return true }
+	rules.dns.tunnel = []*upstream{{name: "dns", lookup: func(context.Context, string) ([]netip.Addr, time.Time, error) {
+		return nil, time.Time{}, fmt.Errorf("%w: closed", errUnreachable)
+	}}}
+	for range 2 {
+		if _, err := rules.ResolveAll(context.Background(), "intranet.example"); err == nil {
+			t.Fatal("expected resolver failure")
+		}
+	}
+	if localCalls.Load() != 0 {
+		t.Fatalf("local DNS calls=%d, want 0", localCalls.Load())
+	}
+	if len(rules.dns.cache) != 0 {
+		t.Fatalf("failed tunnel lookup cached: %+v", rules.dns.cache)
 	}
 }
 
-// TestLocalFallbackNotCached: a local-resolver answer used while the DoH
-// endpoint is down must NOT be cached under the tunnel key — the cached
-// local address would then steer tunnel-routed connections for the whole
-// TTL (route policy silently replaced by home DNS). Degraded answers must
-// be returned but re-attempted per connection; authoritative DoH answers
-// keep caching normally.
-func TestLocalFallbackNotCached(t *testing.T) {
-	t.Run("fallback answer is not cached", func(t *testing.T) {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("listener: %v", err)
-		}
-		closed := l.Addr().String()
-		l.Close()
-
-		rules, err := NewRuleEngine("")
-		if err != nil {
-			t.Fatalf("NewRuleEngine: %v", err)
-		}
-		rules.SetDOH(closed, testDialer{})
-
-		addrs, err := rules.dns.ResolveAll(context.Background(), "localhost")
-		if err != nil || len(addrs) == 0 {
-			t.Skipf("local resolver unavailable: %v", err)
-		}
-		if got := rules.dns.lookups.Load(); got != 1 {
-			t.Fatalf("lookups after fallback = %d, want 1", got)
-		}
-
-		if _, err := rules.dns.ResolveAll(context.Background(), "localhost"); err != nil {
-			t.Fatalf("repeat ResolveAll: %v", err)
-		}
-		if got := rules.dns.lookups.Load(); got != 2 {
-			t.Fatalf("lookups after repeat = %d, want 2 (a fallback answer must not be cached)", got)
-		}
-		rules.dns.mu.Lock()
-		n := len(rules.dns.cache)
-		rules.dns.mu.Unlock()
-		if n != 0 {
-			t.Fatalf("cache size = %d, want 0: non-authoritative answer stored", n)
-		}
-	})
-
-	t.Run("authoritative answer is cached", func(t *testing.T) {
-		fake := startFakeDoHServer(t, func(name, qtype string) dohAnswer {
-			if name == "cached.example" && qtype == "A" {
-				return dohAnswer{status: 0, a: []string{"93.184.216.34"}}
-			}
-			return dohAnswer{status: 0}
-		})
-		rules, err := NewRuleEngine("")
-		if err != nil {
-			t.Fatalf("NewRuleEngine: %v", err)
-		}
-		d, b := setBootstrap(t, fake)
-		rules.SetDOH(b.addr, d)
-		rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
-
-		for i := 0; i < 2; i++ {
-			addrs, err := rules.dns.ResolveAll(context.Background(), "cached.example")
-			if err != nil || len(addrs) != 1 || addrs[0].String() != "93.184.216.34" {
-				t.Fatalf("ResolveAll #%d = (%v, %v)", i+1, addrs, err)
-			}
-		}
-		if got := rules.dns.lookups.Load(); got != 1 {
-			t.Fatalf("lookups = %d, want 1 (authoritative answer must be cached)", got)
-		}
-	})
-}
-
-// TestConcurrentMissSingleLookup: ten parallel ResolveAll calls for one
-// uncached name must share a single resolver round-trip (singleflight), not
-// fan out into ten DoH queries. The fake endpoint blocks until released, so
-// the cache is provably empty for every caller while they pile up.
 func TestConcurrentMissSingleLookup(t *testing.T) {
 	release := make(chan struct{})
 	var reqs atomic.Int64
@@ -772,7 +659,7 @@ func TestConcurrentMissSingleLookup(t *testing.T) {
 		}
 		return dohAnswer{status: 0}
 	})
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -835,7 +722,7 @@ func TestNegativeCaching(t *testing.T) {
 		}
 		return dohAnswer{status: 0}
 	})
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -868,5 +755,31 @@ func TestNegativeCaching(t *testing.T) {
 	}
 	if got := reqs.Load(); got <= first {
 		t.Fatalf("requests = %d after TTL window, want > %d: negative entries must expire", first, got)
+	}
+}
+
+func TestTunnelDNSPauseIsPerSSHServer(t *testing.T) {
+	ip := netip.MustParseAddr("93.184.216.34")
+	resolver := startFakeDNSServer(t, func(string) (byte, netip.Addr) { return 0, ip })
+	a := newSSHTransportPool(&scriptedSlotDialer{errs: []error{errors.New("SSH channel unavailable")}})
+	a.id = "edge-a"
+	b := newSSHTransportPool(&channelDialer{})
+	b.id = "edge-b"
+	rules, err := NewRuleEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rules.Stop)
+	rules.SetTunnelDNS([]string{resolver.addr}, &sshDialerSet{pools: []*sshTransportPool{a, b}})
+	if _, err := rules.dns.ResolveAll(contextWithDialer(t.Context(), a), "same.example"); !errors.Is(err, errUnreachable) {
+		t.Fatalf("edge-a resolver error = %v", err)
+	}
+	if result, err := rules.dns.ResolveAll(contextWithDialer(t.Context(), b), "same.example"); err != nil || len(result) != 1 || result[0] != ip {
+		t.Fatalf("edge-b resolver answer = %v, error = %v", result, err)
+	}
+	st := rules.DNSStatus()
+	if !st.Degraded || len(st.Servers) != 2 || st.Servers[0].ServerID != a.id || !st.Servers[0].Paused ||
+		st.Servers[1].ServerID != b.id || st.Servers[1].Paused || st.Servers[1].OK != 1 {
+		t.Fatalf("DNS status does not show pause only on edge-a: %+v", st)
 	}
 }

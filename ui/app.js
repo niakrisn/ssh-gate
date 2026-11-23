@@ -14,19 +14,41 @@ const STATUS_LABEL = {
 
 const PROTO_LABEL = { socks5: 'SOCKS5', http: 'HTTP' };
 
-// Tunnel states from /api/status (ssh.state) while the session is down.
+// SSH transport states from /api/status.
 const TUNNEL_LABEL = {
+  connected: 'подключён',
   connecting: 'подключение',
   reconnecting: 'переподключение',
   key_rejected: 'VPS не принимает ключ: добавьте ssh_key.pub в authorized_keys',
   unreachable: 'SSH-сессия не подключена',
-  host_key_mismatch: 'ключ хоста изменился: удалите ssh_known_hosts, чтобы доверять новому',
+  host_key_mismatch: 'ключ хоста изменился',
   ssh_error: 'ошибка SSH',
+  healthy: 'работает',
+  checking: 'проверка',
+  excluded: 'исключён',
+  disconnected: 'нет соединения',
 };
 
 const state = { tab: 'active', page: 1, q: '', proto: '' };
 
 const $ = (id) => document.getElementById(id);
+
+const stateLabel = (name) => TUNNEL_LABEL[name] || name || 'неизвестно';
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+// Согласование существительного с числительным: 1 туннель, 2 туннеля, 5 туннелей.
+function plural(n, one, few, many) {
+  const ten = n % 10, hundred = n % 100;
+  if (ten === 1 && hundred !== 11) return one;
+  if (ten >= 2 && ten <= 4 && (hundred < 12 || hundred > 14)) return few;
+  return many;
+}
 
 function apiParams() {
   const p = new URLSearchParams({
@@ -113,6 +135,12 @@ function render(data) {
         } else {
           td.textContent = fmtAddr(it.host, it.port);
         }
+        if (it.server_id) {
+          const path = document.createElement('span');
+          path.className = 'dest-name';
+          path.textContent = ' · SSH ' + it.server_id + '/#' + it.transport;
+          td.appendChild(path);
+        }
         td.className = 'dest';
       } else if (i === 3) { // status renders as a colored dot
         const span = document.createElement('span');
@@ -195,69 +223,211 @@ async function refreshStatus() {
   try {
     const res = await fetch('/api/status');
     if (!res.ok) return;
-    renderStatus(await res.json());
+    lastStatus = await res.json();
+    renderStatus(lastStatus);
   } catch (e) {
     // polling: skip errors silently, the next tick retries.
   }
 }
 
-// DNS row: per-server answers and failures since the start; degraded means a
-// server is paused or names reached the local resolver in the last minute.
+// DNS row: answers and failures per SSH server and resolver.
 function renderDNS(dns) {
   $('dns-row').hidden = !dns;
   if (!dns) return;
   $('dns-dot').className = 'dot ' + (dns.degraded ? 'warn' : 'ok');
+  const resolverLabel = (srv) => srv.server_id ? srv.server_id + ' / ' + srv.name : srv.name;
   const parts = dns.servers.map((srv) => {
-    if (srv.ok + srv.fail === 0) return srv.name + ' не использовался';
-    let p = srv.name;
+    const label = resolverLabel(srv);
+    if (srv.ok + srv.fail === 0) return label + ' не использовался';
+    let p = label;
+    if (srv.paused) p += ' · пауза';
     if (srv.last_ok_at > 0) p += ' · ' + srv.rtt_ms + ' мс';
     if (srv.fail > 0) p += ' · ошибок ' + srv.fail + ' из ' + (srv.ok + srv.fail);
     return p;
   });
-  if (dns.local_fallbacks > 0) parts.push('локальный резерв: ' + dns.local_fallbacks);
   $('dns-info').textContent = 'DNS: ' + parts.join(' · ');
   // last error of each server, full text
-  $('dns-info').title = dns.servers.filter((srv) => srv.error).map((srv) => srv.name + ': ' + srv.error).join('\n');
+  $('dns-info').title = dns.servers.filter((srv) => srv.error).map((srv) => resolverLabel(srv) + ': ' + srv.error).join('\n');
 }
+
+// --- детализация по SSH-серверам -------------------------------------------
+//
+// Квоты показаны полосами занятости: абсолютное число без ёмкости не читается,
+// 99 из 8192 и 99 из 128 — это разные ситуации. TCP-счётчики транспорта свёрнуты,
+// пока транспорт спокоен, и раскрываются сами при росте retrans или RTT, при
+// ошибке, при потере соединения — и вручную по клику.
+
+// Клик закрепляет состояние строки: иначе шумный транспорт, который оператор
+// свернул, развернулся бы обратно на следующем полле.
+const tcpPinned = new Map();
+let tcpPrev = new Map();
+let lastStatus = null;
+
+// Ретрансмисции считаются с момента connect, поэтому само число ни о чём не
+// говорит — важно, что оно приросло с прошлого полла. Уменьшение означает
+// переподключение транспорта, а не улучшение.
+function tcpGrew(prev, tcp) {
+  if (!prev || !tcp) return false;
+  if (tcp.total_retrans > prev.retrans) return true;
+  return tcp.rtt_ms > prev.rtt * 1.5 + 0.1;
+}
+
+function quotaRow(name, hint, used, limit, extra) {
+  used = used || 0;
+  limit = limit || 0;
+  const row = el('div', 'quota');
+  const label = el('span', 'quota-name', name);
+  label.title = hint;
+  row.appendChild(label);
+  const pct = limit > 0 ? (used / limit) * 100 : 0;
+  const bar = el('span', 'bar');
+  const fill = el('i', pct >= 95 ? 'err' : pct >= 80 ? 'warn' : 'ok');
+  // Ширина ставится всегда: без этого незаполненная полоса растягивается на
+  // весь блок и пустой лимит выглядит как исчерпанный.
+  fill.style.width = (used > 0 ? Math.max(pct, 2) : 0) + '%';
+  bar.appendChild(fill);
+  row.appendChild(bar);
+  const value = el('span', 'quota-num', used + '/' + limit + ' · ' +
+    (used > 0 && pct < 1 ? '<1' : Math.round(pct)) + '%');
+  if (extra) value.appendChild(el('em', null, ' · ' + extra));
+  row.appendChild(value);
+  return row;
+}
+
+function healthRow(server) {
+  const h = server.health || {};
+  const row = el('div', 'quota');
+  const label = el('span', 'quota-name', 'доступность');
+  label.title = (h.url || '') + ' — запрос идёт через свежий канал SSH, из сети SSH-сервера';
+  row.appendChild(label);
+  const value = el('span', 'quota-num wide ' + (h.last_error ? 'bad' : 'ok'),
+    (h.last_error ? '✗ ' : '✓ ') + (h.successes || 0) + '/' + (h.success_limit || 0) +
+    (h.failures ? ' · ошибок ' + h.failures : ''));
+  if (server.checked_at) value.appendChild(el('em', null, ' · ' + fmtStarted(server.checked_at)));
+  if (h.excluded_until && h.excluded_until * 1000 > Date.now()) {
+    value.appendChild(el('em', 'warn', ' · исключён до ' + fmtStarted(h.excluded_until)));
+  }
+  row.appendChild(value);
+  return row;
+}
+
+function slotRow(server, slot, prev) {
+  const key = server.id + '/' + slot.slot;
+  const expandable = !!slot.tcp;
+  const open = tcpPinned.has(key) ? tcpPinned.get(key)
+    : !slot.connected || !!slot.error || tcpGrew(prev, slot.tcp);
+  const btn = el('button', 'slot' + (slot.connected ? '' : ' bad'));
+  btn.type = 'button';
+  btn.dataset.tcpKey = key;
+  btn.disabled = !expandable;
+  btn.setAttribute('aria-expanded', expandable && open ? 'true' : 'false');
+  btn.appendChild(el('span', 'chev', expandable ? (open ? '▾' : '▸') : '·'));
+  btn.appendChild(el('span', 'slot-id', '#' + slot.slot));
+  btn.appendChild(el('span', 'slot-state', stateLabel(slot.state)));
+  const n = slot.active_channels || 0;
+  btn.appendChild(el('span', 'slot-load', n + ' ' + plural(n, 'подключение', 'подключения', 'подключений')));
+  if (slot.state === 'host_key_mismatch') {
+    const advice = 'Независимо проверьте новый отпечаток, затем замените только запись ' + server.id + ' в ssh_known_hosts и перезапустите службу.';
+    btn.appendChild(el('span', 'slot-error', [slot.error, advice].filter(Boolean).join(' ')));
+  } else if (slot.error) {
+    btn.appendChild(el('span', 'slot-error', slot.error));
+  }
+  if (expandable && open) {
+    const t = slot.tcp;
+    const grew = prev ? t.total_retrans - prev.retrans : 0;
+    let text = 'RTT ' + t.rtt_ms.toFixed(2) + '/' + t.min_rtt_ms.toFixed(2) + ' мс · retrans ' + t.total_retrans;
+    if (grew > 0) text += ' (+' + grew + ')';
+    text += ' · ↑' + fmtBytes(t.bytes_sent) + ' ↓' + fmtBytes(t.bytes_received);
+    const tcp = el('span', 'slot-tcp', text);
+    tcp.title = 'rttvar ' + t.rttvar_ms + ' мс · cwnd ' + t.cwnd +
+      (typeof t.last_data_recv_s === 'number' ? ' · последние данные ' + t.last_data_recv_s.toFixed(1) + ' с назад' : '');
+    btn.appendChild(tcp);
+  }
+  const li = el('li');
+  li.appendChild(btn);
+  return li;
+}
+
+function renderServers(servers) {
+  const box = $('server-detail');
+  // Блоки пересобираются на каждый полл, поэтому фокус возвращается той же
+  // строке транспорта — иначе клик по раскрытию теряется через 2,5 с.
+  const active = document.activeElement;
+  const focusKey = active && active.dataset ? active.dataset.tcpKey : '';
+  box.innerHTML = '';
+  const seen = new Map();
+  servers.forEach((server) => {
+    const limits = server.limits || {};
+    const health = server.health || {};
+    const section = el('section', 'server');
+    if (servers.length > 1) section.appendChild(el('h2', 'server-id', server.id));
+    const quotas = el('div', 'quotas');
+    quotas.appendChild(quotaRow('подключения', 'Клиентские подключения, обслуживаемые через этот SSH-сервер, из его лимита',
+      limits.client_tunnels_in_use, limits.client_tunnels));
+    quotas.appendChild(quotaRow('открываются', 'Клиентские channel open в ожидании: назначение ещё не принято или отваливается по таймауту самого SSH-сервера',
+      limits.pending_opens_in_use, limits.pending_opens));
+    // Канал без клиентского подключения за спиной — это tunnel DNS и HTTPS-проба
+    // на том же транспорте. Оба счётчика читаются не одним атомарным действием,
+    // поэтому отрицательная разница возможна и означает гонку, а не утечку.
+    const service = Math.max(0, (server.active_channels || 0) - (limits.client_tunnels_in_use || 0));
+    quotas.appendChild(quotaRow('DNS и проверка', 'DNS-запросы и HTTPS-проба, ожидающие channel open; плюс — уже открытые служебные каналы',
+      limits.service_opens_in_use, limits.service_opens, '+' + service + ' служебных'));
+    quotas.appendChild(healthRow(server));
+    section.appendChild(quotas);
+    if (server.reason) section.appendChild(el('p', 'note', server.reason));
+    if (health.last_error) section.appendChild(el('p', 'note', 'проверка: ' + health.last_error));
+    const list = el('ul', 'slots');
+    for (const slot of server.transports || []) {
+      const key = server.id + '/' + slot.slot;
+      list.appendChild(slotRow(server, slot, tcpPrev.get(key)));
+      if (slot.tcp) seen.set(key, { retrans: slot.tcp.total_retrans, rtt: slot.tcp.rtt_ms });
+    }
+    section.appendChild(list);
+    box.appendChild(section);
+  });
+  tcpPrev = seen;
+  box.hidden = box.children.length === 0;
+  if (focusKey) {
+    const again = box.querySelector('.slot[data-tcp-key="' + CSS.escape(focusKey) + '"]');
+    if (again) again.focus();
+  }
+}
+
+$('server-detail').addEventListener('click', (e) => {
+  const btn = e.target.closest('.slot');
+  if (!btn || btn.disabled) return;
+  tcpPinned.set(btn.dataset.tcpKey, btn.getAttribute('aria-expanded') !== 'true');
+  if (lastStatus) renderServers((lastStatus.ssh || {}).servers || []);
+});
 
 function renderStatus(s) {
   const ssh = s.ssh || {};
-  if (ssh.state === 'not_configured') {
-    $('ssh-dot').className = 'dot err';
-    $('ssh-info').textContent = 'Не настроено: задайте SSH_HOST и SSH_USER и перезапустите сервис · работает ' + fmtUptime(s.uptime_s);
-    $('tunnel-info').hidden = true;
+  const servers = ssh.servers || [];
+  if (servers.length === 0) {
+    $('ssh-dot').className = 'dot warn';
+    $('ssh-info').textContent = 'SSH-серверы не заданы · доступны прямые маршруты · работает ' + fmtUptime(s.uptime_s);
+    $('server-detail').hidden = true;
     $('dns-row').hidden = true;
-    $('active-summary').textContent = 'Прокси выключены';
-    $('active-count').textContent = '';
+    const directActive = Object.entries(s.active || {}).filter(([, n]) => n > 0).map(([p, n]) => (PROTO_LABEL[p] || p) + ' ' + n);
+    $('active-summary').textContent = directActive.length ? 'Активные: ' + directActive.join(' · ') : 'Активных нет';
+    $('active-count').textContent = s.active_total > 0 ? '(' + s.active_total + ')' : '';
     return;
   }
-  const dotState = !ssh.reachable ? 'err' : ssh.connected ? 'ok' : 'warn';
+  const dotState = ssh.eligible ? 'ok' : ssh.connected ? 'warn' : 'err';
   $('ssh-dot').className = 'dot ' + dotState;
-  let info = ssh.host + ':' + ssh.port + ' · ';
-  info += ssh.reachable ? ssh.rtt_ms + ' мс · ' : 'недоступен · ';
-  info += ssh.connected ? 'SSH-сессия активна' : TUNNEL_LABEL[ssh.state] || 'SSH-сессия не подключена';
-  info += ' · работает ' + fmtUptime(s.uptime_s);
-  $('ssh-info').textContent = info;
-  $('ssh-info').title = ssh.error || ''; // last connect error, full text
+  $('ssh-info').textContent = servers.map((server) => {
+    const connected = (server.transports || []).filter((slot) => slot.connected).length;
+    const slots = (server.transports || []).length;
+    return server.id + ' · ' + server.address + ' · ' + stateLabel(server.state) + ' · транспорты ' + connected + '/' + slots;
+  }).join(' | ') + ' · работает ' + fmtUptime(s.uptime_s);
+  // A transport can fail while the server still serves traffic, and then
+  // server.reason stays empty; the tooltip falls back to the slot's own error.
+  const slotError = (server) => (server.transports || []).map((slot) => slot.error).find(Boolean) || '';
+  $('ssh-info').title = servers.map((server) => server.id + ': ' + (server.reason || slotError(server) || 'нет ошибок')).join('\n');
   renderDNS(s.dns);
 
-  // Second row: live tcp_info of the tunnel connection (null off-Linux or
-  // without a session); retrans and >60 s of silence are early
-  // path-degradation signs.
-  const detail = $('tunnel-info');
-  if (ssh.connected && ssh.tcp) {
-    const t = ssh.tcp;
-    let d = 'Туннель: RTT ' + t.rtt_ms + ' мс';
-    if (t.min_rtt_ms > 0) d += ' (min ' + t.min_rtt_ms + ')';
-    d += ' · retrans ' + t.total_retrans + ' · cwnd ' + t.cwnd;
-    d += ' · ' + fmtBytes(t.bytes_sent) + '↑ ' + fmtBytes(t.bytes_received) + '↓';
-    const silent = Math.max(t.last_data_recv_s, t.last_ack_recv_s);
-    if (silent > 60) d += ' · тишина ' + Math.round(silent) + ' с';
-    detail.textContent = d;
-    detail.hidden = false;
-  } else {
-    detail.hidden = true;
-  }
+  // Квоты и транспорты по каждому серверу.
+  renderServers(servers);
 
   const parts = [];
   for (const [p, n] of Object.entries(s.active || {})) {

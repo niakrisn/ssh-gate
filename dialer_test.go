@@ -129,6 +129,7 @@ func TestTrackDialMetaHostPriority(t *testing.T) {
 	tr := NewConnTracker(8, time.Minute)
 	d := &sshDialer{cfg: sshDialerCfg{tracker: tr}}
 	ctx := ctxWithConnMeta(context.Background(), ConnMeta{Proto: "socks5", Src: "10.0.0.5:4321", Host: "example.com"})
+	ctx = contextWithTransport(ctx, "edge-a", 2)
 
 	if _, err := d.DialContext(ctx, "tcp", "1.2.3.4:443"); err == nil {
 		t.Fatal("want dial error (no SSH client)")
@@ -221,6 +222,9 @@ func TestTrackDialSuccessLifecycle(t *testing.T) {
 	d := &sshDialer{client: client, cfg: sshDialerCfg{tracker: tr}}
 
 	ctx := ctxWithConnMeta(context.Background(), ConnMeta{Proto: "socks5", Src: "10.0.0.5:4321", Host: "example.com"})
+	// The pool stamps the server and slot on the context; a direct dialer test
+	// has to do the same, otherwise the record carries an empty path.
+	ctx = contextWithTransport(ctx, "edge-a", 2)
 	conn, err := d.DialContext(ctx, "tcp", "127.0.0.1:9")
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -232,6 +236,9 @@ func TestTrackDialSuccessLifecycle(t *testing.T) {
 	}
 	if active[0].Host != "example.com" || active[0].Port != 9 {
 		t.Fatalf("active record: %+v", active[0])
+	}
+	if active[0].ServerID != "edge-a" || active[0].Transport != 2 {
+		t.Fatalf("SSH path = %s/%d, want edge-a/2", active[0].ServerID, active[0].Transport)
 	}
 	// the dial address is an IP literal: the record must keep it as DstIP.
 	if active[0].DstIP != "127.0.0.1" {
@@ -663,6 +670,7 @@ func TestDialerLazyStartAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSSHDialer against a dead endpoint: %v", err)
 	}
+	d.start()
 	t.Cleanup(d.stop)
 	if d.Connected() {
 		t.Fatal("Connected() true before any SSH server exists")

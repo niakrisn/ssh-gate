@@ -25,9 +25,11 @@ const (
 
 // ConnMeta carries proxy-side connection metadata through the dial context.
 type ConnMeta struct {
-	Proto string
-	Src   string
-	Host  string
+	Proto     string
+	Src       string
+	Host      string
+	ServerID  string
+	Transport int
 	// DstIP is the IP the tunnel is actually dialed to (filled by trackDial
 	// when the dial address is an IP literal). The opener resolves names
 	// before dialing, so production tunnel dials always carry an IP
@@ -50,6 +52,8 @@ type ConnView struct {
 	BytesUp    int64     `json:"bytes_up"`
 	BytesDown  int64     `json:"bytes_down"`
 	Reason     string    `json:"reason"`
+	ServerID   string    `json:"server_id,omitempty"`
+	Transport  int       `json:"transport"`
 }
 
 type connRecord struct {
@@ -65,6 +69,8 @@ type connRecord struct {
 	bytesUp   int64
 	bytesDown int64
 	reason    string
+	serverID  string
+	transport int
 	live      *trackedConn
 }
 
@@ -104,6 +110,8 @@ func (t *ConnTracker) Begin(meta ConnMeta, host string, port int) uint64 {
 		src:       meta.Src,
 		host:      host,
 		dstIP:     meta.DstIP,
+		serverID:  meta.ServerID,
+		transport: meta.Transport,
 		port:      port,
 		status:    StateDialing,
 		startedAt: time.Now(),
@@ -416,6 +424,8 @@ func toView(r connRecord, now time.Time) ConnView {
 		BytesUp:    up,
 		BytesDown:  down,
 		Reason:     r.reason,
+		ServerID:   r.serverID,
+		Transport:  r.transport,
 	}
 }
 

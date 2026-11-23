@@ -1,8 +1,26 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+// testSocketPath returns a path for a test unix socket. t.TempDir() embeds the
+// test name in a deep /var/folders tree on macOS, where a socket path is capped
+// at 103 bytes: a long test name then makes ListenUnixgram fail with
+// "bind: invalid argument". /tmp keeps the path short on every platform.
+func testSocketPath(t *testing.T, name string) string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp("/tmp", "sgt")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	return filepath.Join(dir, name)
+}
 
 func TestContains(t *testing.T) {
 	tests := []struct {

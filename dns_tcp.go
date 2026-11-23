@@ -53,7 +53,8 @@ func dnsServerLookup(d dialer, server string) func(context.Context, string) ([]n
 			}
 		}()
 		exchange := func() error {
-			conn, err := d.DialContext(ctxWithNoTrack(work), "tcp", server)
+			dialCtx := ctxWithNoTrack(work)
+			conn, err := dialerForContext(dialCtx, d).DialContext(dialCtx, "tcp", server)
 			if err != nil {
 				return fmt.Errorf("%w: %w", errUnreachable, err)
 			}

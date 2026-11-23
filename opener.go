@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -23,6 +24,8 @@ type Opener struct {
 	d           dialer
 	family      IPFamily
 	dialTimeout time.Duration
+	hashKey     string
+	maxAttempts int
 }
 
 type destination struct {
@@ -45,12 +48,11 @@ func (o *Opener) prepare(ctx context.Context, host string, port int) (destinatio
 	dst := destination{host: host, port: port, route: route, reason: reason}
 
 	var addrs []netip.Addr
-	var localDirect bool
 	var err error
 	if route == RouteDirect {
 		addrs, err = o.rules.dns.localResolveAll(ctx, host)
 	} else {
-		addrs, localDirect, err = o.rules.dns.resolveTunnel(ctx, host)
+		addrs, _, err = o.rules.dns.resolveTunnel(ctx, host)
 		if err == nil {
 			if reason := o.rules.matchCIDR(addrs); reason != "" {
 				dst.route, dst.reason = RouteDirect, reason
@@ -92,15 +94,7 @@ func (o *Opener) prepare(ctx context.Context, host string, port int) (destinatio
 			return dst, nil
 		}
 
-		// With localOnNXDomain a private answer of the local resolver is an
-		// intranet name, for example behind a VPN that overrides DNS: it
-		// goes direct. Loopback and link-local stay refused, or a page could
-		// point its own name at them by DNS rebinding.
-		reachable := dropHostLocal(addrs)
-		if !localDirect || len(reachable) == 0 {
-			return dst, fmt.Errorf("resolve %s: only private addresses (%s), refused through the tunnel; add a direct rule to reach it directly", host, addrs[0])
-		}
-		addrs, dst.route, dst.reason = reachable, RouteDirect, "local-private"
+		return dst, fmt.Errorf("resolve %s: only private addresses (%s), refused through the tunnel; add a direct rule to reach it directly", host, addrs[0])
 	}
 
 	var out []netip.Addr
@@ -122,53 +116,211 @@ func (o *Opener) prepare(ctx context.Context, host string, port int) (destinatio
 // reason. Tunnel dials carry ConnMeta on the dial context. On total failure
 // the error is the first dial's, or the overall deadline, with the attempt count.
 func (o *Opener) Open(ctx context.Context, src, proto, host string, port int) (net.Conn, string, Route, string, error) {
-	dst, err := o.prepare(ctx, host, port)
-	addrs, route, reason := dst.addrs, dst.route, dst.reason
-	if err != nil {
-		// Preserve the failure stage for protocol replies and access logs.
-		var dnsErr *DNSError
-		if !errors.As(err, &dnsErr) {
-			err = NewDNSError(host, err)
-		}
-		return nil, "", route, reason, err
-	}
-	log.Debug().Str("host", host).Str("route", route.String()).Int("addresses", len(addrs)).Msg("dial resolve")
-
 	budget := o.dialTimeout
 	if budget <= 0 {
 		budget = 30 * time.Second
 	}
-	ctx = ctxWithConnMeta(ctx, ConnMeta{Proto: proto, Src: src, Host: host})
-	dial := func(ctx context.Context, ip netip.Addr) (net.Conn, error) {
-		return o.d.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+	maxAttempts := o.maxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 3
 	}
-	if route == RouteDirect {
+	initialRoute, initialReason := o.rules.decideHost(host)
+	if initialRoute == RouteTunnel {
+		if selector, ok := o.d.(*sshDialerSet); ok {
+			deadlineCtx, cancel := context.WithTimeout(ctx, budget)
+			defer cancel()
+			pools := selector.rankedPools(src, host, o.hashKey)
+			if len(pools) == 0 {
+				return nil, "", RouteTunnel, initialReason, NewNetworkError("SSH dial", host, errors.New("no eligible SSH server"))
+			}
+			openBudget := &sshOpenBudget{limit: int64(maxAttempts)}
+			var lastErr error
+			var lastIP netip.Addr
+			lastRoute, lastReason := RouteTunnel, initialReason
+			for poolIndex, pool := range pools {
+				if err := deadlineCtx.Err(); err != nil {
+					lastErr = err
+					break
+				}
+				// Moving to another server costs one attempt. The remaining
+				// budget covers client channel opens across all IPs and slots.
+				if poolIndex > 0 {
+					openBudget.take()
+				}
+				remaining := openBudget.remaining()
+				if remaining == 0 {
+					break
+				}
+				var release func()
+				if pool.quota != nil {
+					var err error
+					release, err = pool.quota.reserveTunnel()
+					if err != nil {
+						log.Warn().Str("server_id", pool.id).Str("limit_type", "client_tunnels").Err(err).Msg("SSH server quota exhausted")
+						return nil, "", RouteTunnel, initialReason, NewNetworkError("SSH dial", host, err)
+					}
+				}
+				poolCtx := contextWithDialer(deadlineCtx, pool)
+				dst, err := o.prepare(poolCtx, host, port)
+				lastRoute, lastReason = dst.route, dst.reason
+				if err != nil {
+					if release != nil {
+						release()
+					}
+					lastErr = err
+					if errors.Is(err, errNotFound) || sshQuotaExhausted(err) {
+						return nil, "", dst.route, dst.reason, err
+					}
+					continue
+				}
+				if dst.route == RouteDirect {
+					if release != nil {
+						release()
+						release = nil
+					}
+					conn, ip, n, err := o.dialPrepared(poolCtx, src, proto, host, port, dst, o.d, remaining)
+					if err != nil {
+						return nil, "", dst.route, dst.reason, fmt.Errorf("direct dial to %s:%d failed: %w", host, port, withAttempts(err, n))
+					}
+					return conn, ip.String(), dst.route, dst.reason, nil
+				}
+				dialCtx := context.WithValue(poolCtx, sshOpenBudgetKey{}, openBudget)
+				conn, ip, _, err := o.dialPrepared(dialCtx, src, proto, host, port, dst, pool, remaining)
+				if err == nil {
+					if release != nil {
+						conn = &leaseConn{Conn: conn, release: release}
+						release = nil
+					}
+					return conn, ip.String(), dst.route, dst.reason, nil
+				}
+				if release != nil {
+					release()
+				}
+				lastErr, lastIP = err, ip
+				if sshQuotaExhausted(err) || errors.Is(err, context.DeadlineExceeded) || deadlineCtx.Err() != nil || openBudget.remaining() == 0 {
+					break
+				}
+			}
+			if lastErr == nil {
+				lastErr = errSSHOpenBudgetExhausted
+			}
+			addr := host
+			if lastIP.IsValid() {
+				addr = lastIP.String()
+			}
+			err := error(NewNetworkError("SSH dial", net.JoinHostPort(addr, strconv.Itoa(port)), lastErr))
+			if attempts := maxAttempts - openBudget.remaining(); attempts > 1 {
+				err = fmt.Errorf("%w (%d attempts)", err, attempts)
+			}
+			return nil, "", lastRoute, lastReason, err
+		}
+	}
+
+	dst, err := o.prepare(ctx, host, port)
+	if err != nil {
+		var dnsErr *DNSError
+		if !errors.As(err, &dnsErr) {
+			err = NewDNSError(host, err)
+		}
+		return nil, "", dst.route, dst.reason, err
+	}
+	conn, ip, attempts, err := o.dialPrepared(ctx, src, proto, host, port, dst, o.d, maxAttempts)
+	if err != nil {
+		if dst.route == RouteDirect {
+			err = fmt.Errorf("direct dial to %s:%d failed: %w", host, port, withAttempts(err, attempts))
+		} else {
+			addr := host
+			if ip.IsValid() {
+				addr = ip.String()
+			}
+			err = withAttempts(NewNetworkError("SSH dial", net.JoinHostPort(addr, strconv.Itoa(port)), err), attempts)
+		}
+		return nil, "", dst.route, dst.reason, err
+	}
+	return conn, ip.String(), dst.route, dst.reason, nil
+}
+
+type sshOpenBudgetKey struct{}
+
+// sshOpenBudget is shared by the parallel IP attempts of a single request.
+type sshOpenBudget struct {
+	limit int64
+	used  atomic.Int64
+}
+
+var errSSHOpenBudgetExhausted = errors.New("SSH retries exhausted")
+
+func (b *sshOpenBudget) remaining() int {
+	return int(b.limit - b.used.Load())
+}
+
+func (b *sshOpenBudget) take() bool {
+	for used := b.used.Load(); used < b.limit; used = b.used.Load() {
+		if b.used.CompareAndSwap(used, used+1) {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *Opener) dialPrepared(ctx context.Context, src, proto, host string, port int, dst destination, d dialer, maxAttempts int) (net.Conn, netip.Addr, int, error) {
+	ctx = ctxWithConnMeta(ctx, ConnMeta{Proto: proto, Src: src, Host: host})
+	budget := o.dialTimeout
+	if budget <= 0 {
+		budget = 30 * time.Second
+	}
+	delay := 250 * time.Millisecond
+	dial := func(ctx context.Context, ip netip.Addr) (net.Conn, error) {
+		return d.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+	}
+	if dst.route == RouteDirect {
 		budget = 5 * time.Second
+		delay = 0
 		dial = func(ctx context.Context, ip netip.Addr) (net.Conn, error) {
 			return dialDirectIP(ctx, ip, port, o.family)
 		}
 	}
-	conn, ip, attempts, err := dialCandidates(ctx, addrs, budget, 250*time.Millisecond, dial)
-	if err == nil {
-		return conn, ip.String(), route, reason, nil
+	return dialCandidatesLimit(ctx, dst.addrs, budget, delay, maxAttempts, dial)
+}
+
+type leaseConn struct {
+	net.Conn
+	release func()
+	closed  atomic.Bool
+}
+
+func (c *leaseConn) Close() error {
+	err := c.Conn.Close()
+	if c.closed.CompareAndSwap(false, true) && c.release != nil {
+		c.release()
 	}
-	if route == RouteDirect {
-		err = fmt.Errorf("direct dial to %s:%d failed: %w", host, port, err)
-	} else {
-		addr := host
-		if ip.IsValid() {
-			addr = ip.String()
-		}
-		err = NewNetworkError("SSH dial", net.JoinHostPort(addr, strconv.Itoa(port)), err)
+	return err
+}
+
+func (c *leaseConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
 	}
-	return nil, "", route, reason, withAttempts(err, attempts)
+	return nil
 }
 
 // dialCandidates owns one deadline and at most two waiting attempts.
 // SSH opens that outlive an attempt stay in sshDialer's bounded pending pool.
 func dialCandidates(ctx context.Context, addrs []netip.Addr, budget, delay time.Duration, dial func(context.Context, netip.Addr) (net.Conn, error)) (net.Conn, netip.Addr, int, error) {
-	ctx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
+	return dialCandidatesLimit(ctx, addrs, budget, delay, len(addrs), dial)
+}
+
+func dialCandidatesLimit(ctx context.Context, addrs []netip.Addr, budget, delay time.Duration, maxAttempts int, dial func(context.Context, netip.Addr) (net.Conn, error)) (net.Conn, netip.Addr, int, error) {
+	ctx, timeout := context.WithTimeout(ctx, budget)
+	defer timeout()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	requestErr := func() error {
+		if cause := context.Cause(ctx); sshQuotaExhausted(cause) {
+			return cause
+		}
+		return ctx.Err()
+	}
 	unique := make([]netip.Addr, 0, len(addrs))
 	seen := make(map[netip.Addr]bool, len(addrs))
 	for _, ip := range addrs {
@@ -179,6 +331,12 @@ func dialCandidates(ctx context.Context, addrs []netip.Addr, budget, delay time.
 	}
 	if len(unique) == 0 {
 		return nil, netip.Addr{}, 0, errors.New("no destination addresses")
+	}
+	if maxAttempts < 1 {
+		return nil, netip.Addr{}, 0, errors.New("attempt limit must be positive")
+	}
+	if len(unique) > maxAttempts {
+		unique = unique[:maxAttempts]
 	}
 	attemptBudget := max(2*time.Second, budget/time.Duration((len(unique)+1)/2))
 	type result struct {
@@ -208,7 +366,9 @@ func dialCandidates(ctx context.Context, addrs []netip.Addr, budget, delay time.
 			if err == nil {
 				conn, err = dial(attempt, ip)
 			}
-			if attempt.Err() != nil {
+			if sshQuotaExhausted(err) {
+				cancel(err)
+			} else if attempt.Err() != nil {
 				err = attempt.Err()
 			}
 			if err != nil && conn != nil {
@@ -226,14 +386,14 @@ func dialCandidates(ctx context.Context, addrs []netip.Addr, budget, delay time.
 		}()
 	}
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := requestErr(); err != nil {
 			return nil, firstIP, attempts, err
 		}
 		if active == 0 && attempts < len(unique) {
 			launch()
 		}
 		if active == 0 {
-			if err := ctx.Err(); err != nil {
+			if err := requestErr(); err != nil {
 				return nil, firstIP, attempts, err
 			}
 			return nil, firstIP, attempts, firstErr
@@ -246,14 +406,14 @@ func dialCandidates(ctx context.Context, addrs []netip.Addr, budget, delay time.
 		}
 		select {
 		case <-ctx.Done():
-			return nil, firstIP, attempts, ctx.Err()
+			return nil, firstIP, attempts, requestErr()
 		case <-next:
 			if ctx.Err() == nil {
 				launch()
 			}
 		case r := <-results:
 			active--
-			if err := ctx.Err(); err != nil {
+			if err := requestErr(); err != nil {
 				if r.conn != nil {
 					r.conn.Close()
 				}
@@ -262,7 +422,7 @@ func dialCandidates(ctx context.Context, addrs []netip.Addr, budget, delay time.
 			if r.err == nil {
 				return r.conn, r.ip, attempts, nil
 			}
-			if firstErr == nil {
+			if firstErr == nil || errors.Is(firstErr, errSSHOpenBudgetExhausted) {
 				firstErr, firstIP = r.err, r.ip
 			}
 			// A refusal frees a slot immediately; it does not add another delay.

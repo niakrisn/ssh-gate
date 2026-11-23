@@ -76,7 +76,7 @@ func TestConnTrackerPaginationOverflow(t *testing.T) {
 }
 
 func TestConnectionsPaginationBoundary(t *testing.T) {
-	addr := startTestHealth(t, testDialer{}, paginationTracker(), "", 0)
+	addr := startTestHealth(t, testDialer{}, paginationTracker())
 	for _, tab := range []string{"active", "history"} {
 		for _, size := range []int{1, 2, 50, 200} {
 			for _, page := range []int{math.MaxInt, math.MaxInt / size, math.MaxInt/max(size, 2) + 1} {

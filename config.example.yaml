@@ -1,0 +1,66 @@
+proxy:
+  socks5:
+    listen:
+      - "0.0.0.0:1080"
+  http:
+    listen:
+      - "0.0.0.0:3128"
+
+routing:
+  direct:
+    # A sequence, or one comma-separated string - the form the old
+    # DIRECT_RULES variable held. Commas separate entries in the string form,
+    # so a rule that contains a comma must be its own sequence entry.
+    rules: []
+    ip_family: both
+
+ssh:
+  keepalive:
+    period: 10s
+    interval: 1s
+    probes: 5
+  servers:
+    - id: edge-a
+      host: ssh-a.example.net
+      port: 22
+      user: tunnel
+      transports: 4
+      limits:
+        max_client_tunnels: 4096
+        max_pending_opens: 256
+        max_pending_service_opens: 32
+
+balancing:
+  hash_key: client_ip_destination
+  retry:
+    max_attempts: 3
+    timeout: 30s
+  passive:
+    max_fails: 3
+    fail_timeout: 30s
+    unhealthy_period: 30s
+
+dns:
+  tunnel:
+    servers:
+      - 1.1.1.1
+      - 8.8.8.8
+
+health:
+  # Compose publishes this port on host loopback only.
+  listen: 0.0.0.0:9090
+  url: https://www.youtube.com
+  interval: 10s
+  timeout: 5s
+  max_fails: 3
+  successes: 2
+
+ui:
+  allowed_hosts: []
+
+logging:
+  level: info
+  access: true
+
+storage:
+  directory: /data

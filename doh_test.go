@@ -17,9 +17,9 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
-// TestDoHAfterTunnelLoss: the DoH client keeps connections in a pool. When the
-// tunnel drops they die with it, and the next lookup must open a new one
-// instead of counting a failure or pausing the endpoint.
+// TestDoHAfterTunnelLoss: every DoH request dials its own tunnel channel, so a
+// lost transport takes those channels with it. The next lookup must still
+// succeed without counting a failure or pausing the endpoint.
 func TestDoHAfterTunnelLoss(t *testing.T) {
 	answer := "93.184.216.34"
 	fake := startFakeDoHServer(t, func(_, qtype string) dohAnswer {
@@ -28,7 +28,7 @@ func TestDoHAfterTunnelLoss(t *testing.T) {
 		}
 		return dohAnswer{}
 	})
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -49,16 +49,16 @@ func TestDoHAfterTunnelLoss(t *testing.T) {
 		}
 	}
 	check("a.example")
-	if got := d.dials.Load(); got != 1 {
-		t.Fatalf("dials = %d, want 1: the test needs a pooled connection", got)
+	if got := d.dials.Load(); got != 2 {
+		t.Fatalf("dials = %d, want 2: one channel per question (A + AAAA)", got)
 	}
 	d.lose()
 	check("b.example")
-	if got := d.dials.Load(); got != 2 {
-		t.Fatalf("dials = %d, want a new connection after the loss", got)
+	if got := d.dials.Load(); got != 4 {
+		t.Fatalf("dials = %d, want 4: the lookup after the loss dials again", got)
 	}
 	st := rules.DNSStatus()
-	if s := st.Servers[0]; s.Fail != 0 || s.Paused || st.LocalFallbacks != 0 {
+	if s := st.Servers[0]; s.Fail != 0 || s.Paused {
 		t.Fatalf("status = %+v", st)
 	}
 }
@@ -73,7 +73,7 @@ func TestDoHPause(t *testing.T) {
 		}
 		closed := l.Addr().String()
 		l.Close()
-		rules, err := NewRuleEngine("")
+		rules, err := NewRuleEngine(nil)
 		if err != nil {
 			t.Fatalf("NewRuleEngine: %v", err)
 		}
@@ -89,7 +89,7 @@ func TestDoHPause(t *testing.T) {
 
 	t.Run("SERVFAIL", func(t *testing.T) {
 		fake := startFakeDoHServer(t, func(string, string) dohAnswer { return dohAnswer{status: 2} })
-		rules, err := NewRuleEngine("")
+		rules, err := NewRuleEngine(nil)
 		if err != nil {
 			t.Fatalf("NewRuleEngine: %v", err)
 		}
@@ -122,7 +122,7 @@ func TestResolveAllDOH(t *testing.T) {
 			return dohAnswer{}
 		}
 	})
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,10 +130,9 @@ func TestResolveAllDOH(t *testing.T) {
 	rules.SetDOH(b.addr, d)
 	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
 	var localCalls int
-	local := netip.MustParseAddr("192.0.2.9")
 	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
 		localCalls++
-		return []net.IPAddr{{IP: local.AsSlice()}}, nil
+		return []net.IPAddr{{IP: net.ParseIP("192.0.2.9")}}, nil
 	}
 
 	addrs, err := rules.ResolveAll(context.Background(), "blocked.example")
@@ -156,18 +155,18 @@ func TestResolveAllDOH(t *testing.T) {
 	if _, err := rules.ResolveAll(context.Background(), "missing.example"); !errors.Is(err, errNotFound) || localCalls != 0 {
 		t.Fatalf("NXDOMAIN: err=%v, local calls=%d", err, localCalls)
 	}
-	rules.dns.localOnNXDomain = true
-	addrs, localDirect, err := rules.dns.resolveTunnel(context.Background(), "other-missing.example")
-	if err != nil || len(addrs) != 1 || addrs[0] != local || !localDirect || localCalls != 1 {
-		t.Fatalf("NXDOMAIN with local DNS: (%v, %t, %v), local calls=%d", addrs, localDirect, err, localCalls)
+	if _, _, err := rules.dns.resolveTunnel(context.Background(), "other-missing.example"); !errors.Is(err, errNotFound) || localCalls != 0 {
+		t.Fatalf("NXDOMAIN: err=%v, local calls=%d", err, localCalls)
 	}
 }
 
-func TestResolveAllDOHServerFallback(t *testing.T) {
+// TestResolveAllDOHServerFailure: a SERVFAIL from the DoH endpoint fails the
+// lookup and lands in that server's status; the local resolver is never asked.
+func TestResolveAllDOHServerFailure(t *testing.T) {
 	srv := startFakeDoHServer(t, func(_, _ string) dohAnswer {
 		return dohAnswer{status: int(dnsmessage.RCodeServerFailure)}
 	})
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,15 +174,13 @@ func TestResolveAllDOHServerFallback(t *testing.T) {
 	rules.SetDOH(b.addr, d)
 	rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
 	var localCalls int
-	local := netip.MustParseAddr("192.0.2.9")
 	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
 		localCalls++
-		return []net.IPAddr{{IP: local.AsSlice()}}, nil
+		return []net.IPAddr{{IP: net.ParseIP("192.0.2.9")}}, nil
 	}
 
-	addrs, err := rules.ResolveAll(context.Background(), "broken.example")
-	if err != nil || len(addrs) != 1 || addrs[0] != local || localCalls != 1 {
-		t.Fatalf("SERVFAIL fallback: (%v, %v), local calls=%d", addrs, err, localCalls)
+	if _, err := rules.ResolveAll(context.Background(), "broken.example"); err == nil || localCalls != 0 {
+		t.Fatalf("SERVFAIL: err=%v, local calls=%d", err, localCalls)
 	}
 	server := rules.DNSStatus().Servers[0]
 	if server.Fail != 1 || !strings.Contains(server.Error, dnsmessage.RCodeServerFailure.String()) {
@@ -191,10 +188,10 @@ func TestResolveAllDOHServerFallback(t *testing.T) {
 	}
 }
 
-// TestResolveAllDOHFallback: when the DoH endpoint is unreachable, cached
-// resolution falls back to the local resolver.
-func TestResolveAllDOHFallback(t *testing.T) {
-	rules, err := NewRuleEngine("")
+// TestResolveAllDOHEndpointUnreachable: a DoH endpoint that cannot be dialed
+// fails the lookup without consulting the local resolver.
+func TestResolveAllDOHEndpointUnreachable(t *testing.T) {
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -207,8 +204,16 @@ func TestResolveAllDOHFallback(t *testing.T) {
 	l.Close()
 
 	rules.SetDOH(closed, testDialer{})
-	if _, err := rules.ResolveAll(context.Background(), "example.com"); err != nil {
-		t.Skipf("local resolver unavailable: %v", err)
+	var localCalls atomic.Int64
+	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
+		localCalls.Add(1)
+		return []net.IPAddr{{IP: net.ParseIP("192.0.2.1")}}, nil
+	}
+	if _, err := rules.ResolveAll(context.Background(), "example.com"); err == nil {
+		t.Fatal("expected DNS resolver error")
+	}
+	if localCalls.Load() != 0 {
+		t.Fatalf("local resolver called %d times", localCalls.Load())
 	}
 }
 
@@ -238,7 +243,7 @@ func TestDoHRedirect(t *testing.T) {
 	}))
 	defer tlsServer.Close()
 
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +328,7 @@ func TestDoHOverSSH(t *testing.T) {
 		return nil
 	})
 
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

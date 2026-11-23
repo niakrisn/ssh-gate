@@ -258,7 +258,6 @@ func TestDoHCacheExpiry(t *testing.T) {
 		name     string
 		lifetime time.Duration
 		negative bool
-		local    bool
 		fixedTTL time.Duration
 	}{
 		{name: "positive bounded by DNS", lifetime: 2 * time.Second},
@@ -267,22 +266,14 @@ func TestDoHCacheExpiry(t *testing.T) {
 		{name: "negative bounded by DNS", lifetime: 2 * time.Second, negative: true},
 		{name: "negative capped by cache", lifetime: time.Minute, negative: true, fixedTTL: dnsNegativeTTL},
 		{name: "negative expired", lifetime: -time.Second, negative: true},
-		{name: "local answer uses its own TTL", lifetime: -time.Second, negative: true, local: true, fixedTTL: dnsCacheTTL},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const name = "query.example"
-			rules, err := NewRuleEngine("")
+			rules, err := NewRuleEngine(nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			cache := rules.dns
-			cache.localOnNXDomain = tc.local
-			cache.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
-				if !tc.local {
-					t.Error("unexpected local lookup")
-				}
-				return []net.IPAddr{{IP: net.IPv4(192, 0, 2, 2)}}, nil
-			}
 			deadline := time.Now().Add(tc.lifetime)
 			cache.tunnel = []*upstream{{
 				name: "dns.example",
@@ -296,22 +287,22 @@ func TestDoHCacheExpiry(t *testing.T) {
 			before := time.Now()
 			addrs, localDirect, err := cache.resolveTunnel(context.Background(), name)
 			after := time.Now()
-			wantNegative := tc.negative && !tc.local
+			wantNegative := tc.negative
 			if wantNegative {
 				if !errors.Is(err, errNotFound) {
 					t.Fatalf("resolve error = %v, want not found", err)
 				}
-			} else if err != nil || len(addrs) != 1 || localDirect != tc.local {
+			} else if err != nil || len(addrs) != 1 || localDirect {
 				t.Fatalf("resolve = (%v, %t, %v)", addrs, localDirect, err)
 			}
 			entry, ok := cache.cache[name]
-			if tc.lifetime < 0 && !tc.local {
+			if tc.lifetime < 0 {
 				if ok {
 					t.Fatal("expired answer cached")
 				}
 				return
 			}
-			if !ok || entry.neg != wantNegative || entry.localDirect != tc.local {
+			if !ok || entry.neg != wantNegative {
 				t.Fatalf("cache entry = %+v, present=%t", entry, ok)
 			}
 			if tc.fixedTTL == 0 {
@@ -428,7 +419,7 @@ func TestDoHFormatSelection(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			rules, err := NewRuleEngine("")
+			rules, err := NewRuleEngine(nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -436,10 +427,9 @@ func TestDoHFormatSelection(t *testing.T) {
 			rules.SetDOH(b.addr, d)
 			rules.dns.dohClient.Transport.(*http.Transport).TLSClientConfig = b.tls
 			var localCalls int
-			local := netip.MustParseAddr("192.0.2.9")
 			rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
 				localCalls++
-				return []net.IPAddr{{IP: local.AsSlice()}}, nil
+				return nil, errors.New("local resolver must not be asked")
 			}
 
 			got, err := rules.ResolveAll(context.Background(), host)
@@ -451,9 +441,11 @@ func TestDoHFormatSelection(t *testing.T) {
 					t.Fatalf("NXDOMAIN = (%v, %v), local calls=%d, status=%+v", got, err, localCalls, status)
 				}
 			case tc.failed != "":
-				if err != nil || !slices.Equal(got, []netip.Addr{local}) || localCalls != 1 ||
+				// No local answer: the caller gets the aggregate failure with
+				// the last real cause, and each server keeps its own error.
+				if !errors.Is(err, errUnreachable) || len(got) != 0 || localCalls != 0 ||
 					server.OK != 0 || server.Fail != 1 || !strings.Contains(server.Error, tc.failed) {
-					t.Fatalf("fallback = (%v, %v), local calls=%d, status=%+v, want error %q", got, err, localCalls, status, tc.failed)
+					t.Fatalf("failed = (%v, %v), local calls=%d, status=%+v, want cause %q", got, err, localCalls, status, tc.failed)
 				}
 			default:
 				want := []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")}
@@ -473,7 +465,7 @@ type doHRoundTripper func(*http.Request) (*http.Response, error)
 func (f doHRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestDoHFormatSelectionDeadline(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,18 +508,18 @@ func TestDoHFormatSelectionDeadline(t *testing.T) {
 	})
 	cache.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
 		localCalls++
-		return []net.IPAddr{{IP: net.IPv4(192, 0, 2, 9)}}, nil
+		return nil, errors.New("local resolver must not be asked")
 	}
 	result, err := cache.lookup(ctx, "deadline.example")
 	server := rules.DNSStatus().Servers[0]
-	if err != nil || len(result.addrs) != 1 || result.authoritative || calls != 3 || localCalls != 1 ||
+	if !errors.Is(err, errUnreachable) || len(result.addrs) != 0 || result.authoritative || calls != 3 || localCalls != 0 ||
 		server.Fail != 1 || !strings.Contains(server.Error, context.DeadlineExceeded.Error()) {
 		t.Fatalf("lookup = (%+v, %v), requests=%d, local calls=%d, status=%+v", result, err, calls, localCalls, server)
 	}
 }
 
 func TestDoHFormatSelectionInvalidQuestion(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,7 +580,7 @@ func TestDoHCacheExpiryWire(t *testing.T) {
 				writeDoHWireResponse(t, w, msg)
 			}))
 			defer srv.Close()
-			rules, err := NewRuleEngine("")
+			rules, err := NewRuleEngine(nil)
 			if err != nil {
 				t.Fatal(err)
 			}

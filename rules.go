@@ -32,9 +32,6 @@ type ruleEntry struct {
 	domain   string
 }
 
-// hostLocalV4 is the IPv4 "this network" range; 0.0.0.0 dials localhost.
-var hostLocalV4 = netip.MustParsePrefix("0.0.0.0/8")
-
 type RuleEngine struct {
 	rules   []ruleEntry
 	dns     *dnsCache
@@ -56,7 +53,13 @@ func (e *RuleEngine) Stop() {
 	e.dns.stop()
 }
 
-func NewRuleEngine(direct string) (*RuleEngine, error) {
+// NewRuleEngine takes routing.direct.rules with one entry per rule. The list is
+// deliberately not split on commas here: the config format already delimited
+// the entries, so re-splitting would silently turn `re:host[0,3]$` into the two
+// rules `re:host[0` and `3]$`, neither of which can ever match. The
+// comma-separated spelling is split once, in ruleList.UnmarshalYAML, where the
+// operator chose that form.
+func NewRuleEngine(direct []string) (*RuleEngine, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &RuleEngine{
 		dns: &dnsCache{
@@ -88,21 +91,22 @@ func NewRuleEngine(direct string) (*RuleEngine, error) {
 	// DIRECT_RULES never reaches the tunnel resolver, whatever the order of
 	// the rules. Every rule leads to direct, so this changes only the reason.
 	var ipRules []ruleEntry
-	if direct != "" {
-		for _, entry := range strings.Split(direct, ",") {
-			entry = strings.TrimSpace(entry)
-			if entry == "" {
-				continue
-			}
-			r, err := parseRuleEntry(entry)
-			if err != nil {
-				return nil, err
-			}
-			if r.ipPrefix != nil {
-				ipRules = append(ipRules, r)
-			} else {
-				e.rules = append(e.rules, r)
-			}
+	for _, entry := range direct {
+		// Trimmed and skipped rather than rejected: whitespace and an empty
+		// item are invisible in a YAML sequence, and an empty entry has no
+		// policy meaning, unlike an empty "re:" pattern.
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		r, err := parseRuleEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+		if r.ipPrefix != nil {
+			ipRules = append(ipRules, r)
+		} else {
+			e.rules = append(e.rules, r)
 		}
 	}
 	e.rules = append(e.rules, ipRules...)
@@ -125,8 +129,13 @@ func normalizeHost(host string) string {
 func (e *RuleEngine) decideHost(host string) (Route, string) {
 	host = normalizeHost(host)
 	// 1. RFC 1918 / loopback / link-local — always direct
-	if ip, err := netip.ParseAddr(host); err == nil && e.isPrivate(ip) {
-		return RouteDirect, "private"
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if e.isPrivate(ip) {
+			return RouteDirect, "private"
+		}
+		if reason := e.matchCIDR([]netip.Addr{ip}); reason != "" {
+			return RouteDirect, reason
+		}
 	}
 
 	// 2. Check direct rules
@@ -140,13 +149,17 @@ func (e *RuleEngine) decideHost(host string) (Route, string) {
 	return RouteTunnel, "fallback"
 }
 
+// matchCIDR reports the first ip: rule covering one of addrs. Every address is
+// unmapped and stripped of its zone first: netip.Prefix.Contains never matches
+// an IPv4-mapped address against an IPv4 prefix, so without it the literal
+// ::ffff:203.0.113.7 would miss ip:203.0.113.0/24 and take the tunnel.
 func (e *RuleEngine) matchCIDR(addrs []netip.Addr) string {
 	for _, r := range e.rules {
 		if r.ipPrefix == nil {
 			continue
 		}
 		for _, a := range addrs {
-			if r.ipPrefix.Contains(a) {
+			if r.ipPrefix.Contains(a.Unmap().WithZone("")) {
 				return "direct:" + r.raw
 			}
 		}
@@ -174,20 +187,6 @@ func pickTunnelAddr(addrs []netip.Addr) (netip.Addr, error) {
 		return netip.Addr{}, fmt.Errorf("no address")
 	}
 	return addrs[0], nil
-}
-
-// dropHostLocal removes loopback, unspecified and link-local addresses: a DNS
-// answer must never send a connection there by itself. Reaching such an
-// address is the job of an IP literal or a direct rule.
-func dropHostLocal(addrs []netip.Addr) []netip.Addr {
-	out := addrs[:0:0]
-	for _, a := range addrs {
-		a = a.Unmap().WithZone("")
-		if !a.IsLoopback() && !a.IsLinkLocalUnicast() && !hostLocalV4.Contains(a) && a != netip.IPv6Unspecified() {
-			out = append(out, a)
-		}
-	}
-	return out
 }
 
 // isPrivate reports whether ip is in a private, loopback, link-local or

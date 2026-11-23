@@ -1,11 +1,52 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"flag"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"go.yaml.in/yaml/v3"
 )
+
+// TestBadConfigExitStatus: a config file the operator must fix cannot be
+// restarted around. Logging is not up yet at that point, so the exit status is
+// set by hand; the child re-runs main the way the SIGTERM test does.
+func TestBadConfigExitStatus(t *testing.T) {
+	if os.Getenv("SSH_GATE_TEST_BADCONFIG") == "1" {
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+		os.Args = []string{os.Args[0], "--config", os.Getenv("SSH_GATE_TEST_CONFIG")}
+		main()
+		return
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("typo_key: 1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestBadConfigExitStatus$")
+	cmd.Env = append(os.Environ(), "SSH_GATE_TEST_BADCONFIG=1", "SSH_GATE_TEST_CONFIG="+path)
+	out, err := cmd.CombinedOutput()
+
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		t.Fatalf("err = %v, want a non-zero exit; output: %s", err, out)
+	}
+	if exit.ExitCode() != exitConfig {
+		t.Fatalf("exit = %d, want %d; output: %s", exit.ExitCode(), exitConfig, out)
+	}
+	if !strings.Contains(string(out), "load config") {
+		t.Fatalf("output = %q, want the config error", out)
+	}
+}
 
 // TestParseKeepalivePeriod covers the semantics of SSH_KEEPALIVE_PERIOD:
 // valid Go durations pass through; 0/0s disable keepalive (0); empty or
@@ -150,243 +191,21 @@ func TestParseDialTimeout(t *testing.T) {
 	}
 }
 
-// TestLoadConfigDohHost covers DOH_HOST semantics: a plain hostname and an
-// explicit :443 pass; URLs, other ports and IP-literal addresses are
-// rejected (TLS is validated against the hostname, and DoH provider certs
-// carry no IP SANs).
-func TestLoadConfigDohHost(t *testing.T) {
-	t.Setenv("PROXY_MODES", "socks5")
-	for _, v := range []string{"", "cloudflare-dns.com", "dns.google:443"} {
-		t.Setenv("SSH_HOST", "h")
-		t.Setenv("SSH_USER", "u")
-		t.Setenv("DOH_HOST", v)
-		if _, err := loadConfig(); err != nil {
-			t.Errorf("DOH_HOST=%q: unexpected error: %v", v, err)
-		}
-	}
-	for _, v := range []string{
-		"https://dns.google",
-		"dns.google/dns-query",
-		"dns.google:8443",
-		"1.1.1.1",
-		"1.1.1.1:443",
-	} {
-		t.Setenv("SSH_HOST", "h")
-		t.Setenv("SSH_USER", "u")
-		t.Setenv("DOH_HOST", v)
-		if _, err := loadConfig(); err == nil {
-			t.Errorf("DOH_HOST=%q: expected error, got nil", v)
-		}
-	}
-}
-
-// TestLoadConfigDialTimeoutCap: SSH_DIAL_TIMEOUT must stay below the
-// connection-history window — dropStalled moves dialing records out of the
-// active map once they outlive it, so a longer dial could lose its record.
-func TestLoadConfigDialTimeoutCap(t *testing.T) {
-	t.Setenv("PROXY_MODES", "socks5")
-	t.Setenv("SSH_HOST", "h")
-	t.Setenv("SSH_USER", "u")
-	t.Setenv("SSH_DIAL_TIMEOUT", "11m")
-	if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "must be below") {
-		t.Fatalf("err = %v, want the history-window cap error", err)
-	}
-	t.Setenv("SSH_DIAL_TIMEOUT", "9m")
-	if _, err := loadConfig(); err != nil {
-		t.Fatalf("9m should be valid: %v", err)
-	}
-}
-
-// TestParseListenList covers comma-separated listen-address lists: items are
-// trimmed, empty items skipped, each item must be host:port, at least one
-// address is required.
-func TestParseListenList(t *testing.T) {
-	cases := []struct {
-		raw     string
-		want    []string
-		wantErr bool
-	}{
-		{raw: ":1080", want: []string{":1080"}},
-		{raw: "0.0.0.0:1080,127.0.0.1:1081", want: []string{"0.0.0.0:1080", "127.0.0.1:1081"}},
-		{raw: " :1080 , :1081 ,", want: []string{":1080", ":1081"}},
-		{raw: ",,:", want: nil, wantErr: true},
-		{raw: ":1080,bad", want: nil, wantErr: true},
-		{raw: "1080", want: nil, wantErr: true},
-	}
-	for _, c := range cases {
-		got, err := parseListenList("TEST_LISTEN", c.raw)
-		if c.wantErr {
-			if err == nil {
-				t.Errorf("parseListenList(%q): expected error, got nil", c.raw)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("parseListenList(%q): unexpected error: %v", c.raw, err)
-			continue
-		}
-		if len(got) != len(c.want) {
-			t.Errorf("parseListenList(%q) = %v, want %v", c.raw, got, c.want)
-			continue
-		}
-		for i := range got {
-			if got[i] != c.want[i] {
-				t.Errorf("parseListenList(%q) = %v, want %v", c.raw, got, c.want)
-			}
-		}
-	}
-}
-
-// TestLoadConfigListenLists: SOCKS5_LISTEN / HTTP_LISTEN accept a single
-// address (backward compatible) and a comma-separated list.
-func TestLoadConfigListenLists(t *testing.T) {
-	t.Setenv("PROXY_MODES", "socks5,http")
-	t.Setenv("SSH_HOST", "h")
-	t.Setenv("SSH_USER", "u")
-
-	t.Setenv("SOCKS5_LISTEN", ":1080")
-	t.Setenv("HTTP_LISTEN", ":3128")
-	cfg, err := loadConfig()
-	if err != nil {
-		t.Fatalf("single addresses: %v", err)
-	}
-	if len(cfg.socks5Addrs) != 1 || cfg.socks5Addrs[0] != ":1080" ||
-		len(cfg.httpAddrs) != 1 || cfg.httpAddrs[0] != ":3128" {
-		t.Fatalf("single addresses: got socks5=%v http=%v", cfg.socks5Addrs, cfg.httpAddrs)
-	}
-
-	t.Setenv("SOCKS5_LISTEN", ":1080,127.0.0.1:1081")
-	t.Setenv("HTTP_LISTEN", "0.0.0.0:3128, [::]:3128 ")
-	cfg, err = loadConfig()
-	if err != nil {
-		t.Fatalf("lists: %v", err)
-	}
-	wantSocks5 := []string{":1080", "127.0.0.1:1081"}
-	wantHTTP := []string{"0.0.0.0:3128", "[::]:3128"}
-	if len(cfg.socks5Addrs) != len(wantSocks5) || len(cfg.httpAddrs) != len(wantHTTP) {
-		t.Fatalf("lists: got socks5=%v http=%v", cfg.socks5Addrs, cfg.httpAddrs)
-	}
-	for i := range wantSocks5 {
-		if cfg.socks5Addrs[i] != wantSocks5[i] || cfg.httpAddrs[i] != wantHTTP[i] {
-			t.Fatalf("lists: got socks5=%v http=%v", cfg.socks5Addrs, cfg.httpAddrs)
-		}
-	}
-}
-
-// TestLoadConfigTunnelDNSDefault: DoH is optional and off by default, unset
-// or empty alike; the tunnel then resolves through the built-in servers.
-func TestLoadConfigTunnelDNSDefault(t *testing.T) {
-	t.Setenv("PROXY_MODES", "socks5")
-	t.Setenv("SSH_HOST", "h")
-	t.Setenv("SSH_USER", "u")
-	t.Setenv("TUNNEL_DNS", "")
-
-	t.Setenv("DOH_HOST", "")
-	check := func(what string) {
-		t.Helper()
-		cfg, err := loadConfig()
-		if err != nil {
-			t.Fatalf("%s: %v", what, err)
-		}
-		want := []string{"1.1.1.1:53", "8.8.8.8:53"}
-		if cfg.dohHost != "" || !slices.Equal(cfg.tunnelDNS, want) {
-			t.Fatalf("%s: dohHost = %q, tunnelDNS = %v, want no DoH and %v", what, cfg.dohHost, cfg.tunnelDNS, want)
-		}
-	}
-	check(`DOH_HOST=""`)
-	os.Unsetenv("DOH_HOST")
-	check("unset DOH_HOST")
-
-	t.Setenv("DOH_HOST", "dns.google")
-	cfg, err := loadConfig()
-	if err != nil {
-		t.Fatalf("DOH_HOST=dns.google: %v", err)
-	}
-	if cfg.dohHost != "dns.google" || cfg.tunnelDNS != nil {
-		t.Fatalf("DOH_HOST=dns.google: dohHost = %q, tunnelDNS = %v", cfg.dohHost, cfg.tunnelDNS)
-	}
-}
-
-// TestLoadConfigTunnelDNS covers the TUNNEL_DNS forms.
-func TestLoadConfigTunnelDNS(t *testing.T) {
-	t.Setenv("PROXY_MODES", "socks5")
-	t.Setenv("SSH_HOST", "h")
-	t.Setenv("SSH_USER", "u")
-	t.Setenv("DOH_HOST", "")
-
-	for raw, want := range map[string][]string{
-		"1.1.1.1":                 {"1.1.1.1:53"},
-		"1.1.1.1:5353":            {"1.1.1.1:5353"},
-		"2606:4700::1111":         {"[2606:4700::1111]:53"},
-		"[2606:4700::1111]:5353":  {"[2606:4700::1111]:5353"},
-		"127.0.0.53":              {"127.0.0.53:53"},
-		" 1.1.1.1 , 9.9.9.9:53 ,": {"1.1.1.1:53", "9.9.9.9:53"},
-	} {
-		t.Setenv("TUNNEL_DNS", raw)
-		cfg, err := loadConfig()
-		if err != nil {
-			t.Errorf("TUNNEL_DNS=%q: %v", raw, err)
-			continue
-		}
-		if !slices.Equal(cfg.tunnelDNS, want) {
-			t.Errorf("TUNNEL_DNS=%q = %v, want %v", raw, cfg.tunnelDNS, want)
-		}
-	}
-	for _, raw := range []string{"dns.google", "dns.google:53", "1.1.1.1:0", "1.1.1.1:70000", "1.1.1.1:dns", " , "} {
-		t.Setenv("TUNNEL_DNS", raw)
-		if _, err := loadConfig(); err == nil {
-			t.Errorf("TUNNEL_DNS=%q: expected error, got nil", raw)
-		}
-	}
-
-	t.Setenv("TUNNEL_DNS", "1.1.1.1")
-	t.Setenv("DOH_HOST", "dns.google")
-	if _, err := loadConfig(); err == nil {
-		t.Error("DOH_HOST and TUNNEL_DNS together: expected error, got nil")
-	}
-}
-
-// TestLoadConfigLocalDNSOnNXDomain: the setting is off by default and takes
-// on/off like ACCESS_LOG.
-func TestLoadConfigLocalDNSOnNXDomain(t *testing.T) {
-	t.Setenv("PROXY_MODES", "socks5")
-	t.Setenv("SSH_HOST", "h")
-	t.Setenv("SSH_USER", "u")
-
-	t.Setenv("LOCAL_DNS_ON_NXDOMAIN", "")
-	if cfg, err := loadConfig(); err != nil || cfg.localOnNXDomain {
-		t.Fatalf("default: localOnNXDomain = %v, err = %v", cfg.localOnNXDomain, err)
-	}
-	t.Setenv("LOCAL_DNS_ON_NXDOMAIN", "on")
-	if cfg, err := loadConfig(); err != nil || !cfg.localOnNXDomain {
-		t.Fatalf("on: localOnNXDomain = %v, err = %v", cfg.localOnNXDomain, err)
-	}
-	t.Setenv("LOCAL_DNS_ON_NXDOMAIN", "maybe")
-	if _, err := loadConfig(); err == nil {
-		t.Fatal("LOCAL_DNS_ON_NXDOMAIN=maybe: expected error, got nil")
-	}
-}
-
-// TestConfigureDNS: the config picks one tunnel resolver mode and passes the
-// NXDOMAIN setting on.
 func TestConfigureDNS(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
-	cfg := config{tunnelDNS: []string{"1.1.1.1:53", "9.9.9.9:5353"}, localOnNXDomain: true}
+	cfg := config{tunnelDNS: []string{"1.1.1.1:53", "9.9.9.9:5353"}}
 	configureDNS(rules, cfg, testDialer{})
 	if mode := rules.DNSStatus().Mode; mode != "servers" {
 		t.Fatalf("mode = %s, want servers", mode)
-	}
-	if !rules.dns.localOnNXDomain {
-		t.Fatal("localOnNXDomain not passed on")
 	}
 	if len(rules.dns.tunnel) != 2 || rules.dns.tunnel[0].name != "1.1.1.1" || rules.dns.tunnel[1].name != "9.9.9.9:5353" {
 		t.Fatalf("tunnel = %+v", rules.dns.tunnel)
 	}
 
-	rules, err = NewRuleEngine("")
+	rules, err = NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -396,32 +215,6 @@ func TestConfigureDNS(t *testing.T) {
 	}
 	if len(rules.dns.tunnel) != 1 || rules.dns.tunnel[0].name != "dns.google" {
 		t.Fatalf("tunnel = %+v", rules.dns.tunnel)
-	}
-}
-
-func TestParseMaxConnections(t *testing.T) {
-	cases := map[string]struct {
-		want    int
-		wantErr bool
-	}{
-		"4096": {want: 4096},
-		"1":    {want: 1},
-		"0":    {want: 0},
-		"-1":   {wantErr: true},
-		"":     {wantErr: true},
-		"many": {wantErr: true},
-	}
-	for raw, want := range cases {
-		got, err := parseMaxConnections(raw)
-		if want.wantErr {
-			if err == nil {
-				t.Errorf("parseMaxConnections(%q): expected error, got nil", raw)
-			}
-			continue
-		}
-		if err != nil || got != want.want {
-			t.Errorf("parseMaxConnections(%q) = %d, %v; want %d", raw, got, err, want.want)
-		}
 	}
 }
 
@@ -443,21 +236,251 @@ func TestParseHostList(t *testing.T) {
 	}
 }
 
-// TestLoadConfigSSHHostIPv6: the tunnel dials tcp4 only, so an IPv6 literal
-// must fail at startup instead of looping in reconnect.
-func TestLoadConfigSSHHostIPv6(t *testing.T) {
-	t.Setenv("PROXY_MODES", "socks5")
-	t.Setenv("SSH_USER", "u")
-	for _, v := range []string{"2001:db8::1", "[2001:db8::1]", "::1"} {
-		t.Setenv("SSH_HOST", v)
-		if _, err := loadConfig(); err == nil || !strings.Contains(err.Error(), "IPv4 only") {
-			t.Errorf("SSH_HOST=%q: err = %v, want the IPv4-only error", v, err)
+// TestLoadConfigDoHEndpointShape: the DoH client builds
+// https://<host>/dns-query itself, so a value that carries a scheme, a path or
+// a space names a nonsense host. It would start fine and only break on the
+// first tunnel lookup, so startup has to refuse it.
+func TestLoadConfigDoHEndpointShape(t *testing.T) {
+	config := func(host string) string {
+		return "proxy:\n  socks5:\n    listen: [\":1080\"]\ndns:\n  tunnel:\n    doh_host: \"" + host + "\"\n"
+	}
+	for _, host := range []string{"dns.google", "dns.example:8443", "192.0.2.1", "[2001:db8::1]:443"} {
+		if _, err := loadConfigFile(writeConfig(t, config(host))); err != nil {
+			t.Errorf("doh_host %q rejected: %v", host, err)
 		}
 	}
-	for _, v := range []string{"203.0.113.1", "vps.example.com", "::ffff:203.0.113.1"} {
-		t.Setenv("SSH_HOST", v)
-		if _, err := loadConfig(); err != nil {
-			t.Errorf("SSH_HOST=%q: unexpected error: %v", v, err)
+	for _, host := range []string{"https://dns.google", "dns.google/dns-query", "dns google", "dns.google:notaport", "dns.google:0", ":443"} {
+		if _, err := loadConfigFile(writeConfig(t, config(host))); err == nil {
+			t.Errorf("doh_host %q accepted", host)
 		}
+	}
+}
+
+func writeConfig(t *testing.T, body string) string {
+	t.Helper()
+	path := t.TempDir() + "/config.yaml"
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadConfigRejectsServerIDsThatBreakKnownHostsFormat(t *testing.T) {
+	for _, id := range []string{"edge a", "edge\na", "#edge"} {
+		body := "ssh:\n  servers:\n    - id: \"" + id + "\"\n      host: ssh.example.test\n      user: tunnel\n"
+		if _, err := loadConfigFile(writeConfig(t, body)); err == nil {
+			t.Errorf("server id %q accepted", id)
+		}
+	}
+}
+
+func TestShippedYAMLConfigsLoad(t *testing.T) {
+	for _, path := range []string{"config.example.yaml", "debian/ssh-gate.config.yaml"} {
+		if _, err := loadConfigFile(path); err != nil {
+			t.Errorf("load %s: %v", path, err)
+		}
+	}
+}
+
+// routing.direct.rules is a sequence in the documented form, but the e2e stand
+// can only get it from Compose interpolation, which produces text. Both
+// spellings must arrive as the same rules, including the comma-separated string
+// DIRECT_RULES held before the config file existed. Commas belong to the string
+// spelling alone: a sequence entry is one rule even when it contains one.
+func TestLoadConfigRulesAcceptsSequenceAndString(t *testing.T) {
+	minimal := "proxy:\n  socks5:\n    listen: [\"127.0.0.1:0\"]\nssh:\n  servers:\n    - id: edge-a\n      host: ssh.example.test\n      user: tunnel\n"
+	for _, tc := range []struct {
+		name, rules string
+		want        []string
+	}{
+		{"sequence", "routing:\n  direct:\n    rules:\n      - re:\\.ru$\n      - ip:198.51.100.0/24\n", []string{`re:\.ru$`, "ip:198.51.100.0/24"}},
+		{"string", "routing:\n  direct:\n    rules: re:\\.ru$, ip:198.51.100.0/24\n", []string{`re:\.ru$`, "ip:198.51.100.0/24"}},
+		{"sequence with comma", "routing:\n  direct:\n    rules:\n      - \"re:host[0,3]$\"\n", []string{`re:host[0,3]$`}},
+		{"empty", "routing:\n  direct:\n    rules:\n", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadConfigFile(writeConfig(t, minimal+tc.rules))
+			if err != nil {
+				t.Fatalf("config: %v", err)
+			}
+			if !slices.Equal(cfg.directRules, tc.want) {
+				t.Errorf("directRules = %q, want %q", cfg.directRules, tc.want)
+			}
+			if _, err := NewRuleEngine(cfg.directRules); err != nil {
+				t.Errorf("rules do not parse: %v", err)
+			}
+		})
+	}
+}
+
+// The e2e stand keeps its gate config inline in docker-compose.e2e.yml, because
+// only the Compose file can interpolate the server endpoint and the routing
+// policy from .env. Compose expands those placeholders at run time, so
+// standConfig expands them the same way: a typo in that block would otherwise
+// surface only as a container that exits on startup.
+func standConfig(t *testing.T, env map[string]string) config {
+	t.Helper()
+	raw, err := os.ReadFile("docker-compose.e2e.yml")
+	if err != nil {
+		t.Fatalf("read compose file: %v", err)
+	}
+	var compose struct {
+		Configs map[string]struct {
+			Content string `yaml:"content"`
+		} `yaml:"configs"`
+	}
+	if err := yaml.Unmarshal(raw, &compose); err != nil {
+		t.Fatalf("parse compose file: %v", err)
+	}
+	body := compose.Configs["gate_config"].Content
+	if body == "" {
+		t.Fatal("docker-compose.e2e.yml has no configs.gate_config.content")
+	}
+	expanded := os.Expand(body, func(expr string) string {
+		// Compose writes ${NAME}, ${NAME:-default} and ${NAME:?message}. An
+		// empty value takes the default too, which is how Compose treats both.
+		name, arg, hasArg := strings.Cut(expr, ":")
+		if v, ok := env[name]; ok {
+			if v != "" || !hasArg {
+				return v
+			}
+		}
+		switch {
+		case !hasArg:
+			t.Errorf("config references ${%s}, which the stand does not resolve", expr)
+		case strings.HasPrefix(arg, "?"):
+			t.Errorf("config requires ${%s}, which the stand does not resolve", expr)
+		default:
+			return strings.TrimPrefix(arg, "-")
+		}
+		return ""
+	})
+	cfg, err := loadConfigFile(writeConfig(t, expanded))
+	if err != nil {
+		t.Fatalf("stand config: %v", err)
+	}
+	return cfg
+}
+
+// e2eEndpoint is the stand's own .env content as far as the test cares: the
+// real values are credentials and stay out of the repository. Routing settings
+// are present but empty, which is the shape of an .env that predates them.
+var e2eEndpoint = map[string]string{
+	"SSH_HOST":         "ssh.example.invalid",
+	"SSH_PORT":         "2200",
+	"SSH_USER":         "tunnel",
+	"DIRECT_RULES":     "",
+	"DIRECT_IP_FAMILY": "",
+}
+
+func TestE2EStandConfigLoads(t *testing.T) {
+	cfg := standConfig(t, e2eEndpoint)
+	if len(cfg.sshServers) != 1 {
+		t.Fatalf("stand must declare exactly one SSH server, got %d", len(cfg.sshServers))
+	}
+	server := cfg.sshServers[0]
+	if server.host != "ssh.example.invalid" || server.port != 2200 || server.user != "tunnel" {
+		t.Errorf("endpoint placeholders did not reach the config: %+v", server)
+	}
+	if server.transports < 2 {
+		t.Errorf("the stand needs two transports to show per-slot spread, got %d", server.transports)
+	}
+}
+
+// The stand must route by the rules in .env, not by its own policy: a stand
+// that silently drops them tests a configuration no deployment uses, and an
+// empty rule list turns every destination into a tunneled one.
+func TestE2EStandRoutesByEnvRules(t *testing.T) {
+	rules := `re:\.ru$,re:example\.com$,ip:198.51.100.0/24`
+	cfg := standConfig(t, map[string]string{
+		"SSH_HOST":         "ssh.example.invalid",
+		"SSH_PORT":         "2200",
+		"SSH_USER":         "tunnel",
+		"DIRECT_RULES":     rules,
+		"DIRECT_IP_FAMILY": "ipv4",
+	})
+	// Compose hands the gate one comma-separated string, so the entries the
+	// operator wrote have to arrive one per rule.
+	if want := []string{`re:\.ru$`, `re:example\.com$`, "ip:198.51.100.0/24"}; !slices.Equal(cfg.directRules, want) {
+		t.Errorf("directRules = %q, want %q from the .env value %q", cfg.directRules, want, rules)
+	}
+	if cfg.directIPFamily != FamilyIPv4 {
+		t.Errorf("directIPFamily = %v, want ipv4 from .env", cfg.directIPFamily)
+	}
+	engine, err := NewRuleEngine(cfg.directRules)
+	if err != nil {
+		t.Fatalf("rules from .env do not parse: %v", err)
+	}
+	for _, tc := range []struct{ host, want string }{
+		{"example.ru", `direct:re:\.ru$`},
+		{"www.example.com", `direct:re:example\.com$`},
+		{"198.51.100.7", `direct:ip:198.51.100.0/24`},
+	} {
+		if route, reason := engine.decideHost(tc.host); route != RouteDirect || reason != tc.want {
+			t.Errorf("decideHost(%q) = (%s, %s), want (direct, %s)", tc.host, route, reason, tc.want)
+		}
+	}
+	if route, reason := engine.decideHost("example.org"); route != RouteTunnel || reason != "fallback" {
+		t.Errorf("decideHost(unlisted) = (%s, %s), want (tunnel, fallback)", route, reason)
+	}
+}
+
+// An operator without DIRECT_RULES in .env still gets a usable stand: the
+// placeholders must render no rules and the config default, not one empty rule
+// or an empty ip_family.
+func TestE2EStandWithoutEnvRulesStillLoads(t *testing.T) {
+	cfg := standConfig(t, e2eEndpoint)
+	if len(cfg.directRules) != 0 {
+		t.Errorf("directRules = %q, want no rules when .env has none", cfg.directRules)
+	}
+	if cfg.directIPFamily != FamilyBoth {
+		t.Errorf("directIPFamily = %v, want the config default both", cfg.directIPFamily)
+	}
+	if _, err := NewRuleEngine(cfg.directRules); err != nil {
+		t.Errorf("empty rules must parse: %v", err)
+	}
+}
+
+func TestLoadConfigYAMLDefaultsAndNestedProxy(t *testing.T) {
+	cfg, err := loadConfigFile(writeConfig(t, `proxy:
+  socks5:
+    listen: ["0.0.0.0:1080"]
+  http:
+    listen: ["0.0.0.0:3128"]
+ssh:
+  servers:
+    - id: edge-a
+      host: ssh.example.test
+      user: tunnel
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cfg.proxyModes, []string{"socks5", "http"}) || cfg.sshPort != 22 || cfg.dialTimeout != 30*time.Second {
+		t.Fatalf("unexpected defaults: %+v", cfg)
+	}
+	if !slices.Equal(cfg.socks5Addrs, []string{"0.0.0.0:1080"}) || !slices.Equal(cfg.httpAddrs, []string{"0.0.0.0:3128"}) {
+		t.Fatalf("proxy listeners: %v %v", cfg.socks5Addrs, cfg.httpAddrs)
+	}
+}
+
+func TestLoadConfigRejectsUnknownAndDuplicateServerID(t *testing.T) {
+	for _, body := range []string{
+		"proxy:\n  socks5:\n    listen: [\":1080\"]\nunknown: true\n",
+		"proxy:\n  socks5:\n    listen: [\":1080\"]\nssh:\n  servers:\n    - {id: x, host: a, user: u}\n    - {id: x, host: b, user: u}\n",
+	} {
+		if _, err := loadConfigFile(writeConfig(t, body)); err == nil {
+			t.Fatalf("accepted invalid YAML config: %s", body)
+		}
+	}
+}
+
+func TestLoadConfigAllowsNoSSHServers(t *testing.T) {
+	cfg, err := loadConfigFile(writeConfig(t, "proxy:\n  http:\n    listen: [\":3128\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.sshHost != "" || !slices.Equal(cfg.proxyModes, []string{"http"}) {
+		t.Fatalf("unexpected config: %+v", cfg)
 	}
 }

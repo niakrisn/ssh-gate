@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,16 +21,16 @@ func TestOpenOneLookupPerPolicy(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		err          error
-		fallback     bool
 		local, dials int
 	}{
-		{"TTL zero", nil, false, 0, 1},
-		{"NXDOMAIN", errNotFound, false, 0, 0},
-		{"SERVFAIL", errors.New("temporary resolver failure"), false, 1, 0},
-		{"local fallback", errors.New("temporary resolver failure"), true, 1, 1},
+		{"TTL zero", nil, 0, 1},
+		{"NXDOMAIN", errNotFound, 0, 0},
+		// A resolver failure ends the lookup: the local resolver would leak
+		// a tunneled name, so it is never asked.
+		{"SERVFAIL", errors.New("temporary resolver failure"), 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rules, err := NewRuleEngine(strings.Join(entries, ","))
+			rules, err := NewRuleEngine(entries)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -44,9 +43,6 @@ func TestOpenOneLookupPerPolicy(t *testing.T) {
 			rules.dns.tunnelUp = func() bool { return true }
 			rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
 				local.Add(1)
-				if tc.fallback {
-					return []net.IPAddr{{IP: net.ParseIP("203.0.113.2")}}, nil
-				}
 				return nil, errors.New("local resolver failure")
 			}
 			d := &fallbackDialer{failTo: "*"}
@@ -87,7 +83,7 @@ func testPreparedDirectPolicy(t *testing.T, rule string, tunnelWant int64) {
 		}
 		close(accepted)
 	}()
-	rules, err := NewRuleEngine(rule)
+	rules, err := NewRuleEngine([]string{rule})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,14 +117,14 @@ func TestSOCKSResolvesOnce(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		remoteErr error
-		fallback  bool
 		code      byte
 		local     int64
 	}{
-		{"TTL zero", nil, false, 0, 0},
-		{"NXDOMAIN", errNotFound, false, 4, 0},
-		{"SERVFAIL", errors.New("temporary DNS failure"), false, 4, 1},
-		{"fallback", errors.New("temporary DNS failure"), true, 0, 1},
+		{"TTL zero", nil, 0, 0},
+		{"NXDOMAIN", errNotFound, 4, 0},
+		// A resolver failure answers host-unreachable: the local resolver is
+		// never asked for a tunneled name.
+		{"SERVFAIL", errors.New("temporary DNS failure"), 4, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, access, flush := captureLogs(t)
@@ -143,7 +139,7 @@ func TestSOCKSResolvesOnce(t *testing.T) {
 					io.Copy(c, c)
 				}
 			}()
-			rules, _ := NewRuleEngine("")
+			rules, _ := NewRuleEngine(nil)
 			defer rules.Stop()
 			var tunnel, local atomic.Int64
 			rules.dns.tunnelUp = func() bool { return true }
@@ -153,9 +149,6 @@ func TestSOCKSResolvesOnce(t *testing.T) {
 			}}}
 			rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
 				local.Add(1)
-				if tc.fallback {
-					return []net.IPAddr{{IP: net.ParseIP("203.0.113.1")}}, nil
-				}
 				return nil, errors.New("local DNS failed")
 			}
 			d := &fallbackDialer{redirect: ln.Addr().String()}

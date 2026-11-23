@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -59,7 +58,7 @@ func TestLoggingBackpressure(t *testing.T) {
 }
 
 func TestJournalFullSocket(t *testing.T) {
-	addr := &net.UnixAddr{Name: filepath.Join(t.TempDir(), "journal"), Net: "unixgram"}
+	addr := &net.UnixAddr{Name: testSocketPath(t, "journal"), Net: "unixgram"}
 	srv, err := net.ListenUnixgram("unixgram", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +116,7 @@ func TestLoggingShutdownBounded(t *testing.T) {
 }
 
 func TestLoggingFallbackBounded(t *testing.T) {
-	addr := &net.UnixAddr{Name: filepath.Join(t.TempDir(), "journal"), Net: "unixgram"}
+	addr := &net.UnixAddr{Name: testSocketPath(t, "journal"), Net: "unixgram"}
 	srv, err := net.ListenUnixgram("unixgram", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -161,7 +160,7 @@ func TestDNSStatusDoesNotWaitForLog(t *testing.T) {
 	prev := testAppLog.set(sink)
 	finished := make(chan struct{})
 	defer func() { close(sink.release); <-finished; testAppLog.set(prev) }()
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +168,7 @@ func TestDNSStatusDoesNotWaitForLog(t *testing.T) {
 	u := &upstream{name: "test"}
 	rules.dns.tunnel = []*upstream{u}
 	rules.dns.tunnelUp = func() bool { return true }
-	go func() { defer close(finished); rules.dns.upstreamFailed(u, errUnreachable) }()
+	go func() { defer close(finished); rules.dns.upstreamFailed(t.Context(), u, errUnreachable) }()
 	<-sink.entered
 	status := make(chan dnsStatus, 1)
 	go func() { status <- rules.DNSStatus() }()
@@ -322,7 +321,7 @@ func TestJournalPriority(t *testing.T) {
 }
 
 func TestJournalWriterSendsAndFallsBack(t *testing.T) {
-	addr := &net.UnixAddr{Name: filepath.Join(t.TempDir(), "journal"), Net: "unixgram"}
+	addr := &net.UnixAddr{Name: testSocketPath(t, "journal"), Net: "unixgram"}
 	srv, err := net.ListenUnixgram("unixgram", addr)
 	if err != nil {
 		t.Fatal(err)

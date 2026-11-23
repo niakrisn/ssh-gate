@@ -50,7 +50,7 @@ func newTestOpener(rules *RuleEngine, d dialer) *Opener {
 
 func startTestProxy(t *testing.T, dialTarget string) *HTTPProxyServer {
 	t.Helper()
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -372,7 +372,7 @@ func TestHTTPProxyTransferEncodingRejected(t *testing.T) {
 
 // TestHTTPProxyDialTimeout returns 504 when the upstream dial times out.
 func TestHTTPProxyDialTimeout(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -473,7 +473,7 @@ func TestHTTPProxyTunnelV6(t *testing.T) {
 // destination FQDN cannot be resolved client-side (the reserved .invalid TLD
 // never resolves).
 func TestHTTPProxyTunnelResolveFailure(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -526,7 +526,7 @@ func (d *captureMetaDialer) stop()           {}
 // TestHTTPProxyConnMeta checks that openUpstream attaches
 // ConnMeta{http, src, host} to the SSH dial context.
 func TestHTTPProxyConnMeta(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -636,7 +636,7 @@ func TestHTTPProxyShutdownDrains(t *testing.T) {
 // TestHTTPProxyShutdownEmptyImmediate: no in-flight connections means
 // Shutdown must not consume the ctx deadline.
 func TestHTTPProxyShutdownEmptyImmediate(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}

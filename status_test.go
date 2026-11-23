@@ -24,7 +24,7 @@ func TestSDNotify(t *testing.T) {
 		t.Fatalf("no NOTIFY_SOCKET: err = %v, want nil", err)
 	}
 
-	sock := filepath.Join(t.TempDir(), "notify")
+	sock := testSocketPath(t, "notify")
 	l, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: sock, Net: "unixgram"})
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -135,14 +135,14 @@ func TestConnectSSHFailStates(t *testing.T) {
 	t.Run("host key mismatch", func(t *testing.T) {
 		addr, _ := startStoppableSSHServer(t, "127.0.0.1:0", newTestHostSigner(t))
 		host, port := splitTestAddr(t, addr)
-		cfg := sshDialerCfg{host: host, port: port, user: "test", keyPath: writeTestKey(t), fingerprint: "SHA256:old"}
+		cfg := sshDialerCfg{host: host, port: port, user: "test", keyPath: writeTestKey(t), fingerprint: "SHA256:old", serverID: "edge-a"}
 		_, _, _, err := connectSSH(context.Background(), cfg)
 		if got := failState(err); got != stateHostKeyMismatch {
 			t.Fatalf("state = %q, want %q (err %v)", got, stateHostKeyMismatch, err)
 		}
 		text := statusText(cfg, tunnelStatus{State: failState(err), Err: err})
 		knownHosts := filepath.Join(filepath.Dir(cfg.keyPath), sshKnownHostsFile)
-		if !strings.Contains(text, "expected SHA256:old") || !strings.Contains(text, "delete "+knownHosts) {
+		if !strings.Contains(text, "expected SHA256:old") || !strings.Contains(text, `replace the "edge-a" entry in `+knownHosts) || !strings.Contains(text, "independently") || !strings.Contains(text, "restart") {
 			t.Fatalf("status = %q", text)
 		}
 	})
@@ -203,6 +203,7 @@ func TestMonitorReportsStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSSHDialer: %v", err)
 	}
+	d.start()
 	t.Cleanup(d.stop)
 
 	waitState := func(want string) tunnelStatus {
@@ -233,10 +234,9 @@ func TestMonitorReportsStatus(t *testing.T) {
 	}
 }
 
-// TestHealthNotConfigured: without SSH_HOST the health server runs, readyz
-// says why it is not ready and /api/status reports the state.
+// An empty SSH pool does not prevent proxy listeners from becoming ready.
 func TestHealthNotConfigured(t *testing.T) {
-	addr := startTestHealth(t, unconfiguredDialer{}, nil, "", 22)
+	addr := startTestHealth(t, unconfiguredDialer{}, nil)
 
 	resp, err := http.Get("http://" + addr + "/readyz")
 	if err != nil {
@@ -244,7 +244,7 @@ func TestHealthNotConfigured(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable || !strings.HasPrefix(string(body), "not configured") {
+	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("/readyz: code=%d body=%q", resp.StatusCode, body)
 	}
 
@@ -254,32 +254,20 @@ func TestHealthNotConfigured(t *testing.T) {
 	}
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if !strings.Contains(string(body), `"state":"not_configured"`) {
+	if !strings.Contains(string(body), `"servers":[]`) || !strings.Contains(string(body), `"eligible":false`) {
 		t.Fatalf("/api/status = %s", body)
 	}
 }
 
-// TestLoadConfigNotConfigured: empty SSH_HOST and SSH_USER are not a config
-// error; missing names them for the status line.
+// TestLoadConfigNotConfigured: an empty server list is valid so direct routes
+// can operate independently of SSH availability.
 func TestLoadConfigNotConfigured(t *testing.T) {
-	t.Setenv("SSH_HOST", "")
-	t.Setenv("SSH_USER", "")
-	cfg, err := loadConfig()
+	path := writeConfig(t, "proxy:\n  socks5:\n    listen: [\":1080\"]\n")
+	cfg, err := loadConfigFile(path)
 	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
+		t.Fatalf("loadConfigFile: %v", err)
 	}
-	if got := strings.Join(cfg.missing(), ","); got != "SSH_HOST,SSH_USER" {
+	if got := strings.Join(cfg.missing(), ","); got != "ssh.servers" {
 		t.Fatalf("missing = %q", got)
-	}
-	if got := notConfiguredText(cfg.missing()); !strings.Contains(got, "set SSH_HOST and SSH_USER in /etc/default/ssh-gate") {
-		t.Fatalf("status = %q", got)
-	}
-
-	t.Setenv("SSH_HOST", "h")
-	if cfg, err = loadConfig(); err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if got := strings.Join(cfg.missing(), ","); got != "SSH_USER" {
-		t.Fatalf("missing = %q, want SSH_USER", got)
 	}
 }

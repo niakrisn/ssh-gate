@@ -4,39 +4,47 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
-
-	"golang.org/x/crypto/ssh"
 )
 
 func TestShutdownSIGTERM(t *testing.T) {
 	if os.Getenv("SSH_GATE_TEST_SIGTERM") == "1" {
+		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+		os.Args = []string{os.Args[0], "--config", os.Getenv("SSH_GATE_TEST_CONFIG")}
 		main()
 		return
 	}
 	closed := make(chan struct{}, 2)
-	sshAddr, _ := startTestSSHServerWithChannelHandler(t, "", true, func(open ssh.NewChannel) error {
-		ch, requests, err := open.Accept()
-		if err != nil {
-			return err
+	target, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	targetHost, targetPort, _ := net.SplitHostPort(target.Addr().String())
+	go func() {
+		for range 2 {
+			conn, err := target.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(conn, conn)
+				_ = conn.Close()
+				closed <- struct{}{}
+			}()
 		}
-		go ssh.DiscardRequests(requests)
-		go func() {
-			io.Copy(ch, ch)
-			ch.Close()
-			closed <- struct{}{}
-		}()
-		return nil
-	})
-	host, port, _ := net.SplitHostPort(sshAddr)
+	}()
 	// Reserve distinct ephemeral addresses until all three have been chosen.
 	var listeners []net.Listener
 	var addresses []string
@@ -53,11 +61,13 @@ func TestShutdownSIGTERM(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	config := fmt.Sprintf("proxy:\n  socks5:\n    listen: [%q]\n  http:\n    listen: [%q]\nssh:\n  servers: []\nhealth:\n  listen: %q\nstorage:\n  directory: %q\nrouting:\n  direct:\n    rules: []\n", addresses[1], addresses[0], addresses[2], t.TempDir())
+	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestShutdownSIGTERM$")
-	cmd.Env = append(os.Environ(), "SSH_GATE_TEST_SIGTERM=1", "SSH_HOST="+host, "SSH_PORT="+port,
-		"SSH_USER=test", "DATA_DIR="+t.TempDir(), "PROXY_MODES=socks5,http",
-		"HTTP_LISTEN="+addresses[0], "SOCKS5_LISTEN="+addresses[1], "HEALTH_LISTEN="+addresses[2],
-		"DIRECT_RULES=", "DOH_HOST=", "TUNNEL_DNS=1.1.1.1", "LOG_LEVEL=warn", "ACCESS_LOG=off", "NOTIFY_SOCKET=")
+	cmd.Env = append(os.Environ(), "SSH_GATE_TEST_SIGTERM=1", "SSH_GATE_TEST_CONFIG="+configPath, "NOTIFY_SOCKET=")
 	var output bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &output, &output
 	if err := cmd.Start(); err != nil {
@@ -96,7 +106,7 @@ func TestShutdownSIGTERM(t *testing.T) {
 	}
 	defer httpConn.Close()
 	httpConn.SetDeadline(time.Now().Add(8 * time.Second))
-	fmt.Fprint(httpConn, "CONNECT 198.51.100.1:443 HTTP/1.1\r\nHost: 198.51.100.1:443\r\n\r\n")
+	fmt.Fprintf(httpConn, "CONNECT %s:%s HTTP/1.1\r\nHost: %s:%s\r\n\r\n", targetHost, targetPort, targetHost, targetPort)
 	reader := bufio.NewReader(httpConn)
 	resp, err := http.ReadResponse(reader, nil)
 	if err != nil || resp.StatusCode != 200 {
@@ -113,7 +123,12 @@ func TestShutdownSIGTERM(t *testing.T) {
 	if _, err := io.ReadFull(socks, greeting); err != nil || !bytes.Equal(greeting, []byte{5, 0}) {
 		t.Fatalf("greeting: %x %v", greeting, err)
 	}
-	socks.Write([]byte{5, 1, 0, 1, 198, 51, 100, 1, 1, 187})
+	portNum, err := strconv.Atoi(targetPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	portBytes := []byte{byte(portNum >> 8), byte(portNum)}
+	socks.Write([]byte{5, 1, 0, 1, 127, 0, 0, 1, portBytes[0], portBytes[1]})
 	reply := make([]byte, 10)
 	if _, err := io.ReadFull(socks, reply); err != nil || reply[1] != 0 {
 		t.Fatalf("SOCKS CONNECT: %x %v", reply, err)

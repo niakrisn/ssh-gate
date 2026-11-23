@@ -8,43 +8,21 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// startTestHealth stands up a health server that probes the given SSH
-// endpoint (usually a live or dead local port) for /api/status.
-func startTestHealth(t *testing.T, d dialer, tr *ConnTracker, sshHost string, sshPort int) string {
+// startTestHealth stands up a health server for API and UI checks.
+func startTestHealth(t *testing.T, d dialer, tr *ConnTracker) string {
 	t.Helper()
-	h, err := NewHealthServer("127.0.0.1:0", sshHost, sshPort, d, tr)
+	h, err := NewHealthServer("127.0.0.1:0", d, tr)
 	if err != nil {
 		t.Fatalf("NewHealthServer: %v", err)
 	}
 	h.Start()
 	t.Cleanup(func() { h.Shutdown(context.Background()) })
 	return h.ln.Addr().String()
-}
-
-// liveLocalPort returns the address of a throwaway TCP listener.
-func liveLocalPort(t *testing.T) (string, int) {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listener: %v", err)
-	}
-	t.Cleanup(func() { l.Close() })
-	host, portStr, err := net.SplitHostPort(l.Addr().String())
-	if err != nil {
-		t.Fatalf("split: %v", err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		t.Fatalf("port: %v", err)
-	}
-	return host, port
 }
 
 func getAPI(t *testing.T, url string) (int, connectionsResponse) {
@@ -72,7 +50,7 @@ func TestWebUIConnectionsAPI(t *testing.T) {
 	idLive := tr.Begin(ConnMeta{Proto: "socks5", Src: "10.0.0.3:3333"}, "live.example.com", 8443)
 	_ = idLive
 
-	addr := startTestHealth(t, testDialer{}, tr, "127.0.0.1", 1)
+	addr := startTestHealth(t, testDialer{}, tr)
 	base := "http://" + addr
 
 	// history: both records, newest first, default page/page_size.
@@ -155,56 +133,40 @@ func TestWebUIStatusAPI(t *testing.T) {
 	tr.Begin(ConnMeta{Proto: "socks5"}, "h2", 443)
 	tr.Begin(ConnMeta{Proto: "http"}, "h3", 80)
 
-	sshHost, sshPort := liveLocalPort(t)
-	addr := startTestHealth(t, testDialer{}, tr, sshHost, sshPort)
+	pool := &sshTransportPool{id: "edge-a", host: "ssh-a.example.net", port: 22, user: "tunnel", quota: newServerQuota(10, 4, 2), health: newServerHealth(3, time.Minute, time.Minute, 3, 2)}
+	pool.slots = []*transportSlot{{dialer: testDialer{}, index: 0}}
+	pool.health.recordProbe(true)
+	pool.health.recordProbe(true)
+	set := &sshDialerSet{pools: []*sshTransportPool{pool}}
+	h := &HealthServer{dialer: set, tracker: tr}
 
 	var out struct {
 		SSH struct {
-			Host      string    `json:"host"`
-			Port      int       `json:"port"`
-			Connected bool      `json:"connected"`
-			Reachable bool      `json:"reachable"`
-			RttMs     int64     `json:"rtt_ms"`
-			TCP       *tcpStats `json:"tcp"`
+			Connected bool              `json:"connected"`
+			Eligible  bool              `json:"eligible"`
+			Servers   []sshServerStatus `json:"servers"`
 		} `json:"ssh"`
 		Active      map[string]int `json:"active"`
 		ActiveTotal int            `json:"active_total"`
 		UptimeS     int64          `json:"uptime_s"`
 	}
-	// the first probe runs right after Start; retry briefly until it landed.
-	for i := 0; i < 20; i++ {
-		resp, err := http.Get("http://" + addr + "/api/status")
-		if err != nil {
-			t.Fatalf("GET /api/status: %v", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("code=%d, want 200", resp.StatusCode)
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		resp.Body.Close()
-		if out.SSH.Reachable {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	rec := httptest.NewRecorder()
+	h.statusHandler(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d, want 200", rec.Code)
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
 	}
 
-	if out.SSH.Host != sshHost || out.SSH.Port != sshPort {
-		t.Fatalf("ssh endpoint: %+v", out.SSH)
-	}
-	if !out.SSH.Reachable || out.SSH.RttMs < 0 {
-		t.Fatalf("probe: reachable=%v rtt=%d", out.SSH.Reachable, out.SSH.RttMs)
-	}
-	if !out.SSH.Connected {
-		t.Fatal("testDialer is connected, want connected=true")
+	if !out.SSH.Connected || !out.SSH.Eligible || len(out.SSH.Servers) != 1 {
+		t.Fatalf("SSH summary: %+v", out.SSH)
 	}
 	if out.ActiveTotal != 3 || out.Active["socks5"] != 2 || out.Active["http"] != 1 {
 		t.Fatalf("active: total=%d map=%v", out.ActiveTotal, out.Active)
 	}
-	// testDialer implements tcpStatsProvider with fixed values.
-	if out.SSH.TCP == nil || out.SSH.TCP.RTTMs != 42 || out.SSH.TCP.TotalRetrans != 7 {
-		t.Fatalf("tcp: %+v, want fixed test values", out.SSH.TCP)
+	if slot := out.SSH.Servers[0].Transports[0]; slot.TCP == nil || slot.TCP.RTTMs != 42 || slot.TCP.TotalRetrans != 7 {
+		t.Fatalf("transport tcp: %+v, want fixed test values", slot.TCP)
 	}
 	// uptime_s is the process uptime; handler and test share the clock, so
 	// the value must lie within [0, elapsed].
@@ -212,20 +174,16 @@ func TestWebUIStatusAPI(t *testing.T) {
 		t.Fatalf("uptime_s=%d, want in [0, %d]", out.UptimeS, want+1)
 	}
 
-	resp, err := http.Post("http://"+addr+"/api/status", "", nil)
-	if err != nil {
-		t.Fatalf("POST: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("POST: code=%d, want 405", resp.StatusCode)
+	rec = httptest.NewRecorder()
+	h.statusHandler(rec, httptest.NewRequest(http.MethodPost, "/api/status", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST: code=%d, want 405", rec.Code)
 	}
 }
 
 // TestWebUIStatusDNS: /api/status carries the resolver status when a source is
 // set and null otherwise, and a degraded resolver does not touch readyz.
 func TestWebUIStatusDNS(t *testing.T) {
-	sshHost, sshPort := liveLocalPort(t)
 	status := func(h *HealthServer) map[string]json.RawMessage {
 		t.Helper()
 		resp, err := http.Get("http://" + h.ln.Addr().String() + "/api/status")
@@ -240,13 +198,13 @@ func TestWebUIStatusDNS(t *testing.T) {
 		return out
 	}
 	start := func(set bool) *HealthServer {
-		h, err := NewHealthServer("127.0.0.1:0", sshHost, sshPort, testDialer{}, nil)
+		h, err := NewHealthServer("127.0.0.1:0", testDialer{}, nil)
 		if err != nil {
 			t.Fatalf("NewHealthServer: %v", err)
 		}
 		if set {
 			h.SetDNSStatus(func() dnsStatus {
-				return dnsStatus{Mode: "servers", Degraded: true, LocalFallbacks: 3, Servers: []dnsServerStatus{{Name: "1.1.1.1", OK: 1197, Fail: 3}}}
+				return dnsStatus{Mode: "servers", Degraded: true, Servers: []dnsServerStatus{{ServerID: "edge-a", Name: "1.1.1.1", OK: 1197, Fail: 3, Paused: true}}}
 			})
 		}
 		h.Start()
@@ -265,7 +223,7 @@ func TestWebUIStatusDNS(t *testing.T) {
 	if err := json.Unmarshal(out["dns"], &dns); err != nil {
 		t.Fatalf("decode dns: %v", err)
 	}
-	if !dns.Degraded || dns.LocalFallbacks != 3 || len(dns.Servers) != 1 || dns.Servers[0].Fail != 3 {
+	if !dns.Degraded || len(dns.Servers) != 1 || dns.Servers[0].Fail != 3 || dns.Servers[0].ServerID != "edge-a" || !dns.Servers[0].Paused {
 		t.Fatalf("dns = %+v", dns)
 	}
 	for _, key := range []string{"ssh", "active", "active_total", "uptime_s"} {
@@ -284,86 +242,55 @@ func TestWebUIStatusDNS(t *testing.T) {
 	}
 }
 
-// TestWebUIStatusAPIWithoutProvider: a dialer without TunnelTCPStats must
-// yield "tcp": null in /api/status, not fail the request.
+// A transport without TCP stats must yield "tcp": null in /api/status.
 func TestWebUIStatusAPIWithoutProvider(t *testing.T) {
-	sshHost, sshPort := liveLocalPort(t)
-	addr := startTestHealth(t, &captureMetaDialer{}, nil, sshHost, sshPort)
-
-	resp, err := http.Get("http://" + addr + "/api/status")
-	if err != nil {
-		t.Fatalf("GET /api/status: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("code=%d, want 200", resp.StatusCode)
-	}
+	p := &sshTransportPool{id: "edge-a", host: "ssh-a.example.net", port: 22, health: newServerHealth(3, time.Minute, time.Minute, 3, 2), slots: []*transportSlot{{dialer: &captureMetaDialer{}, index: 0}}}
+	p.health.recordProbe(true)
+	p.health.recordProbe(true)
+	h := &HealthServer{dialer: &sshDialerSet{pools: []*sshTransportPool{p}}}
+	rec := httptest.NewRecorder()
+	h.statusHandler(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
 
 	var out struct {
 		SSH struct {
-			TCP *tcpStats `json:"tcp"`
+			Servers []sshServerStatus `json:"servers"`
 		} `json:"ssh"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if out.SSH.TCP != nil {
-		t.Fatalf("tcp = %+v, want null", out.SSH.TCP)
+	if len(out.SSH.Servers) != 1 || len(out.SSH.Servers[0].Transports) != 1 || out.SSH.Servers[0].Transports[0].TCP != nil {
+		t.Fatalf("server transports = %+v, want tcp null", out.SSH.Servers)
 	}
 }
 
-// TestWebUIStatusAPIUnreachable: a dead SSH port must report
-// reachable=false with zero rtt (the first probe runs right after Start).
-func TestWebUIStatusAPIUnreachable(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listener: %v", err)
-	}
-	deadHost, deadPortStr, err := net.SplitHostPort(l.Addr().String())
-	if err != nil {
-		t.Fatalf("split: %v", err)
-	}
-	l.Close()
-	deadPort, err := strconv.Atoi(deadPortStr)
-	if err != nil {
-		t.Fatalf("port: %v", err)
-	}
-
-	// Disconnected: with a live session the probe does not dial at all.
-	addr := startTestHealth(t, disconnectedDialer{}, nil, deadHost, deadPort)
-
+// A disconnected pool reports its per-server reason without an unauthenticated
+// TCP probe to the SSH port.
+func TestWebUIStatusReportsDisconnectedServer(t *testing.T) {
+	p := &sshTransportPool{id: "edge-a", host: "ssh-a.example.net", port: 22, health: newServerHealth(3, time.Minute, time.Minute, 3, 2), slots: []*transportSlot{{dialer: disconnectedDialer{}, index: 0}}}
+	h := &HealthServer{dialer: &sshDialerSet{pools: []*sshTransportPool{p}}}
+	rec := httptest.NewRecorder()
+	h.statusHandler(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
 	var out struct {
 		SSH struct {
-			Reachable bool  `json:"reachable"`
-			RttMs     int64 `json:"rtt_ms"`
-			CheckedAt int64 `json:"checked_at"`
+			Connected bool              `json:"connected"`
+			Eligible  bool              `json:"eligible"`
+			Servers   []sshServerStatus `json:"servers"`
 		} `json:"ssh"`
 	}
-	// Before the first probe lands, checked_at is a zero time (negative unix).
-	for i := 0; i < 20; i++ {
-		resp, err := http.Get("http://" + addr + "/api/status")
-		if err != nil {
-			t.Fatalf("GET /api/status: %v", err)
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		resp.Body.Close()
-		if out.SSH.CheckedAt > 0 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
 	}
-	if out.SSH.CheckedAt <= 0 {
-		t.Fatal("probe never completed")
+	if out.SSH.Connected || out.SSH.Eligible || len(out.SSH.Servers) != 1 || out.SSH.Servers[0].State != "disconnected" {
+		t.Fatalf("SSH status = %+v", out.SSH)
 	}
-	if out.SSH.Reachable || out.SSH.RttMs != 0 {
-		t.Fatalf("probe: reachable=%v rtt=%d, want false/0", out.SSH.Reachable, out.SSH.RttMs)
+	if out.SSH.Servers[0].Reason != "no connected SSH transport" {
+		t.Fatalf("reason = %q", out.SSH.Servers[0].Reason)
 	}
 }
 
 func TestWebUIStaticAndHealth(t *testing.T) {
-	addr := startTestHealth(t, testDialer{}, nil, "127.0.0.1", 1)
+	addr := startTestHealth(t, testDialer{}, nil)
 	base := "http://" + addr
 
 	// / serves index.html.
@@ -460,7 +387,7 @@ func getWithHost(t *testing.T, addr, path, host string) *http.Response {
 // open to any Host.
 func TestWebUIHostGuard(t *testing.T) {
 	tr := NewConnTracker(10, time.Minute)
-	h, err := NewHealthServer("127.0.0.1:0", "127.0.0.1", 22, testDialer{}, tr)
+	h, err := NewHealthServer("127.0.0.1:0", testDialer{}, tr)
 	if err != nil {
 		t.Fatalf("NewHealthServer: %v", err)
 	}
@@ -498,7 +425,7 @@ func TestWebUIHostGuard(t *testing.T) {
 // TestWebUIHostGuardListenHost: a specific listen address is an allowed
 // name; an unspecified one is not.
 func TestWebUIHostGuardListenHost(t *testing.T) {
-	h, err := NewHealthServer("0.0.0.0:0", "127.0.0.1", 22, testDialer{}, nil)
+	h, err := NewHealthServer("0.0.0.0:0", testDialer{}, nil)
 	if err != nil {
 		t.Fatalf("NewHealthServer: %v", err)
 	}
@@ -506,7 +433,7 @@ func TestWebUIHostGuardListenHost(t *testing.T) {
 	if h.allowedHosts["0.0.0.0"] {
 		t.Fatal("unspecified listen host 0.0.0.0 allowed as a Host name")
 	}
-	h2, err := NewHealthServer("127.0.0.2:0", "127.0.0.1", 22, testDialer{}, nil)
+	h2, err := NewHealthServer("127.0.0.2:0", testDialer{}, nil)
 	if err != nil {
 		t.Skipf("127.0.0.2 not bindable: %v", err)
 	}
@@ -521,56 +448,27 @@ type disconnectedDialer struct{ testDialer }
 
 func (disconnectedDialer) Connected() bool { return false }
 
-// TestHealthProbeSkipsDialWhileConnected: with a live session reporting
-// tcp_info the probe must not open connections to sshd (each one is a
-// [preauth] log line on the server); reachability and RTT come from the
-// session.
-func TestHealthProbeSkipsDialWhileConnected(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listener: %v", err)
-	}
-	defer l.Close()
-	var accepts atomic.Int64
-	go func() {
-		for {
-			c, err := l.Accept()
-			if err != nil {
-				return
-			}
-			accepts.Add(1)
-			c.Close()
-		}
-	}()
-	host, portStr, _ := net.SplitHostPort(l.Addr().String())
-	port, _ := strconv.Atoi(portStr)
-
-	h, err := NewHealthServer("127.0.0.1:0", host, port, testDialer{}, nil)
-	if err != nil {
-		t.Fatalf("NewHealthServer: %v", err)
-	}
-	defer h.ln.Close()
-	h.runProbe()
+func TestStatusWithNoSSHServersKeepsListenerReady(t *testing.T) {
+	h := &HealthServer{dialer: &sshDialerSet{}}
+	h.SetReady(true)
 	rec := httptest.NewRecorder()
+	h.readyHandler(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("readyz = %d, want 200", rec.Code)
+	}
+	rec = httptest.NewRecorder()
 	h.statusHandler(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
-	var out struct {
+	var status struct {
 		SSH struct {
-			Reachable bool  `json:"reachable"`
-			RttMs     int64 `json:"rtt_ms"`
+			Connected bool              `json:"connected"`
+			Eligible  bool              `json:"eligible"`
+			Servers   []sshServerStatus `json:"servers"`
 		} `json:"ssh"`
 	}
-	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
-		t.Fatalf("decode: %v", err)
+	if err := json.NewDecoder(rec.Body).Decode(&status); err != nil {
+		t.Fatal(err)
 	}
-	if !out.SSH.Reachable || out.SSH.RttMs != 42 {
-		t.Fatalf("status = reachable %v rtt %d, want true and the session RTT 42", out.SSH.Reachable, out.SSH.RttMs)
-	}
-
-	// Disconnected: the probe dials.
-	h.dialer = disconnectedDialer{}
-	h.runProbe()
-	time.Sleep(100 * time.Millisecond)
-	if n := accepts.Load(); n != 1 {
-		t.Fatalf("probe connections = %d, want 1 (none while connected, one when down)", n)
+	if status.SSH.Connected || status.SSH.Eligible || len(status.SSH.Servers) != 0 {
+		t.Fatalf("ssh = %+v", status.SSH)
 	}
 }

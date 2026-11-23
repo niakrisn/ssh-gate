@@ -19,8 +19,8 @@ Architecture: any
 # shared library dependencies. init-system-helpers is Essential, so the
 # deb-systemd-helper calls in the generated snippets need no dependency either.
 Depends: ${misc:Depends}, ca-certificates
-Description: SSH tunnel with SOCKS5 and HTTP proxy
- ssh-gate opens a single SSH connection to a gateway host and exposes local
- SOCKS5 and HTTP proxies over it. Per-destination direct routing rules decide
- which traffic bypasses the tunnel, and hostname resolution for tunnelled
- destinations goes through DNS servers queried over the same connection.
+Description: SSH server pools with SOCKS5 and HTTP proxy
+ ssh-gate exposes local SOCKS5 and HTTP proxies through configurable SSH
+ server pools with per-server transport, health and connection limits.
+ Per-destination direct routing rules bypass SSH, while tunnel DNS queries
+ use the selected server's SSH transport.

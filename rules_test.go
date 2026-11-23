@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,7 +17,7 @@ import (
 // Stop() may race. closeOnce makes all of these safe — the test asserts that
 // they run without panic and without a data race (the race detector proves it).
 func TestRuleEngineStopConcurrent(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -129,7 +128,7 @@ func TestSOCKS5ServerResolver(t *testing.T) {
 // TestSOCKS5UnresolvableHost: a name that does not resolve must produce a
 // SOCKS5 "host unreachable" reply (0x04), not a hang or a dial attempt.
 func TestSOCKS5UnresolvableHost(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -181,7 +180,7 @@ func TestSOCKS5DirectHostResolvesLocally(t *testing.T) {
 
 	// localhost resolves locally to 127.0.0.1 regardless of the ambient DNS
 	// configuration; the direct rule keeps it off the tunnel.
-	rules, err := NewRuleEngine("localhost")
+	rules, err := NewRuleEngine([]string{"localhost"})
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -241,7 +240,7 @@ func TestSOCKS5TunnelHostResolvesViaDoH(t *testing.T) {
 		}
 	}()
 
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -320,7 +319,7 @@ func TestSOCKS5ServerV6Literal(t *testing.T) {
 		}
 	}()
 
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -375,7 +374,7 @@ func TestIPRuleMatchesViaDoH(t *testing.T) {
 		}
 		return dohAnswer{status: 0}
 	})
-	rules, err := NewRuleEngine("ip:10.0.0.0/8")
+	rules, err := NewRuleEngine([]string{"ip:10.0.0.0/8"})
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -404,7 +403,7 @@ func TestIPRuleMatchesViaDoH(t *testing.T) {
 // TestDomainRuleBeatsIPRuleOrder: a name listed in DIRECT_RULES never reaches
 // a resolver while the route is decided, even when an ip: rule stands first.
 func TestDomainRuleBeatsIPRuleOrder(t *testing.T) {
-	for _, raw := range []string{"ip:10.0.0.0/8,internal.local", `ip:10.0.0.0/8,re:\.local$`} {
+	for _, raw := range [][]string{{"ip:10.0.0.0/8", "internal.local"}, {`ip:10.0.0.0/8`, `re:\.local$`}} {
 		rules, err := NewRuleEngine(raw)
 		if err != nil {
 			t.Fatalf("NewRuleEngine(%q): %v", raw, err)
@@ -422,7 +421,7 @@ func TestDomainRuleBeatsIPRuleOrder(t *testing.T) {
 		}
 
 		route, reason := rules.decideHost("internal.local")
-		want := "direct:" + strings.Split(raw, ",")[1]
+		want := "direct:" + raw[1]
 		if route != RouteDirect || reason != want {
 			t.Fatalf("%q: Decide = (%s, %s), want (direct, %s)", raw, route, reason, want)
 		}
@@ -439,7 +438,7 @@ func TestDomainRuleBeatsIPRuleOrder(t *testing.T) {
 // entries and two DoH cycles.
 func TestHostNormalization(t *testing.T) {
 	t.Run("rules match every spelling", func(t *testing.T) {
-		rules, err := NewRuleEngine("example.com")
+		rules, err := NewRuleEngine([]string{"example.com"})
 		if err != nil {
 			t.Fatalf("NewRuleEngine: %v", err)
 		}
@@ -458,7 +457,7 @@ func TestHostNormalization(t *testing.T) {
 			}
 			return dohAnswer{status: 0}
 		})
-		rules, err := NewRuleEngine("")
+		rules, err := NewRuleEngine(nil)
 		if err != nil {
 			t.Fatalf("NewRuleEngine: %v", err)
 		}
@@ -486,7 +485,7 @@ func TestHostNormalization(t *testing.T) {
 // matches and traffic the operator believes is direct goes through the
 // tunnel.
 func TestDomainRuleCaseInsensitive(t *testing.T) {
-	rules, err := NewRuleEngine("Example.COM., Other.Local")
+	rules, err := NewRuleEngine([]string{"Example.COM.", "Other.Local"})
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -502,6 +501,20 @@ func TestDomainRuleCaseInsensitive(t *testing.T) {
 	}
 }
 
+// TestRuleEntryKeepsComma: one entry is one rule, commas included. Rules used
+// to reach the engine as one comma-separated string rebuilt from the config
+// list, which turned `re:a,b$` into `re:a` and `b$` - two rules that match
+// nothing the operator meant, and no error to show for it.
+func TestRuleEntryKeepsComma(t *testing.T) {
+	rules, err := NewRuleEngine([]string{`re:a,b$`})
+	if err != nil {
+		t.Fatalf("NewRuleEngine: %v", err)
+	}
+	if route, reason := rules.decideHost("svc-a,b"); route != RouteDirect || reason != `direct:re:a,b$` {
+		t.Errorf("decideHost = (%s, %s), want (direct, direct:re:a,b$)", route, reason)
+	}
+}
+
 // TestRuleEntryParseErrors: rule entries must mean what they look like.
 // An empty "re:" pattern compiles to the match-anything regex (a silent
 // global direct bypass, splitting-horizon split for all traffic), and a
@@ -510,7 +523,7 @@ func TestDomainRuleCaseInsensitive(t *testing.T) {
 // not install them as policies.
 func TestRuleEntryParseErrors(t *testing.T) {
 	for _, raw := range []string{"re:", "."} {
-		if _, err := NewRuleEngine(raw); err == nil {
+		if _, err := NewRuleEngine([]string{raw}); err == nil {
 			t.Errorf("NewRuleEngine(%q): want parse error, got none", raw)
 		}
 	}
@@ -521,7 +534,7 @@ func TestRuleEntryParseErrors(t *testing.T) {
 // and addresses with a zone, so before the fix ::ffff:127.0.0.1 went to the
 // tunnel and reached the VPS loopback.
 func TestDecidePrivateLiterals(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -536,6 +549,21 @@ func TestDecidePrivateLiterals(t *testing.T) {
 	for _, host := range []string{"203.0.113.1", "2001:db8::1", "::ffff:203.0.113.1", "100.128.0.1"} {
 		if route, _ := rules.decideHost(host); route != RouteTunnel {
 			t.Errorf("Decide(%s) = %s, want tunnel", host, route)
+		}
+	}
+}
+
+func TestDecidePublicIPCIDRBeforeTunnel(t *testing.T) {
+	rules, err := NewRuleEngine([]string{"ip:203.0.113.0/24"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every spelling of the same address must match: netip.Prefix.Contains
+	// misses an IPv4-mapped address against an IPv4 prefix, so without
+	// normalizing, the ::ffff: spelling took the tunnel.
+	for _, host := range []string{"203.0.113.7", "::ffff:203.0.113.7"} {
+		if route, reason := rules.decideHost(host); route != RouteDirect || reason != "direct:ip:203.0.113.0/24" {
+			t.Fatalf("Decide(%s)=%s (%s), want direct CIDR", host, route, reason)
 		}
 	}
 }

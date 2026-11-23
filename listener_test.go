@@ -161,7 +161,7 @@ func TestResilientListenerRetriesTransient(t *testing.T) {
 // TestConnLimitRefusesOverLimit: past the limit a connection is closed at
 // once, and a closed connection returns its slot.
 func TestConnLimitRefusesOverLimit(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}

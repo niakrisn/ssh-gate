@@ -108,7 +108,7 @@ func TestDNSPartialFamilyTCP(t *testing.T) {
 					if !errors.Is(err, errNotFound) || local.Load() != 0 {
 						t.Fatalf("negative=%v local=%d", err, local.Load())
 					}
-				} else if err == nil || local.Load() != 1 {
+				} else if !errors.Is(err, errUnreachable) || local.Load() != 0 {
 					t.Fatalf("failure=%v local=%d", err, local.Load())
 				}
 			})
@@ -158,12 +158,12 @@ func TestDNSNoFalseNegativeCacheTCP(t *testing.T) {
 	})
 	rules, local := tunnelServers(t, &channelDialer{}, addr)
 	defer rules.Stop()
-	if _, err := rules.ResolveAll(context.Background(), "negative.example"); err != nil || local.Load() != 1 {
-		t.Fatalf("failed lookup did not fall back: %v", err)
+	if _, err := rules.ResolveAll(context.Background(), "negative.example"); !errors.Is(err, errUnreachable) || local.Load() != 0 {
+		t.Fatalf("failed lookup fell back: %v local=%d", err, local.Load())
 	}
 	recovered.Store(true)
 	got, err := rules.ResolveAll(context.Background(), "negative.example")
-	if err != nil || len(got) != 2 || calls.Load() != 4 || local.Load() != 1 {
+	if err != nil || len(got) != 2 || calls.Load() != 4 || local.Load() != 0 {
 		t.Fatalf("negative cache hid recovery: %v %v queries=%d", got, err, calls.Load())
 	}
 }

@@ -1,4 +1,5 @@
 data/
+.e2e-data/
 build/
 dist/
 packaging/

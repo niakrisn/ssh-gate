@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// Tunnel states. /api/status reports them as ssh.state; statusText turns
-// them into the systemd status line.
+// Tunnel states. statusText turns a transport state into the systemd line;
+// /api/status reports the states per server and transport.
 const (
 	stateNotConfigured   = "not_configured"
 	stateConnecting      = "connecting"
@@ -100,11 +100,16 @@ func statusText(cfg sshDialerCfg, st tunnelStatus) string {
 		return fmt.Sprintf("Cannot reach %s: %s; %s", ep, dialCause(st.Err), retry)
 	case stateHostKeyMismatch:
 		knownHosts := filepath.Join(filepath.Dir(cfg.keyPath), sshKnownHostsFile)
+		entry := "the fingerprint"
+		if cfg.serverID != "" {
+			entry = fmt.Sprintf("the %q entry", cfg.serverID)
+		}
+		message := "Host key of " + ep + " changed"
 		var m *hostKeyMismatchError
 		if errors.As(st.Err, &m) {
-			return fmt.Sprintf("Host key of %s changed (expected %s, got %s): delete %s to trust the new key", ep, m.want, m.got, knownHosts)
+			message += fmt.Sprintf(" (expected %s, got %s)", m.want, m.got)
 		}
-		return fmt.Sprintf("Host key of %s changed: delete %s to trust the new key", ep, knownHosts)
+		return fmt.Sprintf("%s: independently verify the new fingerprint, then replace %s in %s and restart the service", message, entry, knownHosts)
 	}
 	return fmt.Sprintf("SSH error: %v; %s", st.Err, retry)
 }
@@ -122,18 +127,18 @@ func dialCause(err error) string {
 	return err.Error()
 }
 
-// notConfiguredText is the status line while SSH_HOST or SSH_USER is empty.
+// notConfiguredText is the status line while no SSH server is configured.
 func notConfiguredText(missing []string) string {
-	return "Not configured: set " + strings.Join(missing, " and ") + " in /etc/default/ssh-gate, then restart the service"
+	return "Not configured: set " + strings.Join(missing, " and ") + " in /etc/ssh-gate/config.yaml, then restart the service"
 }
 
-// unconfiguredDialer stands in for the SSH dialer while SSH_HOST or
-// SSH_USER is empty: the health server and the Web UI run and report the
+// unconfiguredDialer stands in for the SSH dialer when no SSH server is
+// configured: the health server and the Web UI run and report the
 // state, the proxies stay off.
 type unconfiguredDialer struct{}
 
 func (unconfiguredDialer) DialContext(context.Context, string, string) (net.Conn, error) {
-	return nil, errors.New("not configured: SSH_HOST and SSH_USER are required")
+	return nil, errors.New("not configured: ssh.servers is empty")
 }
 
 func (unconfiguredDialer) Connected() bool { return false }

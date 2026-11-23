@@ -138,6 +138,8 @@ for rev in "${REVISIONS[@]}"; do
 			mkdir -p /etc/defaults
 			echo keep >/etc/defaults/other
 			dpkg -i --force-depends "$DEB" >/dev/null
+			test -f /etc/ssh-gate/config.yaml
+			grep -Fxq /etc/ssh-gate/config.yaml /tmp/ctl/conffiles
 			test -f /etc/defaults/other || { echo "postinst removed /etc/defaults/other" >&2; exit 1; }
 			echo "install: ok"'
 done

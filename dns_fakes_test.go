@@ -263,7 +263,7 @@ func (d *channelDialer) stop() {}
 // local resolver that answers 198.51.100.1 and counts its calls.
 func tunnelServers(t *testing.T, d dialer, servers ...string) (*RuleEngine, *atomic.Int64) {
 	t.Helper()
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}

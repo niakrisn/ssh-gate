@@ -1,23 +1,5 @@
 #!/bin/sh
-# Only the config migration and the hint are written by hand here; enabling,
-# starting and restarting the unit come from the debhelper section that the
-# token line below expands to.
 set -e
-
-case "$1" in
-	configure)
-		# Packages up to 0.1.0 shipped the config as /etc/defaults/ssh-gate
-		# (non-standard). Carry a configured file over to /etc/default.
-		if [ -f /etc/defaults/ssh-gate ] && ! grep -Eqs '^SSH_HOST=.+' /etc/default/ssh-gate; then
-			cp -p /etc/defaults/ssh-gate /etc/default/ssh-gate
-			echo "ssh-gate: moved config from /etc/defaults/ssh-gate to /etc/default/ssh-gate"
-		fi
-		# Remove only our own file: /etc/defaults is not ours and may hold
-		# files of the admin or of other packages.
-		rm -f /etc/defaults/ssh-gate
-		rmdir --ignore-fail-on-non-empty /etc/defaults 2>/dev/null || true
-		;;
-esac
 
 #DEBHELPER#
 
@@ -25,9 +7,14 @@ if [ "$1" != configure ]; then
 	exit 0
 fi
 
-if ! grep -Eqs '^SSH_HOST=.+' /etc/default/ssh-gate; then
-	echo "ssh-gate: set SSH_HOST and SSH_USER in /etc/default/ssh-gate,"
-	echo "ssh-gate: then run: systemctl restart ssh-gate"
+if [ -s /etc/default/ssh-gate ]; then
+	echo "ssh-gate: the old /etc/default/ssh-gate environment file is no longer read."
+	echo "ssh-gate: migrate its values to /etc/ssh-gate/config.yaml; see /usr/share/doc/ssh-gate/README.md and config.example.yaml."
+fi
+
+if ! grep -Eq '^[[:space:]]*servers:[[:space:]]*\[' /etc/ssh-gate/config.yaml 2>/dev/null && \
+	! grep -Eq '^[[:space:]]*- id:' /etc/ssh-gate/config.yaml 2>/dev/null; then
+	echo "ssh-gate: add entries under ssh.servers in /etc/ssh-gate/config.yaml, then restart the service."
 fi
 
 exit 0

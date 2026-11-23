@@ -5,10 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	stdlog "log"
-	"math"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,28 +15,9 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// probeInterval is how often the SSH server port is probed in the
-// background; probeTimeout bounds a single probe dial. Probes only refresh
-// the cached /api/status reachability result and log nothing; 30 s keeps a
-// dead SSH endpoint from being dialed every few seconds.
-const (
-	probeInterval = 30 * time.Second
-	probeTimeout  = 3 * time.Second
-)
-
 // processStartedAt is when this process began; /api/status reports the
 // elapsed time as uptime_s.
 var processStartedAt = time.Now()
-
-// sshProbe is the latest result of probing the SSH server port.
-type sshProbe struct {
-	reachable bool
-	rttMs     int64
-	at        time.Time
-	// fromSession marks a result taken from the live session instead of
-	// a dial; the RTT then comes from tcp_info at request time.
-	fromSession bool
-}
 
 // HealthServer provides /healthz, /readyz, the Web UI and /api/status.
 type HealthServer struct {
@@ -46,18 +25,12 @@ type HealthServer struct {
 	ln      net.Listener
 	srv     http.Server
 	started atomic.Bool
+	ready   atomic.Bool
 
 	tracker *ConnTracker
-	sshHost string
-	sshPort int
 	// dnsStatus reports the tunnel resolvers; nil while the proxies are off.
 	dnsStatus func() dnsStatus
 
-	probeMu   sync.Mutex
-	probe     sshProbe
-	ctx       context.Context
-	cancel    context.CancelFunc
-	probeDone chan struct{}
 	closeOnce sync.Once
 
 	// allowedHosts are the Host header names (no port) the Web UI and the
@@ -65,17 +38,11 @@ type HealthServer struct {
 	allowedHosts map[string]bool
 }
 
-// NewHealthServer creates a new health server with the Web UI,
-// /api/connections and /api/status attached to the same mux. sshHost/
-// sshPort is the tunnel endpoint, probed in the background for /api/status.
-func NewHealthServer(listen, sshHost string, sshPort int, d dialer, tracker *ConnTracker) (*HealthServer, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+// NewHealthServer creates the health server and Web UI.
+func NewHealthServer(listen string, d dialer, tracker *ConnTracker) (*HealthServer, error) {
 	h := &HealthServer{
 		dialer:  d,
 		tracker: tracker,
-		sshHost: sshHost,
-		sshPort: sshPort,
-		ctx:     ctx, cancel: cancel, probeDone: make(chan struct{}),
 		allowedHosts: map[string]bool{
 			"localhost": true,
 			"127.0.0.1": true,
@@ -109,7 +76,6 @@ func NewHealthServer(listen, sshHost string, sshPort int, d dialer, tracker *Con
 
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
-		cancel()
 		return nil, err
 	}
 	h.ln = limitConns(ln, newConnLimiter(128))
@@ -152,13 +118,12 @@ func (h *HealthServer) uiGuard(next http.Handler) http.Handler {
 	})
 }
 
-// Start begins serving health checks and probing the SSH server port. An
-// empty sshHost (not configured) has no port to probe.
+// Start begins serving health and status endpoints.
 func (h *HealthServer) Start() {
 	if !h.started.CompareAndSwap(false, true) {
 		return
 	}
-	go h.probeLoop()
+	h.ready.Store(true)
 	go func() {
 		log.Info().Str("listen", h.ln.Addr().String()).Msg("health server starting")
 		if err := h.srv.Serve(h.ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
@@ -169,7 +134,8 @@ func (h *HealthServer) Start() {
 
 func (h *HealthServer) StopAccept() error {
 	var err error
-	h.closeOnce.Do(func() { h.cancel(); err = h.ln.Close() })
+	h.ready.Store(false)
+	h.closeOnce.Do(func() { err = h.ln.Close() })
 	return err
 }
 
@@ -178,20 +144,7 @@ func (h *HealthServer) Drain(ctx context.Context) error {
 	if errors.Is(err, net.ErrClosed) {
 		err = nil
 	}
-	if !h.started.Load() {
-		return err
-	}
-	select {
-	case <-h.probeDone:
-		return err
-	default:
-	}
-	select {
-	case <-h.probeDone:
-		return err
-	case <-ctx.Done():
-		return errors.Join(err, ctx.Err())
-	}
+	return err
 }
 
 func (h *HealthServer) ForceClose() { _ = h.srv.Close() }
@@ -207,90 +160,22 @@ func (h *HealthServer) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// probeLoop dials the SSH server port in the background and caches the
-// result, so /api/status never blocks on the dial.
-func (h *HealthServer) probeLoop() {
-	defer close(h.probeDone)
-	if h.sshHost == "" || h.ctx.Err() != nil {
-		return
-	}
-	h.runProbe()
-	ticker := time.NewTicker(probeInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-h.ctx.Done():
-			return
-		case <-ticker.C:
-			h.runProbe()
-		}
-	}
-}
-
-// liveSessionStats returns the tunnel tcp_info when the SSH session is up
-// and the dialer reports it, nil otherwise.
-func (h *HealthServer) liveSessionStats() *tcpStats {
-	if !h.dialer.Connected() {
-		return nil
-	}
-	if p, ok := h.dialer.(tcpStatsProvider); ok {
-		return p.TunnelTCPStats()
-	}
-	return nil
-}
-
-// runProbe dials the SSH server port (IPv4 only, like the tunnel itself)
-// and stores the reachability result and RTT. While the session is up and
-// reports tcp_info it does not dial: the live session already proves the
-// server reachable and carries the RTT, and every probe is an
-// unauthenticated connection that sshd logs as [preauth] and that
-// fail2ban-style tools may count against the client address.
-func (h *HealthServer) runProbe() {
-	if h.ctx.Err() != nil {
-		return
-	}
-	if h.liveSessionStats() != nil {
-		h.probeMu.Lock()
-		h.probe = sshProbe{reachable: true, at: time.Now(), fromSession: true}
-		h.probeMu.Unlock()
-		return
-	}
-	addr := net.JoinHostPort(h.sshHost, strconv.Itoa(h.sshPort))
-	start := time.Now()
-	probe := net.Dialer{Timeout: probeTimeout}
-	conn, err := probe.DialContext(h.ctx, "tcp4", addr)
-	result := sshProbe{at: time.Now()}
-	if err == nil {
-		conn.Close()
-		result.reachable = true
-		result.rttMs = time.Since(start).Milliseconds()
-	}
-	if h.ctx.Err() != nil {
-		return
-	}
-	h.probeMu.Lock()
-	h.probe = result
-	h.probeMu.Unlock()
-}
-
 func (h *HealthServer) healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
 }
 
 func (h *HealthServer) readyHandler(w http.ResponseWriter, r *http.Request) {
-	if h.dialer.Connected() {
+	if h.ready.Load() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 		return
 	}
 	w.WriteHeader(http.StatusServiceUnavailable)
-	if st := h.tunnelStatus(); st.State == stateNotConfigured {
-		w.Write([]byte("not configured: SSH_HOST and SSH_USER are required"))
-	} else {
-		w.Write([]byte("SSH not connected: " + st.State))
-	}
+	w.Write([]byte("listeners not ready"))
 }
+
+func (h *HealthServer) SetReady(ready bool) { h.ready.Store(ready) }
 
 // tunnelStatus returns the dialer's tunnel state. A dialer without a state
 // (test fakes) is connected or connecting by Connected().
@@ -323,16 +208,16 @@ func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.probeMu.Lock()
-	probe := h.probe
-	h.probeMu.Unlock()
-
-	var tcp *tcpStats
-	if p, ok := h.dialer.(tcpStatsProvider); ok {
-		tcp = p.TunnelTCPStats()
+	var serverViews []sshServerStatus
+	if p, ok := h.dialer.(sshServersProvider); ok {
+		serverViews = p.SSHServersStatus()
 	}
-	if probe.fromSession && tcp != nil {
-		probe.rttMs = int64(math.Round(tcp.RTTMs))
+	if serverViews == nil {
+		serverViews = []sshServerStatus{}
+	}
+	eligible := false
+	for _, server := range serverViews {
+		eligible = eligible || server.Eligible
 	}
 
 	active := map[string]int{}
@@ -344,19 +229,6 @@ func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 		total += n
 	}
 
-	// No probe has run yet, or none runs (not configured): report 0, not
-	// the Unix time of the zero time.
-	var checkedAt int64
-	if !probe.at.IsZero() {
-		checkedAt = probe.at.Unix()
-	}
-
-	st := h.tunnelStatus()
-	errText := ""
-	if st.Err != nil {
-		errText = st.Err.Error()
-	}
-
 	var dns *dnsStatus
 	if h.dnsStatus != nil {
 		s := h.dnsStatus()
@@ -366,15 +238,9 @@ func (h *HealthServer) statusHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(map[string]any{
 		"ssh": map[string]any{
-			"host":       h.sshHost,
-			"port":       h.sshPort,
-			"connected":  h.dialer.Connected(),
-			"state":      st.State,
-			"error":      errText,
-			"reachable":  probe.reachable,
-			"rtt_ms":     probe.rttMs,
-			"checked_at": checkedAt,
-			"tcp":        tcp,
+			"connected": h.dialer.Connected(),
+			"eligible":  eligible,
+			"servers":   serverViews,
 		},
 		"dns":          dns,
 		"active":       active,

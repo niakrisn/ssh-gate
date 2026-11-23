@@ -1,0 +1,144 @@
+name: ssh-gate-e2e
+
+# e2e stand: the current build against the real SSH server from .env, with the
+# deployment's client key. Endpoint and credentials come from .env through
+# Compose interpolation, so nothing about the server is committed. The config is
+# inline below because a bind-mounted file cannot be interpolated.
+#
+# Unlike docker-compose.yml this stand listens on other host ports and keeps
+# its own storage directory, so it can run next to the deployment without
+# sharing state with it.
+services:
+  ssh-gate:
+    build: .
+    container_name: ssh-gate-e2e
+    restart: "no"
+    configs:
+      - source: gate_config
+        target: /etc/ssh-gate/config.yaml
+    # Published on every host interface so other devices on the network can use
+    # the stand. The proxy listeners have no authentication: pin these back to
+    # "127.0.0.1:11080:1080" and friends on a network you do not control. The
+    # Web UI also answers only to Host names in ui.allowed_hosts, so a LAN
+    # address has to be listed in the config below to open the UI elsewhere.
+    ports:
+      - "11080:1080"
+      - "13128:3128"
+      - "19090:9090"
+    volumes:
+      # A copy of the deployment client key, so the stand authenticates as the
+      # same account but writes its own host pins. Never mount ./data here:
+      # the stand would rewrite the deployment's ssh_known_hosts.
+      - type: bind
+        source: ./.e2e-data
+        target: /data
+      - type: tmpfs
+        target: /tmp
+    security_opt:
+      - no-new-privileges:true
+    # Not read_only: Compose can only materialize an inline config into a
+    # writable container filesystem ("file" is the sole supported option for a
+    # read-only service). The deployment keeps read_only: true.
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+configs:
+  gate_config:
+    content: |
+      proxy:
+        socks5:
+          listen:
+            - "0.0.0.0:1080"
+        http:
+          listen:
+            - "0.0.0.0:3128"
+
+      # The routing policy belongs to the operator, not to the stand, so both
+      # values come from .env: the stand then exercises the rules production
+      # will use instead of an empty list. Compose interpolates .env into this
+      # inline file only (a service can consume a `file:` config unrendered),
+      # which is why the values are expanded here rather than read by the
+      # container.
+      routing:
+        direct:
+          # One comma-separated string, the format DIRECT_RULES had before the
+          # config file existed, so the old EnvironmentFile value is copied
+          # unchanged. It cannot be a YAML list built from this variable: rules
+          # contain "[" and "]", which end a flow sequence. Commas separate
+          # entries in this spelling, so a rule that needs a literal comma
+          # belongs in a sequence entry of a config file instead. Unset or empty
+          # routes everything through the SSH server, as this stand did before.
+          rules: ${DIRECT_RULES}
+          ip_family: ${DIRECT_IP_FAMILY:-both}
+
+      ssh:
+        keepalive:
+          period: 10s
+          interval: 1s
+          probes: 5
+        servers:
+          - id: e2e-a
+            host: ${SSH_HOST:?set SSH_HOST in .env}
+            port: ${SSH_PORT:-22}
+            user: ${SSH_USER:?set SSH_USER in .env}
+            # Two transports so the transport pool is observable: concurrent
+            # tunnels spread over the slots and /api/status reports per-slot
+            # channel counts.
+            transports: 2
+            limits:
+              max_client_tunnels: 8192
+              # Blocked or blackholed destinations hold a pending open until the
+              # server's own connect() gives up, so a small budget here starves
+              # unrelated connections behind them.
+              max_pending_opens: 256
+              # Carries every tunnel DNS query and the HTTPS health check.
+              max_pending_service_opens: 32
+
+      balancing:
+        hash_key: client_ip_destination
+        retry:
+          max_attempts: 3
+          timeout: 20s
+        passive:
+          max_fails: 3
+          fail_timeout: 30s
+          unhealthy_period: 30s
+
+      dns:
+        tunnel:
+          servers:
+            - 1.1.1.1
+            - 8.8.8.8
+
+      health:
+        listen: 0.0.0.0:9090
+        # The check runs through the tunnel, so it must be a public HTTPS
+        # endpoint the SSH server itself reaches with a publicly trusted
+        # certificate. A filtered destination fails it with a bare EOF and keeps
+        # the server out of rotation.
+        url: https://www.google.com
+        interval: 10s
+        timeout: 5s
+        max_fails: 3
+        successes: 2
+
+      ui:
+        allowed_hosts: []
+
+      logging:
+        level: debug
+        access: true
+
+      storage:
+        directory: /data

@@ -109,14 +109,14 @@ func TestDoHTLSHandshakeBounded(t *testing.T) {
 	const channels = 2 * count
 	target, hellos, closed := startSilentTLSPeer(t, channels)
 	f := startForwardingSSH(t, target)
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rules.SetDOH(target, f.d)
 	rules.dns.dohClient.Timeout = 100 * time.Millisecond
 	rules.dns.localLookup = func(context.Context, string) ([]net.IPAddr, error) {
-		return []net.IPAddr{{IP: net.ParseIP("198.51.100.1")}}, nil
+		return nil, errors.New("local resolver must not be asked")
 	}
 	t.Cleanup(func() {
 		f.d.stop()
@@ -125,10 +125,7 @@ func TestDoHTLSHandshakeBounded(t *testing.T) {
 	results := make(chan error, count)
 	for i := range count {
 		go func() {
-			addrs, err := rules.ResolveAll(context.Background(), fmt.Sprintf("tls-%d.example", i))
-			if err == nil && (len(addrs) != 1 || addrs[0].String() != "198.51.100.1") {
-				err = fmt.Errorf("unexpected fallback: %v", addrs)
-			}
+			_, err := rules.ResolveAll(context.Background(), fmt.Sprintf("tls-%d.example", i))
 			results <- err
 		}()
 	}
@@ -142,11 +139,11 @@ func TestDoHTLSHandshakeBounded(t *testing.T) {
 	for range count {
 		select {
 		case err := <-results:
-			if err != nil {
-				t.Fatal(err)
+			if err == nil {
+				t.Fatal("a DoH endpoint that never answered returned an answer")
 			}
 		case <-time.After(time.Second):
-			t.Fatal("lookup did not return its local fallback promptly")
+			t.Fatal("lookup did not fail within its deadline")
 		}
 	}
 	deadline := time.NewTimer(4 * time.Second)
@@ -193,12 +190,16 @@ func TestDoHDialWaitBounded(t *testing.T) {
 	}
 }
 
-func TestDoHTransportReuse(t *testing.T) {
+// TestDoHNoIdleConnectionReuse: a finished DoH request must not leave its
+// tunnel channel idle. The route is picked per request while Go keys an idle
+// connection only by URL and TLS config, so a pooled channel would send the
+// next request through whichever server opened it.
+func TestDoHNoIdleConnectionReuse(t *testing.T) {
 	srv := startFakeDoHServer(t, func(_, _ string) dohAnswer {
 		return dohAnswer{a: []string{"198.51.100.1"}}
 	})
 	f := startForwardingSSH(t, srv.Listener.Addr().String())
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,8 +214,15 @@ func TestDoHTransportReuse(t *testing.T) {
 			t.Fatalf("lookup %s: %v, %v", host, addrs, err)
 		}
 	}
-	if f.opens.Load() != 1 || f.active.Load() != 1 {
-		t.Fatalf("finished request killed pooled connection: opens=%d active=%d", f.opens.Load(), f.active.Load())
+	if got := f.opens.Load(); got != 4 {
+		t.Fatalf("opens = %d, want 4 (two lookups x A+AAAA)", got)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for f.active.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := f.active.Load(); got != 0 {
+		t.Fatalf("idle channels retained = %d", got)
 	}
 }
 
@@ -240,7 +248,7 @@ func TestDoHTransportStop(t *testing.T) {
 				t.Cleanup(srv.Close)
 			}
 			f := startForwardingSSH(t, target)
-			rules, err := NewRuleEngine("")
+			rules, err := NewRuleEngine(nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -303,7 +311,7 @@ func TestDoHTransportStop(t *testing.T) {
 }
 
 func TestDNSStopCancelsSharedLookup(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +348,7 @@ func TestDNSStopCancelsSharedLookup(t *testing.T) {
 }
 
 func TestDNSStopWaitsForSharedLookupCleanup(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

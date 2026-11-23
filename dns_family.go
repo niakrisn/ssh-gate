@@ -35,6 +35,9 @@ func (e dnsRCodeError) Is(target error) bool {
 // A negative DNS answer is distinct from a transient resolver failure.
 // Unknown errors are protocol/trust failures and cannot be masked by an IP.
 func temporaryDNSFailure(err error) bool {
+	if sshQuotaExhausted(err) {
+		return false
+	}
 	if errors.Is(err, errUnreachable) {
 		return true
 	}

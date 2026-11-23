@@ -52,7 +52,7 @@ func TestDNSTCPIgnoresHosts(t *testing.T) {
 	}
 	want := netip.MustParseAddr("203.0.113.7")
 	peer := startFakeDNSServer(t, func(string) (byte, netip.Addr) { return 0, want })
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

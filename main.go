@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,28 +19,155 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"go.yaml.in/yaml/v3"
 )
 
 type config struct {
-	sshHost              string
-	sshPort              int
-	sshUser              string
-	dataDir              string
-	proxyModes           []string
-	socks5Addrs          []string
-	httpAddrs            []string
-	directRules          string
-	directIPFamily       IPFamily
-	dohHost              string
-	tunnelDNS            []string
-	localOnNXDomain      bool
-	healthAddr           string
-	sshKeepalivePeriod   time.Duration
-	sshKeepaliveInterval int
-	sshKeepaliveProbes   int
-	dialTimeout          time.Duration
-	maxConnections       int
-	uiAllowedHosts       []string
+	sshServers             []sshServerConfig
+	sshHost                string
+	sshPort                int
+	sshUser                string
+	dataDir                string
+	proxyModes             []string
+	socks5Addrs            []string
+	httpAddrs              []string
+	directRules            []string
+	directIPFamily         IPFamily
+	dohHost                string
+	tunnelDNS              []string
+	healthAddr             string
+	sshKeepalivePeriod     time.Duration
+	sshKeepaliveInterval   int
+	sshKeepaliveProbes     int
+	dialTimeout            time.Duration
+	uiAllowedHosts         []string
+	logLevel               string
+	accessLog              bool
+	balancingHashKey       string
+	retryMaxAttempts       int
+	passiveMaxFails        int
+	passiveFailTimeout     time.Duration
+	passiveUnhealthyPeriod time.Duration
+	healthURL              string
+	healthInterval         time.Duration
+	healthTimeout          time.Duration
+	healthMaxFails         int
+	healthSuccesses        int
+}
+
+type sshServerConfig struct {
+	id                     string
+	host                   string
+	port                   int
+	user                   string
+	transports             int
+	maxClientTunnels       int
+	maxPendingOpens        int
+	maxPendingServiceOpens int
+}
+
+// ruleList is routing.direct.rules. It takes the documented YAML sequence and a
+// single comma-separated string, which is the form DIRECT_RULES held before the
+// config file existed. The string form exists because Compose can only
+// interpolate .env as text: rules routinely contain "[" and "]", and those are
+// flow-sequence indicators in YAML, so a list spelled `[${DIRECT_RULES}]`
+// fails to parse. Only the string form splits on commas - it is defined by them
+// - so a rule containing a comma has to be its own sequence entry.
+type ruleList []string
+
+func (l *ruleList) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode || node.Tag == "!!null" {
+		var entries []string
+		if err := node.Decode(&entries); err != nil {
+			return err
+		}
+		*l = entries
+		return nil
+	}
+	var raw string
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	var entries []string
+	for _, entry := range strings.Split(raw, ",") {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			entries = append(entries, entry)
+		}
+	}
+	*l = entries
+	return nil
+}
+
+type fileConfig struct {
+	Proxy struct {
+		SOCKS5 *struct {
+			Listen []string `yaml:"listen"`
+		} `yaml:"socks5"`
+		HTTP *struct {
+			Listen []string `yaml:"listen"`
+		} `yaml:"http"`
+	} `yaml:"proxy"`
+	Routing struct {
+		Direct struct {
+			Rules    ruleList `yaml:"rules"`
+			IPFamily string   `yaml:"ip_family"`
+		} `yaml:"direct"`
+	} `yaml:"routing"`
+	SSH struct {
+		Keepalive struct {
+			Period   string `yaml:"period"`
+			Interval string `yaml:"interval"`
+			Probes   int    `yaml:"probes"`
+		} `yaml:"keepalive"`
+		Servers []struct {
+			ID         string `yaml:"id"`
+			Host       string `yaml:"host"`
+			Port       int    `yaml:"port"`
+			User       string `yaml:"user"`
+			Transports int    `yaml:"transports"`
+			Limits     struct {
+				MaxClientTunnels       int `yaml:"max_client_tunnels"`
+				MaxPendingOpens        int `yaml:"max_pending_opens"`
+				MaxPendingServiceOpens int `yaml:"max_pending_service_opens"`
+			} `yaml:"limits"`
+		} `yaml:"servers"`
+	} `yaml:"ssh"`
+	DNS struct {
+		Tunnel struct {
+			Servers []string `yaml:"servers"`
+			DOHHost string   `yaml:"doh_host"`
+		} `yaml:"tunnel"`
+	} `yaml:"dns"`
+	Balancing struct {
+		HashKey string `yaml:"hash_key"`
+		Retry   struct {
+			MaxAttempts int    `yaml:"max_attempts"`
+			Timeout     string `yaml:"timeout"`
+		} `yaml:"retry"`
+		Passive struct {
+			MaxFails        int    `yaml:"max_fails"`
+			FailTimeout     string `yaml:"fail_timeout"`
+			UnhealthyPeriod string `yaml:"unhealthy_period"`
+		} `yaml:"passive"`
+	} `yaml:"balancing"`
+	Health struct {
+		Listen    string `yaml:"listen"`
+		URL       string `yaml:"url"`
+		Interval  string `yaml:"interval"`
+		Timeout   string `yaml:"timeout"`
+		MaxFails  int    `yaml:"max_fails"`
+		Successes int    `yaml:"successes"`
+	} `yaml:"health"`
+	UI struct {
+		AllowedHosts []string `yaml:"allowed_hosts"`
+	} `yaml:"ui"`
+	Logging struct {
+		Level  string `yaml:"level"`
+		Access bool   `yaml:"access"`
+	} `yaml:"logging"`
+	Storage struct {
+		Directory string `yaml:"directory"`
+	} `yaml:"storage"`
 }
 
 type server struct {
@@ -48,7 +178,7 @@ type server struct {
 }
 
 // connHistoryMaxAge bounds the in-memory connection history window.
-// SSH_DIAL_TIMEOUT must stay below it: dropStalled moves dialing records
+// balancing.retry.timeout must stay below it: dropStalled moves dialing records
 // older than this window to history, so a dial in flight past it would lose
 // its record.
 const connHistoryMaxAge = 10 * time.Minute
@@ -60,34 +190,32 @@ const connHistoryMaxAge = 10 * time.Minute
 // restarting in a loop.
 const exitConfig = 78
 
-// missing returns the names of the empty required variables. With any of
-// them empty the service runs not configured: Web UI and health only.
+// missing lists absent SSH configuration. Proxy listeners still run so
+// direct routes remain available when the server list is empty.
 func (c config) missing() []string {
-	var names []string
-	if c.sshHost == "" {
-		names = append(names, "SSH_HOST")
+	if c.sshHost == "" || c.sshUser == "" {
+		return []string{"ssh.servers"}
 	}
-	if c.sshUser == "" {
-		names = append(names, "SSH_USER")
-	}
-	return names
+	return nil
 }
 
 func main() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	configPath := flag.String("config", "/etc/ssh-gate/config.yaml", "YAML configuration file")
+	flag.Parse()
+	cfg, err := loadConfigFile(*configPath)
+	if err != nil {
+		// Logging cannot be set up yet: its level comes from this file. The
+		// status still has to be the one the unit lists in
+		// RestartPreventExitStatus, and zerolog's Fatal would exit 1 here,
+		// making systemd restart a broken config forever.
+		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+		os.Exit(exitConfig)
+	}
 	// log.Fatal is used only for startup errors.
-	accessOn, accessErr := parseOnOff(getEnv("ACCESS_LOG", "on"))
-	logs := setupLogging(parseLogLevel(getEnv("LOG_LEVEL", "info")), accessOn)
+	logs := setupLogging(parseLogLevel(cfg.logLevel), cfg.accessLog)
 	defer logs.stop()
 	zerolog.FatalExitFunc = logs.exitFatal
-	if accessErr != nil {
-		log.Fatal().Err(accessErr).Msg("invalid ACCESS_LOG")
-	}
-
-	cfg, err := loadConfig()
-	if err != nil {
-		log.Fatal().Err(err).Msg("load config")
-	}
 
 	if err := os.MkdirAll(cfg.dataDir, 0700); err != nil {
 		log.Fatal().Err(err).Str("dir", cfg.dataDir).Msg("create data dir")
@@ -110,22 +238,14 @@ func main() {
 	// Connection history is in-memory only: last 1000 connections / 10 minutes.
 	tracker := NewConnTracker(1000, connHistoryMaxAge)
 
-	var servers []server
-	var d dialer
-	var rules *RuleEngine
-	if missing := cfg.missing(); len(missing) > 0 {
-		// First start after install: keep running so that systemctl shows
-		// the hint and the restart after the config edit just works. No
-		// proxies: without a tunnel every tunnel connection would fail.
-		log.Warn().Strs("missing", missing).Msg("not configured: proxies stay off until SSH_HOST and SSH_USER are set and the service restarts")
-		status.set(notConfiguredText(missing))
-		d = unconfiguredDialer{}
-	} else {
-		d, rules, servers = startProxies(cfg, tracker, status)
+	d, rules, servers := startProxies(cfg, tracker, status)
+	if len(cfg.sshServers) == 0 {
+		log.Warn().Msg("no SSH servers configured; proxy listeners only serve direct routes")
+		status.set(notConfiguredText([]string{"ssh.servers"}))
 	}
 
 	// Health/ready endpoint + Web UI.
-	hs, err := NewHealthServer(cfg.healthAddr, cfg.sshHost, cfg.sshPort, d, tracker)
+	hs, err := NewHealthServer(cfg.healthAddr, d, tracker)
 	if err != nil {
 		log.Fatal().Err(err).Msg("health server")
 	}
@@ -134,6 +254,7 @@ func main() {
 		hs.SetDNSStatus(rules.DNSStatus)
 	}
 	hs.Start()
+	hs.SetReady(len(servers) > 0)
 	servers = append(servers, server{Name: "health", StopAccept: hs.StopAccept, Drain: hs.Drain, ForceClose: hs.ForceClose})
 
 	// Graceful shutdown on SIGTERM/SIGINT
@@ -147,12 +268,16 @@ func main() {
 
 	if rules != nil {
 		rules.Start(ctx)
+		if set, ok := d.(*sshDialerSet); ok {
+			set.startHealthChecks(ctx, rules, cfg.healthURL, cfg.healthInterval, cfg.healthTimeout)
+		}
 	}
 	status.ready()
 
 	<-ctx.Done()
 	log.Info().Msg("shutting down...")
 	status.stop("Stopping, draining connections")
+	hs.SetReady(false)
 	// The signal ctx is already canceled; passing it to the servers would
 	// skip the relay drain entirely. Give the drain its own deadline,
 	// comfortably below compose's stop_grace_period (10 s).
@@ -167,7 +292,6 @@ func main() {
 // configureDNS routes tunnel-destination resolution through the configured
 // resolvers, inside the SSH tunnel. Direct destinations keep local DNS.
 func configureDNS(rules *RuleEngine, cfg config, d dialer) {
-	rules.dns.localOnNXDomain = cfg.localOnNXDomain
 	if cfg.dohHost != "" {
 		rules.SetDOH(cfg.dohHost, d)
 		return
@@ -177,69 +301,79 @@ func configureDNS(rules *RuleEngine, cfg config, d dialer) {
 
 // startProxies starts the SSH dialer and the proxy listeners. The dialer
 // reports every tunnel state change to the systemd status line.
-func startProxies(cfg config, tracker *ConnTracker, status *sdStatus) (*sshDialer, *RuleEngine, []server) {
-	dcfg := sshDialerCfg{
-		host:              cfg.sshHost,
-		port:              cfg.sshPort,
-		user:              cfg.sshUser,
-		keyPath:           filepath.Join(cfg.dataDir, sshKeyFile),
-		keepalivePeriod:   cfg.sshKeepalivePeriod,
-		keepaliveInterval: cfg.sshKeepaliveInterval,
-		keepaliveProbes:   cfg.sshKeepaliveProbes,
-		tracker:           tracker,
-		dialTimeout:       cfg.dialTimeout,
+func startProxies(cfg config, tracker *ConnTracker, status *sdStatus) (dialer, *RuleEngine, []server) {
+	set := &sshDialerSet{}
+	hostKeys := &hostKeyStore{path: filepath.Join(cfg.dataDir, sshKnownHostsFile)}
+	var monitors []*sshDialer
+	for _, serverCfg := range cfg.sshServers {
+		quota := newServerQuota(serverCfg.maxClientTunnels, serverCfg.maxPendingOpens, serverCfg.maxPendingServiceOpens)
+		pool := &sshTransportPool{id: serverCfg.id, host: serverCfg.host, port: serverCfg.port, user: serverCfg.user, healthURL: cfg.healthURL, quota: quota, health: newServerHealth(cfg.passiveMaxFails, cfg.passiveFailTimeout, cfg.passiveUnhealthyPeriod, cfg.healthMaxFails, cfg.healthSuccesses)}
+		for slot := 0; slot < serverCfg.transports; slot++ {
+			dcfg := sshDialerCfg{
+				host: serverCfg.host, port: serverCfg.port, user: serverCfg.user,
+				keyPath: filepath.Join(cfg.dataDir, sshKeyFile), serverID: serverCfg.id, transportSlot: slot, hostKeys: hostKeys,
+				openQuota:       quota,
+				keepalivePeriod: cfg.sshKeepalivePeriod, keepaliveInterval: cfg.sshKeepaliveInterval,
+				keepaliveProbes: cfg.sshKeepaliveProbes, tracker: tracker, dialTimeout: cfg.dialTimeout,
+			}
+			slotID := slot
+			dcfg.onStatus = func(st tunnelStatus) {
+				status.set(fmt.Sprintf("%s slot %d: %s", dcfg.serverID, dcfg.transportSlot, statusText(dcfg, st)))
+				event := log.Info().Str("server_id", dcfg.serverID).Int("slot", dcfg.transportSlot).Str("state", st.State)
+				if st.Err != nil {
+					event = event.Err(st.Err)
+				}
+				event.Msg("SSH transport state changed")
+				if st.State == stateReconnecting {
+					pool.transportFailed(slotID)
+				}
+			}
+			d, err := newSSHDialer(dcfg)
+			if err != nil {
+				for _, slot := range pool.slots {
+					slot.dialer.stop()
+				}
+				set.stop()
+				log.Fatal().Err(err).Str("server_id", serverCfg.id).Msg("SSH transport")
+			}
+			pool.slots = append(pool.slots, &transportSlot{dialer: d, index: slot})
+			monitors = append(monitors, d)
+		}
+		set.pools = append(set.pools, pool)
 	}
-	dcfg.onStatus = func(st tunnelStatus) { status.set(statusText(dcfg, st)) }
-	dialer, err := newSSHDialer(dcfg)
-	if err != nil {
-		log.Fatal().Err(err).Msg("SSH dialer")
-	}
-
 	rules, err := NewRuleEngine(cfg.directRules)
 	if err != nil {
+		set.stop()
 		log.Fatal().Err(err).Msg("rule engine")
 	}
-
-	configureDNS(rules, cfg, dialer)
-	log.Info().Str("mode", rules.DNSStatus().Mode).Strs("tunnel_dns", cfg.tunnelDNS).Bool("local_on_nxdomain", cfg.localOnNXDomain).Msg("DNS resolvers configured")
-
-	// One Opener per process: both proxy protocols share the route/resolve
-	// policy (direct via local DNS, tunnel via the tunnel resolvers) and the
-	// SSH dialer.
-	opener := &Opener{rules: rules, d: dialer, family: cfg.directIPFamily, dialTimeout: cfg.dialTimeout}
-
+	configureDNS(rules, cfg, set)
+	for _, d := range monitors {
+		d.start()
+	}
+	log.Info().Str("mode", rules.DNSStatus().Mode).Strs("tunnel_dns", cfg.tunnelDNS).Msg("DNS resolvers configured")
+	opener := &Opener{rules: rules, d: set, family: cfg.directIPFamily, dialTimeout: cfg.dialTimeout, hashKey: cfg.balancingHashKey, maxAttempts: cfg.retryMaxAttempts}
 	var servers []server
-
-	// One limit for all proxy listeners: descriptors and goroutines are
-	// per process.
-	limit := newConnLimiter(cfg.maxConnections)
-
-	// One server instance per listen address; all instances share the
-	// Opener (route policy, DNS, SSH dialer).
 	if contains(cfg.proxyModes, "socks5") {
 		for _, addr := range cfg.socks5Addrs {
 			s5, err := NewSOCKS5Server(addr, opener)
 			if err != nil {
 				log.Fatal().Err(err).Str("listen", addr).Msg("SOCKS5 server")
 			}
-			s5.SetConnLimit(limit)
 			s5.Start()
 			servers = append(servers, server{Name: "SOCKS5 " + addr, StopAccept: s5.StopAccept, Drain: s5.Drain, ForceClose: s5.ForceClose})
 		}
 	}
-
 	if contains(cfg.proxyModes, "http") {
 		for _, addr := range cfg.httpAddrs {
 			hp, err := NewHTTPProxyServer(addr, opener)
 			if err != nil {
 				log.Fatal().Err(err).Str("listen", addr).Msg("HTTP proxy")
 			}
-			hp.SetConnLimit(limit)
 			hp.Start()
 			servers = append(servers, server{Name: "HTTP " + addr, StopAccept: hp.StopAccept, Drain: hp.Drain, ForceClose: hp.ForceClose})
 		}
 	}
-	return dialer, rules, servers
+	return set, rules, servers
 }
 
 func shutdownServers(ctx context.Context, servers []server, rules *RuleEngine, d dialer) error {
@@ -271,7 +405,7 @@ func shutdownServers(ctx context.Context, servers []server, rules *RuleEngine, d
 			errs = append(errs, fmt.Errorf("DNS cleanup: %w", err))
 		}
 	}
-	if owner, ok := d.(*sshDialer); ok {
+	if owner, ok := d.(interface{ waitStopped(context.Context) error }); ok {
 		if err := owner.waitStopped(cleanup); err != nil {
 			errs = append(errs, fmt.Errorf("SSH cleanup: %w", err))
 		}
@@ -300,168 +434,214 @@ func drainServers(ctx context.Context, servers []server) error {
 }
 
 func loadConfig() (config, error) {
-	// Validate SSH_PORT
-	portStr := getEnv("SSH_PORT", "22")
-	port, err := strconv.Atoi(portStr)
+	return loadConfigFile("/etc/ssh-gate/config.yaml")
+}
+
+func loadConfigFile(path string) (config, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return config{}, fmt.Errorf("invalid SSH_PORT %q: %w", portStr, err)
+		return config{}, fmt.Errorf("read %s: %w", path, err)
 	}
-	if err := validatePort(port); err != nil {
-		return config{}, fmt.Errorf("invalid SSH_PORT: %w", err)
+	var raw fileConfig
+	raw.SSH.Keepalive.Period = "10s"
+	raw.SSH.Keepalive.Interval = "1s"
+	raw.SSH.Keepalive.Probes = 5
+	raw.Routing.Direct.IPFamily = "both"
+	raw.Balancing.Retry.Timeout = "30s"
+	raw.Balancing.HashKey = "client_ip_destination"
+	raw.Balancing.Retry.MaxAttempts = 3
+	raw.Balancing.Passive.MaxFails = 3
+	raw.Balancing.Passive.FailTimeout = "30s"
+	raw.Balancing.Passive.UnhealthyPeriod = "30s"
+	raw.Health.Listen = "127.0.0.1:9090"
+	raw.Health.URL = "https://www.youtube.com"
+	raw.Health.Interval = "10s"
+	raw.Health.Timeout = "5s"
+	raw.Health.MaxFails = 3
+	raw.Health.Successes = 2
+	raw.Logging.Level = "info"
+	raw.Logging.Access = true
+	raw.Storage.Directory = "/data"
+	dec := yaml.NewDecoder(strings.NewReader(string(data)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&raw); err != nil {
+		return config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
-
-	// Validate PROXY_MODES
-	modesRaw := getEnv("PROXY_MODES", "socks5")
-	modes, err := parseModes(modesRaw)
-	if err != nil {
-		return config{}, fmt.Errorf("invalid PROXY_MODES: %w", err)
-	}
-
-	// SSH_HOST and SSH_USER may be empty: the service then runs not
-	// configured (see config.missing) instead of exiting.
-	sshHost := os.Getenv("SSH_HOST")
-	// The tunnel connects over IPv4 only (dialer.go dials tcp4), so an
-	// IPv6 literal could never connect; fail at startup, not in the
-	// reconnect loop.
-	if ip := net.ParseIP(strings.Trim(sshHost, "[]")); ip != nil && ip.To4() == nil {
-		return config{}, fmt.Errorf("invalid SSH_HOST %q: the tunnel connects over IPv4 only, use an IPv4 address or a name with an A record", sshHost)
-	}
-
-	sshUser := os.Getenv("SSH_USER")
-
-	// Validate DIRECT_IP_FAMILY
-	directIPFamily, err := parseIPFamily(getEnv("DIRECT_IP_FAMILY", "both"))
-	if err != nil {
-		return config{}, fmt.Errorf("invalid DIRECT_IP_FAMILY: %w", err)
-	}
-
-	// Validate SSH_KEEPALIVE_PERIOD
-	sshKeepalivePeriod, err := parseKeepalivePeriod(getEnv("SSH_KEEPALIVE_PERIOD", "10s"))
-	if err != nil {
-		return config{}, fmt.Errorf("invalid SSH_KEEPALIVE_PERIOD: %w", err)
-	}
-
-	// Validate SSH_KEEPALIVE_INTERVAL
-	sshKeepaliveInterval, err := parseKeepaliveInterval(getEnv("SSH_KEEPALIVE_INTERVAL", "1s"))
-	if err != nil {
-		return config{}, fmt.Errorf("invalid SSH_KEEPALIVE_INTERVAL: %w", err)
-	}
-
-	// Validate SSH_KEEPALIVE_PROBES
-	sshKeepaliveProbes, err := parseKeepaliveProbes(getEnv("SSH_KEEPALIVE_PROBES", "5"))
-	if err != nil {
-		return config{}, fmt.Errorf("invalid SSH_KEEPALIVE_PROBES: %w", err)
-	}
-
-	// Validate SSH_DIAL_TIMEOUT
-	dialTimeout, err := parseDialTimeout(getEnv("SSH_DIAL_TIMEOUT", "30s"))
-	if err != nil {
-		return config{}, fmt.Errorf("invalid SSH_DIAL_TIMEOUT: %w", err)
-	}
-	if dialTimeout >= connHistoryMaxAge {
-		return config{}, fmt.Errorf("invalid SSH_DIAL_TIMEOUT %s: must be below %s (connection history window)", dialTimeout, connHistoryMaxAge)
-	}
-
-	// Validate MAX_CONNECTIONS
-	maxConnections, err := parseMaxConnections(getEnv("MAX_CONNECTIONS", "4096"))
-	if err != nil {
-		return config{}, err
-	}
-
-	// Validate listen addresses (comma-separated lists; one server per
-	// address).
-	socks5Addrs, err := parseListenList("SOCKS5_LISTEN", getEnv("SOCKS5_LISTEN", ":1080"))
-	if err != nil {
-		return config{}, err
-	}
-
-	httpAddrs, err := parseListenList("HTTP_LISTEN", getEnv("HTTP_LISTEN", ":3128"))
-	if err != nil {
-		return config{}, err
-	}
-
-	healthAddr := getEnv("HEALTH_LISTEN", "127.0.0.1:9090")
-	if err := validateHostPort(healthAddr); err != nil {
-		return config{}, fmt.Errorf("invalid HEALTH_LISTEN: %w", err)
-	}
-
-	// Validate UI_ALLOWED_HOSTS
-	uiAllowedHosts, err := parseHostList("UI_ALLOWED_HOSTS", getEnv("UI_ALLOWED_HOSTS", ""))
-	if err != nil {
-		return config{}, err
-	}
-
-	// Validate DATA_DIR
-	dataDir := getEnv("DATA_DIR", "/data")
-	if dataDir == "" {
-		return config{}, fmt.Errorf("DATA_DIR cannot be empty")
-	}
-
-	// Validate DOH_HOST: a hostname (optionally with port 443) for the
-	// optional DNS-over-HTTPS endpoint that tunnel destinations resolve
-	// through. Empty means the DNS servers of TUNNEL_DNS.
-	dohHost := os.Getenv("DOH_HOST")
-	if dohHost != "" {
-		if strings.Contains(dohHost, "/") {
-			return config{}, fmt.Errorf("invalid DOH_HOST %q: use a hostname, e.g. cloudflare-dns.com", dohHost)
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return config{}, fmt.Errorf("parse %s: multiple YAML documents are not supported", path)
 		}
-		hostOnly := dohHost
-		if host, port, err := net.SplitHostPort(dohHost); err == nil {
-			hostOnly = host
-			if port != "443" {
-				return config{}, fmt.Errorf("invalid DOH_HOST %q: only port 443 is supported", dohHost)
+		return config{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	if raw.Proxy.SOCKS5 == nil && raw.Proxy.HTTP == nil {
+		return config{}, errors.New("at least one of proxy.socks5 or proxy.http must be configured")
+	}
+	var modes, socks, httpAddrs []string
+	if raw.Proxy.SOCKS5 != nil {
+		modes = append(modes, "socks5")
+		socks = raw.Proxy.SOCKS5.Listen
+	}
+	if raw.Proxy.HTTP != nil {
+		modes = append(modes, "http")
+		httpAddrs = raw.Proxy.HTTP.Listen
+	}
+	validateAddrs := func(name string, addrs []string) error {
+		if len(addrs) == 0 {
+			return fmt.Errorf("%s.listen must contain at least one address", name)
+		}
+		for _, a := range addrs {
+			if err := validateHostPort(a); err != nil {
+				return fmt.Errorf("invalid %s.listen address %q: %w", name, a, err)
 			}
 		}
-		// IP-literal endpoints are unusable: TLS certificates are validated
-		// against the hostname, and DoH provider certs carry no IP SANs.
-		if net.ParseIP(hostOnly) != nil {
-			return config{}, fmt.Errorf("invalid DOH_HOST %q: use a hostname (e.g. cloudflare-dns.com), not an IP address", dohHost)
-		}
+		return nil
 	}
-
-	// Validate TUNNEL_DNS: one tunnel resolver mode only, so the running
-	// config never depends on which of the two wins.
-	if dohHost != "" && os.Getenv("TUNNEL_DNS") != "" {
-		return config{}, fmt.Errorf("DOH_HOST and TUNNEL_DNS are both set: use one of them")
-	}
-	var tunnelDNS []string
-	if dohHost == "" {
-		if tunnelDNS, err = parseTunnelDNS(getEnv("TUNNEL_DNS", defaultTunnelDNS)); err != nil {
+	if raw.Proxy.SOCKS5 != nil {
+		if err := validateAddrs("proxy.socks5", socks); err != nil {
 			return config{}, err
 		}
 	}
-
-	// Validate LOCAL_DNS_ON_NXDOMAIN
-	localOnNXDomain, err := parseOnOff(getEnv("LOCAL_DNS_ON_NXDOMAIN", "off"))
-	if err != nil {
-		return config{}, fmt.Errorf("invalid LOCAL_DNS_ON_NXDOMAIN: %w", err)
+	if raw.Proxy.HTTP != nil {
+		if err := validateAddrs("proxy.http", httpAddrs); err != nil {
+			return config{}, err
+		}
 	}
-
-	return config{
-		sshHost:              sshHost,
-		sshPort:              port,
-		sshUser:              sshUser,
-		dataDir:              dataDir,
-		proxyModes:           modes,
-		socks5Addrs:          socks5Addrs,
-		httpAddrs:            httpAddrs,
-		directRules:          getEnv("DIRECT_RULES", ""),
-		directIPFamily:       directIPFamily,
-		dohHost:              dohHost,
-		tunnelDNS:            tunnelDNS,
-		localOnNXDomain:      localOnNXDomain,
-		healthAddr:           healthAddr,
-		sshKeepalivePeriod:   sshKeepalivePeriod,
-		sshKeepaliveInterval: sshKeepaliveInterval,
-		sshKeepaliveProbes:   sshKeepaliveProbes,
-		dialTimeout:          dialTimeout,
-		maxConnections:       maxConnections,
-		uiAllowedHosts:       uiAllowedHosts,
-	}, nil
+	family, err := parseIPFamily(raw.Routing.Direct.IPFamily)
+	if err != nil {
+		return config{}, fmt.Errorf("routing.direct.ip_family: %w", err)
+	}
+	period, err := parseKeepalivePeriod(raw.SSH.Keepalive.Period)
+	if err != nil {
+		return config{}, fmt.Errorf("ssh.keepalive.period: %w", err)
+	}
+	interval, err := parseKeepaliveInterval(raw.SSH.Keepalive.Interval)
+	if err != nil {
+		return config{}, fmt.Errorf("ssh.keepalive.interval: %w", err)
+	}
+	if raw.SSH.Keepalive.Probes < 0 {
+		return config{}, errors.New("ssh.keepalive.probes must be non-negative")
+	}
+	dialTimeout, err := parseDialTimeout(raw.Balancing.Retry.Timeout)
+	if err != nil {
+		return config{}, fmt.Errorf("balancing.retry.timeout: %w", err)
+	}
+	if dialTimeout >= connHistoryMaxAge {
+		return config{}, fmt.Errorf("balancing.retry.timeout %s: must be below %s (connection history window)", dialTimeout, connHistoryMaxAge)
+	}
+	if raw.Balancing.Retry.MaxAttempts < 1 || raw.Balancing.Retry.MaxAttempts > 3 {
+		return config{}, errors.New("balancing.retry.max_attempts must be between 1 and 3")
+	}
+	if raw.Balancing.HashKey != "client_ip_destination" && raw.Balancing.HashKey != "client_ip" {
+		return config{}, errors.New("balancing.hash_key must be client_ip_destination or client_ip")
+	}
+	for name, value := range map[string]string{"balancing.passive.fail_timeout": raw.Balancing.Passive.FailTimeout, "balancing.passive.unhealthy_period": raw.Balancing.Passive.UnhealthyPeriod, "health.interval": raw.Health.Interval, "health.timeout": raw.Health.Timeout} {
+		d, e := time.ParseDuration(value)
+		if e != nil || d <= 0 {
+			return config{}, fmt.Errorf("%s must be a positive duration", name)
+		}
+	}
+	passiveFailTimeout, _ := time.ParseDuration(raw.Balancing.Passive.FailTimeout)
+	passiveUnhealthyPeriod, _ := time.ParseDuration(raw.Balancing.Passive.UnhealthyPeriod)
+	healthInterval, _ := time.ParseDuration(raw.Health.Interval)
+	healthTimeout, _ := time.ParseDuration(raw.Health.Timeout)
+	if raw.Balancing.Passive.MaxFails < 1 || raw.Health.MaxFails < 1 || raw.Health.Successes < 1 {
+		return config{}, errors.New("balancing.passive.max_fails, health.max_fails, and health.successes must be positive")
+	}
+	if raw.Storage.Directory == "" {
+		return config{}, errors.New("storage.directory cannot be empty")
+	}
+	if err := validateHostPort(raw.Health.Listen); err != nil {
+		return config{}, fmt.Errorf("health.listen: %w", err)
+	}
+	if raw.Health.URL == "" {
+		return config{}, errors.New("health.url cannot be empty")
+	}
+	probeURL, err := url.ParseRequestURI(raw.Health.URL)
+	if err != nil {
+		return config{}, fmt.Errorf("health.url: %w", err)
+	}
+	if probeURL.Scheme != "https" || probeURL.Host == "" {
+		return config{}, errors.New("health.url must be an absolute HTTPS URL")
+	}
+	if raw.Logging.Level != "debug" && raw.Logging.Level != "info" && raw.Logging.Level != "warn" && raw.Logging.Level != "error" {
+		return config{}, fmt.Errorf("logging.level %q is invalid", raw.Logging.Level)
+	}
+	seen := map[string]bool{}
+	for i, srv := range raw.SSH.Servers {
+		if srv.ID == "" || srv.Host == "" || srv.User == "" {
+			return config{}, fmt.Errorf("ssh.servers[%d] requires id, host, and user", i)
+		}
+		if strings.TrimSpace(srv.ID) != srv.ID || strings.ContainsAny(srv.ID, " \t\r\n#") {
+			return config{}, fmt.Errorf("ssh.servers[%d].id cannot contain whitespace or #", i)
+		}
+		if seen[srv.ID] {
+			return config{}, fmt.Errorf("duplicate ssh server id %q", srv.ID)
+		}
+		seen[srv.ID] = true
+		if srv.Port == 0 {
+			raw.SSH.Servers[i].Port = 22
+		} else if err := validatePort(srv.Port); err != nil {
+			return config{}, fmt.Errorf("ssh.servers[%d].port: %w", i, err)
+		}
+		if ip := net.ParseIP(strings.Trim(srv.Host, "[]")); ip != nil && ip.To4() == nil {
+			return config{}, fmt.Errorf("ssh.servers[%d].host: IPv4 only; use IPv4 or a name with an A record", i)
+		}
+		if srv.Transports == 0 {
+			raw.SSH.Servers[i].Transports = 4
+		} else if srv.Transports < 1 {
+			return config{}, fmt.Errorf("ssh.servers[%d].transports must be positive", i)
+		}
+		limits := &raw.SSH.Servers[i].Limits
+		if limits.MaxClientTunnels == 0 {
+			limits.MaxClientTunnels = 4096
+		}
+		if limits.MaxPendingOpens == 0 {
+			limits.MaxPendingOpens = 256
+		}
+		if limits.MaxPendingServiceOpens == 0 {
+			limits.MaxPendingServiceOpens = 32
+		}
+		if limits.MaxClientTunnels < 1 || limits.MaxPendingOpens < 1 || limits.MaxPendingServiceOpens < 1 {
+			return config{}, fmt.Errorf("ssh.servers[%d].limits must be positive", i)
+		}
+	}
+	var host, user string
+	port := 22
+	serverConfigs := make([]sshServerConfig, 0, len(raw.SSH.Servers))
+	if len(raw.SSH.Servers) > 0 {
+		host = raw.SSH.Servers[0].Host
+		user = raw.SSH.Servers[0].User
+		port = raw.SSH.Servers[0].Port
+	}
+	for _, srv := range raw.SSH.Servers {
+		serverConfigs = append(serverConfigs, sshServerConfig{
+			id: srv.ID, host: srv.Host, port: srv.Port, user: srv.User,
+			transports: srv.Transports, maxClientTunnels: srv.Limits.MaxClientTunnels,
+			maxPendingOpens: srv.Limits.MaxPendingOpens, maxPendingServiceOpens: srv.Limits.MaxPendingServiceOpens,
+		})
+	}
+	var tunnelDNS []string
+	dohHost := raw.DNS.Tunnel.DOHHost
+	if err := validateDOHHost(dohHost); err != nil {
+		return config{}, fmt.Errorf("dns.tunnel.doh_host: %w", err)
+	}
+	if dohHost != "" && len(raw.DNS.Tunnel.Servers) > 0 {
+		return config{}, errors.New("dns.tunnel.doh_host and dns.tunnel.servers are mutually exclusive")
+	}
+	if dohHost == "" {
+		rawServers := raw.DNS.Tunnel.Servers
+		if len(rawServers) == 0 {
+			rawServers = []string{"1.1.1.1", "8.8.8.8"}
+		}
+		tunnelDNS, err = parseTunnelDNS(strings.Join(rawServers, ","))
+		if err != nil {
+			return config{}, fmt.Errorf("dns.tunnel.servers: %w", err)
+		}
+	}
+	return config{sshServers: serverConfigs, sshHost: host, sshPort: port, sshUser: user, dataDir: raw.Storage.Directory, proxyModes: modes, socks5Addrs: socks, httpAddrs: httpAddrs, directRules: raw.Routing.Direct.Rules, directIPFamily: family, dohHost: dohHost, tunnelDNS: tunnelDNS, healthAddr: raw.Health.Listen, sshKeepalivePeriod: period, sshKeepaliveInterval: interval, sshKeepaliveProbes: raw.SSH.Keepalive.Probes, dialTimeout: dialTimeout, uiAllowedHosts: raw.UI.AllowedHosts, logLevel: raw.Logging.Level, accessLog: raw.Logging.Access, balancingHashKey: raw.Balancing.HashKey, retryMaxAttempts: raw.Balancing.Retry.MaxAttempts, passiveMaxFails: raw.Balancing.Passive.MaxFails, passiveFailTimeout: passiveFailTimeout, passiveUnhealthyPeriod: passiveUnhealthyPeriod, healthURL: raw.Health.URL, healthInterval: healthInterval, healthTimeout: healthTimeout, healthMaxFails: raw.Health.MaxFails, healthSuccesses: raw.Health.Successes}, nil
 }
-
-// defaultTunnelDNS is used when neither TUNNEL_DNS nor DOH_HOST is set.
-const defaultTunnelDNS = "1.1.1.1,8.8.8.8"
 
 // parseTunnelDNS parses a comma-separated list of DNS server IPs with an
 // optional port into host:port addresses. Names are refused: resolving the
@@ -476,45 +656,53 @@ func parseTunnelDNS(raw string) ([]string, error) {
 		host, port := entry, "53"
 		if _, err := netip.ParseAddr(entry); err != nil {
 			if host, port, err = net.SplitHostPort(entry); err != nil {
-				return nil, fmt.Errorf("invalid TUNNEL_DNS entry %q: use an IP address with an optional port", entry)
+				return nil, fmt.Errorf("invalid DNS server %q: use an IP address with an optional port", entry)
 			}
 		}
 		if _, err := netip.ParseAddr(host); err != nil {
-			return nil, fmt.Errorf("invalid TUNNEL_DNS entry %q: use an IP address, not a name", entry)
+			return nil, fmt.Errorf("invalid DNS server %q: use an IP address, not a name", entry)
 		}
 		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
-			return nil, fmt.Errorf("invalid TUNNEL_DNS entry %q: bad port", entry)
+			return nil, fmt.Errorf("invalid DNS server %q: bad port", entry)
 		}
 		servers = append(servers, net.JoinHostPort(host, port))
 	}
 	if len(servers) == 0 {
-		return nil, fmt.Errorf("TUNNEL_DNS has no servers")
+		return nil, fmt.Errorf("DNS tunnel resolver list is empty")
 	}
 	return servers, nil
 }
 
-func parseModes(raw string) ([]string, error) {
-	valid := map[string]bool{"socks5": true, "http": true}
-	var modes []string
-	for _, m := range strings.Split(raw, ",") {
-		m = strings.TrimSpace(strings.ToLower(m))
-		if m == "" {
-			continue
-		}
-		if !valid[m] {
-			return nil, fmt.Errorf("unknown proxy mode %q (valid: socks5, http)", m)
-		}
-		modes = append(modes, m)
+// validateDOHHost checks the DoH endpoint is a bare host name or address with
+// an optional port. The client builds "https://<host>/dns-query" itself, so a
+// scheme, a path or a stray space becomes a request to a nonsense host: the
+// proxy would start fine and only break on the first tunnel lookup. An empty
+// value means "no DoH" and is the caller's business.
+func validateDOHHost(raw string) error {
+	const want = `want a host name or address with an optional port, for example dns.google or dns.example:8443`
+	if raw == "" {
+		return nil
 	}
-	if len(modes) == 0 {
-		return []string{"socks5"}, nil
+	if strings.Contains(raw, "://") {
+		return fmt.Errorf("invalid %q: no scheme allowed, %s", raw, want)
 	}
-	return modes, nil
+	host, port, err := net.SplitHostPort(raw)
+	switch {
+	case err == nil:
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid %q: bad port, %s", raw, want)
+		}
+	case strings.HasSuffix(err.Error(), "missing port in address"):
+		host = raw
+	default:
+		return fmt.Errorf("invalid %q: %s", raw, want)
+	}
+	if host == "" || strings.ContainsAny(host, " \t/\\?#@%") {
+		return fmt.Errorf("invalid %q: %s", raw, want)
+	}
+	return nil
 }
 
-// parseListenList parses a comma-separated list of host:port listen
-// addresses (one proxy server per address). Whitespace around items is
-// ignored, empty items are skipped, at least one address is required.
 func parseListenList(name, raw string) ([]string, error) {
 	var addrs []string
 	for _, addr := range strings.Split(raw, ",") {
@@ -561,7 +749,7 @@ const (
 )
 
 // setupLogging builds the service and access loggers. Levels are set per
-// logger, not globally, so the access log stays on at LOG_LEVEL=warn. Under
+// logger, not globally, so the access log stays on at logging.level=warn. Under
 // systemd the lines go to journald natively (priority and identifier per
 // line); elsewhere (Docker, a terminal) both loggers write JSON to stderr.
 func setupLogging(level zerolog.Level, access bool) *logging {
@@ -595,31 +783,10 @@ func parseLogLevel(level string) zerolog.Level {
 	}
 }
 
-func parseOnOff(v string) (bool, error) {
-	switch strings.ToLower(v) {
-	case "on":
-		return true, nil
-	case "off":
-		return false, nil
-	}
-	return false, fmt.Errorf("%q: want on or off", v)
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// parseKeepalivePeriod parses SSH_KEEPALIVE_PERIOD as a Go duration.
-// Non-positive values disable OS keepalive (returned as 0). Empty input is
-// a hard error: loadConfig always supplies a non-empty default, so an empty
-// raw value here would mean a caller bug, not a configuration choice.
 func parseKeepalivePeriod(raw string) (time.Duration, error) {
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		return 0, fmt.Errorf("invalid SSH_KEEPALIVE_PERIOD %q (Go duration, e.g. 90s): %w", raw, err)
+		return 0, fmt.Errorf("invalid keepalive period %q (Go duration, e.g. 90s): %w", raw, err)
 	}
 	if d <= 0 {
 		return 0, nil
@@ -627,17 +794,17 @@ func parseKeepalivePeriod(raw string) (time.Duration, error) {
 	return d, nil
 }
 
-// parseKeepaliveInterval parses SSH_KEEPALIVE_INTERVAL as a Go duration and
+// parseKeepaliveInterval parses keepalive interval as a Go duration and
 // returns whole seconds for TCP_KEEPINTVL. Zero keeps the kernel default
 // (returned as 0); sub-second values round up to 1 s. Empty input is a hard
 // error: loadConfig always supplies a non-empty default.
 func parseKeepaliveInterval(raw string) (int, error) {
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		return 0, fmt.Errorf("invalid SSH_KEEPALIVE_INTERVAL %q (Go duration, e.g. 1s): %w", raw, err)
+		return 0, fmt.Errorf("invalid keepalive interval %q (Go duration, e.g. 1s): %w", raw, err)
 	}
 	if d < 0 {
-		return 0, fmt.Errorf("SSH_KEEPALIVE_INTERVAL must be non-negative, got %s", raw)
+		return 0, fmt.Errorf("keepalive interval must be non-negative, got %s", raw)
 	}
 	if d == 0 {
 		return 0, nil
@@ -649,50 +816,34 @@ func parseKeepaliveInterval(raw string) (int, error) {
 	return s, nil
 }
 
-// parseKeepaliveProbes parses SSH_KEEPALIVE_PROBES as an integer for
+// parseKeepaliveProbes parses keepalive probes as an integer for
 // TCP_KEEPCNT. Zero keeps the kernel default (returned as 0). Empty input is
 // a hard error: loadConfig always supplies a non-empty default.
 func parseKeepaliveProbes(raw string) (int, error) {
 	n, err := strconv.Atoi(raw)
 	if err != nil {
-		return 0, fmt.Errorf("invalid SSH_KEEPALIVE_PROBES %q (integer, e.g. 5): %w", raw, err)
+		return 0, fmt.Errorf("invalid keepalive probes %q (integer, e.g. 5): %w", raw, err)
 	}
 	if n < 0 {
-		return 0, fmt.Errorf("SSH_KEEPALIVE_PROBES must be non-negative, got %d", n)
+		return 0, fmt.Errorf("keepalive probes must be non-negative, got %d", n)
 	}
 	return n, nil
 }
 
-// parseDialTimeout parses SSH_DIAL_TIMEOUT as a Go duration.
+// parseDialTimeout parses tunnel attempt timeout as a Go duration.
 // A non-positive value is rejected: an unbounded destination dial can
 // hang forever on a blackholed host.
 func parseDialTimeout(raw string) (time.Duration, error) {
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		return 0, fmt.Errorf("invalid SSH_DIAL_TIMEOUT %q (Go duration, e.g. 30s): %w", raw, err)
+		return 0, fmt.Errorf("invalid tunnel attempt timeout %q (Go duration, e.g. 30s): %w", raw, err)
 	}
 	if d <= 0 {
-		return 0, fmt.Errorf("SSH_DIAL_TIMEOUT must be positive, got %s", raw)
+		return 0, fmt.Errorf("tunnel attempt timeout must be positive, got %s", raw)
 	}
 	return d, nil
 }
 
-// parseMaxConnections parses MAX_CONNECTIONS, the limit of concurrent
-// client connections over all proxy listeners. 0 disables the limit.
-func parseMaxConnections(raw string) (int, error) {
-	n, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, fmt.Errorf("invalid MAX_CONNECTIONS %q (integer, e.g. 4096): %w", raw, err)
-	}
-	if n < 0 {
-		return 0, fmt.Errorf("MAX_CONNECTIONS must be non-negative (0 = no limit), got %d", n)
-	}
-	return n, nil
-}
-
-// firstRunPorts returns the unique ports of the listen addresses in order,
-// so the first-run hint lists each reachable port once. An address without
-// a parseable port falls back to the protocol default.
 func firstRunPorts(addrs []string, defaultPort string) []string {
 	seen := map[string]bool{}
 	var ports []string

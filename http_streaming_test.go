@@ -197,7 +197,7 @@ func TestHTTPUploadAbortReleasesResources(t *testing.T) {
 				})
 				d = &sshDialer{client: connectTestSSHClient(t, addr, signer)}
 			}
-			rules, _ := NewRuleEngine("")
+			rules, _ := NewRuleEngine(nil)
 			defer rules.Stop()
 			s, err := NewHTTPProxyServer("127.0.0.1:0", newTestOpener(rules, d))
 			if err != nil {

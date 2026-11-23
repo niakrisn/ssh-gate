@@ -1,19 +1,14 @@
 [Unit]
-Description=ssh-gate SSH tunnel with SOCKS5 and HTTP proxy
+Description=ssh-gate SSH server pools with SOCKS5 and HTTP proxy
 Documentation=https://github.com/niakrisn/ssh-gate
 Wants=network-online.target
 After=network-online.target
 
 [Service]
-# The daemon reports READY=1 once its listeners are open (it does not wait
-# for the tunnel) and keeps the Status: line of systemctl status current:
-# not configured, connecting, key not accepted, connected and so on.
+# The daemon reports READY=1 once its listeners are open and keeps the
+# Status: line of systemctl status current.
 Type=notify
-ExecStart=/usr/bin/ssh-gate
-# Declared before EnvironmentFile so that /etc/default/ssh-gate wins if the
-# user sets DATA_DIR there.
-Environment=DATA_DIR=/var/lib/ssh-gate
-EnvironmentFile=-/etc/default/ssh-gate
+ExecStart=/usr/bin/ssh-gate --config /etc/ssh-gate/config.yaml
 DynamicUser=yes
 StateDirectory=ssh-gate
 NoNewPrivileges=yes
@@ -49,8 +44,8 @@ LogRateLimitIntervalSec=30s
 LogRateLimitBurst=50000
 KillSignal=SIGTERM
 TimeoutStopSec=15
-# An empty SSH_HOST or SSH_USER is not an error: the daemon runs and its
-# status line asks for the config. Every startup error (a bad value, a busy
+# An empty ssh.servers list is not an error: proxy listeners remain available
+# for direct routes. Every startup error (a bad value, a busy
 # port, an unreadable key) exits with 78, which a restart cannot fix, so
 # the unit stays failed instead of restarting in a loop. Restart covers
 # crashes only.

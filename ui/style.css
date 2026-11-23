@@ -121,9 +121,9 @@ h1 {
 
 /* ---------- status line ---------- */
 
-/* Two rows: state (endpoint, probe, session, uptime, active) on top,
-   tunnel tcp_info counters below. Rows wrap instead of overflowing, so
-   the layout survives narrow windows. */
+/* Three zones: state (endpoint, transports, uptime, active) on top, per-server
+   quota meters, then one line per SSH transport. Rows wrap instead of
+   overflowing, so the layout survives narrow windows. */
 .statusline {
   display: flex;
   flex-direction: column;
@@ -157,10 +157,110 @@ h1 {
 
 #ssh-info { font-variant-numeric: tabular-nums; }
 
-/* The counter row aligns with the text, past the dot. */
-#tunnel-info {
+/* Одна сетка на весь блок детализации: метки, полосы и значения выравниваются
+   по общим колонкам, поэтому полосы одинаковой длины и у разных квот, и у
+   разных серверов. Отступает на ширину точки, как и строка состояния. */
+.server-detail {
+  display: grid;
+  grid-template-columns: 108px minmax(48px, 1fr) max-content;
+  align-items: center;
+  gap: 1px 10px;
   padding-left: 16px;
-  font-variant-numeric: tabular-nums;
+  max-width: 760px;
+}
+
+/* Строки не должны иметь собственной сетки или отступа — иначе колонки
+   поедут и длина полосы начнёт зависеть от соседней строки. */
+.server, .quotas, .quota { display: contents; }
+
+.server-id, .note, .slots { grid-column: 1 / -1; }
+
+.server-detail[hidden] { display: none; }
+
+.server-detail, .slot-tcp { font-variant-numeric: tabular-nums; }
+
+.server-id {
+  margin: 10px 0 2px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.quota-name { cursor: help; }
+
+.bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.bar > i { display: block; height: 100%; background: var(--ok); }
+.bar > i.warn { background: var(--warn); }
+.bar > i.err { background: var(--err); }
+
+.quota-num { color: var(--fg); white-space: nowrap; }
+/* Строка доступности занимает колонку полосы: значение не должно влиять на
+   ширину третьей колонки, иначе оно укорачивает полосы остальных строк. */
+.quota-num.wide { grid-column: 2; white-space: normal; }
+.quota-num.bad { color: var(--err); }
+.quota-num em { font-style: normal; color: var(--dim); }
+.quota-num em.warn { color: var(--warn); }
+
+.note {
+  margin: 2px 0 0;
+  color: var(--err);
+}
+
+.slots {
+  list-style: none;
+  margin: 5px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.slot {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  width: 100%;
+  margin-left: -4px;
+  padding: 1px 4px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.slot:hover:not(:disabled) { background: #ececee; }
+.slot:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.slot:disabled { cursor: default; }
+
+.chev { flex: none; width: 8px; }
+.slot-id { font-family: var(--mono); font-size: 12px; }
+.slot-load { color: var(--fg); font-weight: 500; }
+.slot-tcp { margin-left: auto; }
+.slot.bad .slot-state, .slot-error { color: var(--err); }
+
+/* Узкое окно: значение не влезает рядом с полосой, поэтому уходит под неё.
+   Строки снова становятся отдельными сетками — при двух колонках с той же
+   шириной метки полосы всё равно остаются одинаковой длины. */
+@media (max-width: 620px) {
+  .server-detail, .server, .quotas { display: block; }
+  .quota {
+    display: grid;
+    grid-template-columns: 108px 1fr;
+    align-items: center;
+    gap: 1px 10px;
+  }
+  .server-id { margin: 12px 0 2px; }
+  .quota-num, .quota-num.wide { grid-column: 2; white-space: normal; }
 }
 
 #active-summary {

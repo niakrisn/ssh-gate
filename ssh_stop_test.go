@@ -152,3 +152,100 @@ func TestSSHStopRejectsLateConnection(t *testing.T) {
 		t.Fatal("late successful transport not closed")
 	}
 }
+
+type stalledSSHWriter struct {
+	net.Conn
+	stall     atomic.Bool
+	blocked   chan struct{}
+	closed    chan struct{}
+	once      sync.Once
+	closeOnce sync.Once
+}
+
+func (c *stalledSSHWriter) Write(p []byte) (int, error) {
+	if c.stall.Load() {
+		c.once.Do(func() { close(c.blocked) })
+		<-c.closed
+		return 0, net.ErrClosed
+	}
+	return c.Conn.Write(p)
+}
+
+func (c *stalledSSHWriter) Close() error {
+	err := c.Conn.Close()
+	// The test may close the socket again to release a stuck shutdown.
+	c.closeOnce.Do(func() { close(c.closed) })
+	return err
+}
+
+func TestShutdownClosesAllSSHTransportsBeforeWaitingForProbes(t *testing.T) {
+	dnsOpen := make(chan ssh.NewChannel, 1)
+	addr, signer := startTestSSHServerWithChannelHandler(t, "", true, func(open ssh.NewChannel) error {
+		dnsOpen <- open
+		return nil
+	})
+	tcp, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := &stalledSSHWriter{Conn: tcp, blocked: make(chan struct{}), closed: make(chan struct{})}
+	defer raw.Close()
+	sshConn, channels, requests, err := ssh.NewClientConn(raw, addr, &ssh.ClientConfig{
+		User: "test", Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := &sshDialer{client: ssh.NewClient(sshConn, channels, requests)}
+	second := &sshDialer{client: connectTestSSHClient(t, addr, signer)}
+	rules, err := NewRuleEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rules.Stop)
+	pool := newSSHTransportPool(first, second)
+	pool.id = "edge-a"
+	set := &sshDialerSet{pools: []*sshTransportPool{pool}}
+	rules.SetTunnelDNS([]string{"203.0.113.53:53"}, set)
+	set.startHealthChecks(t.Context(), rules, "https://health.example/", time.Hour, time.Hour)
+	var open ssh.NewChannel
+	select {
+	case open = <-dnsOpen:
+	case <-time.After(time.Second):
+		t.Fatal("health probe did not open a DNS channel")
+	}
+	raw.stall.Store(true)
+	ch, reqs, err := open.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ch.Close()
+	go ssh.DiscardRequests(reqs)
+	select {
+	case <-raw.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("health probe did not block writing DNS")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- shutdownServers(ctx, nil, rules, set) }()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("shutdown: %v", err)
+		}
+	case <-ctx.Done():
+		raw.Close()
+		<-result
+		t.Fatal("shutdown waited for a DNS probe blocked on an SSH writer")
+	}
+	for i, d := range []*sshDialer{first, second} {
+		check, done := context.WithCancel(t.Context())
+		done()
+		if err := d.waitStopped(check); err != nil {
+			t.Errorf("shutdown returned before transport %d stopped: %v", i, err)
+		}
+	}
+}

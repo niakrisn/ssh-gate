@@ -30,7 +30,7 @@ func TestConnectCopyErrorClosesBoth(t *testing.T) {
 	})
 	client := connectTestSSHClient(t, addr, signer)
 	d := &sshDialer{client: client}
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func testConnectSocketFailure(t *testing.T, failure string) {
 	if failure != "reply" {
 		go io.Copy(io.Discard, peer)
 	}
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,5 +239,92 @@ func TestConnectHalfClosePreservesResponse(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestConnectThroughSSHPoolPassesEOFBeforeReleasingQuota(t *testing.T) {
+	request := make(chan string, 1)
+	sendResponse := make(chan struct{})
+	defer close(sendResponse)
+	addr, signer := startTestSSHServerWithChannelHandler(t, "", true, func(open ssh.NewChannel) error {
+		ch, requests, err := open.Accept()
+		if err == nil {
+			go ssh.DiscardRequests(requests)
+			go func() {
+				defer ch.Close()
+				b, err := io.ReadAll(ch)
+				if err != nil {
+					return
+				}
+				request <- string(b)
+				select {
+				case <-sendResponse:
+				case <-t.Context().Done():
+					return
+				}
+				io.WriteString(ch, "response after EOF")
+			}()
+		}
+		return err
+	})
+	transport := &sshDialer{client: connectTestSSHClient(t, addr, signer), cfg: sshDialerCfg{tracker: NewConnTracker(10, time.Minute)}}
+	pool := newSSHTransportPool(transport)
+	pool.id = "edge-a"
+	pool.quota = newServerQuota(1, 1, 1)
+	set := &sshDialerSet{pools: []*sshTransportPool{pool}}
+	rules, err := NewRuleEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewHTTPProxyServer("127.0.0.1:0", newTestOpener(rules, set))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Start()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		s.Shutdown(ctx)
+		rules.Stop()
+		set.stop()
+	})
+	c, err := net.Dial("tcp", proxyAddr(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(3 * time.Second))
+	io.WriteString(c, "CONNECT 203.0.113.1:443 HTTP/1.1\r\nHost: 203.0.113.1:443\r\n\r\n")
+	reader := bufio.NewReader(c)
+	expectStatus(t, reader, "200")
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(c, "request before EOF")
+	if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-request:
+		if got != "request before EOF" {
+			t.Fatalf("upstream request = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not receive EOF through the pooled channel")
+	}
+	if len(pool.quota.clientTunnels) != 1 || pool.slots[0].load.Load() != 1 {
+		t.Fatal("half-close released the tunnel quota or slot load")
+	}
+	sendResponse <- struct{}{}
+	if response, err := io.ReadAll(reader); err != nil || string(response) != "response after EOF" {
+		t.Fatalf("response = %q, error = %v", response, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(pool.quota.clientTunnels) != 0 || pool.slots[0].load.Load() != 0 {
+		t.Fatal("full close did not release tunnel quota and slot load")
 	}
 }

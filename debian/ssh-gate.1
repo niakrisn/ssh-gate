@@ -1,385 +1,183 @@
-.TH SSH-GATE 1 "October 2026" "ssh-gate" "User Commands"
+.TH SSH-GATE 1 "November 2026" "ssh-gate" "User Commands"
 .SH NAME
-ssh-gate \- expose SOCKS5 and HTTP proxies over one SSH tunnel
+ssh-gate \- SOCKS5 and HTTP proxy over SSH server pools
 .SH SYNOPSIS
 .B ssh-gate
+.RB [ --config
+.IR file ]
 .SH DESCRIPTION
 .I ssh-gate
-opens a single SSH connection to a gateway host and serves local proxies over
-it: SOCKS5 by default, an HTTP CONNECT proxy when asked for. Every destination
-is dialed either through the tunnel or directly from the local network,
-depending on the rules in
-.BR DIRECT_RULES .
-Hostnames routed through the tunnel are resolved by DNS servers queried over
-the tunnel itself, so a local resolver sees them only while no such server
-answers; direct destinations are resolved locally.
+serves SOCKS5 and HTTP CONNECT proxies. It assigns each new tunnel to one
+eligible SSH server using rendezvous hashing over the client IP and the
+destination. An established connection stays on its selected SSH transport
+until it closes. Direct rules bypass SSH and remain available while all SSH
+servers are down.
 .PP
-Authentication uses an Ed25519 key pair generated on first start. The public
-half has to be present in the gateway's
+Each configured server has its own pool of SSH transports, health state,
+tunnel quota and pending-open quotas. A shared HTTPS URL is checked through
+each server with certificate verification. Hostname resolution for tunnel
+destinations uses DNS over the selected SSH server and does not fall back to
+local DNS.
+.PP
+The Ed25519 client key is generated on first start. Add its public key to the
+SSH account's
 .IR authorized_keys .
-The server host key is trusted on first use and pinned in
-.IR ssh_known_hosts
-inside the data directory; a different key afterwards aborts every connection
-attempt until that file is deleted.
-.PP
-Losing the SSH connection is not fatal. The proxies keep serving direct
-destinations, dialing is retried with jittered backoff capped at 60 seconds,
-and the readiness endpoint reports not ready until the tunnel is back up. The
-process exits only on a fatal startup error, most often an invalid
-configuration. Empty
-.BR SSH_HOST " or " SSH_USER
-is not such an error: the process keeps running with the proxies off, and only
-the health endpoints and the Web UI are served until the configuration is
-filled in and the service restarted.
-.PP
-Under systemd the tunnel state is the
-.B Status:
-line of
-.BR "systemctl status ssh-gate" :
-not configured, connecting, key not accepted by the gateway, gateway
-unreachable, host key changed, other SSH error, connected or reconnecting.
-A failure state names the file to act on and the time of the next attempt.
-The service reports ready once its listeners are open, without waiting for the
-tunnel.
-.PP
-A SOCKS5 client must finish its handshake within 30 seconds. A plain HTTP
-proxy request is closed after 5 minutes without data in either direction;
-CONNECT tunnels and SOCKS5 relays have no idle limit.
-.PP
-On SIGTERM or SIGINT the listeners close and running relays get 5 seconds to
-finish.
-.SH OPTIONS
-No command-line options. All configuration is read from the environment: a
-variable that is set and non-empty is used as given, otherwise the default
-below applies. In the packaged form the variables live in
-.IR /etc/default/ssh-gate ,
-which systemd reads as an
-.BR EnvironmentFile .
-That file is not a shell script: only
-.I KEY = value
-lines, no
-.BR export ,
-no command substitution. Apply changes with
-.BR "systemctl restart ssh-gate" .
-.TP
-.BI "SSH_HOST=" host
-Gateway address. Required; while it is empty the proxies stay off. The tunnel
-connects over IPv4 only: an IPv6 address is rejected at startup, and a name
-needs an A record.
-.TP
-.BI "SSH_PORT=" port
-Gateway SSH port. Default
-.BR 22 .
-.TP
-.BI "SSH_USER=" user
-Gateway account. Required; while it is empty the proxies stay off.
-.TP
-.BI "PROXY_MODES=" modes
-Comma-separated list of proxies to serve:
-.BR socks5 ", " http .
-Default
-.BR socks5 .
-.TP
-.BI "SOCKS5_LISTEN=" addrs
-Comma-separated list of SOCKS5 listen addresses, one proxy server per
-address. Default
-.BR 127.0.0.1:1080 .
-.TP
-.BI "HTTP_LISTEN=" addrs
-Comma-separated list of HTTP proxy listen addresses, one proxy server per
-address. Default
-.BR 127.0.0.1:3128 .
-.TP
-.BI "HEALTH_LISTEN=" addr
-Health endpoints and web UI. Default
-.BR 127.0.0.1:9090 .
-.TP
-.BI "UI_ALLOWED_HOSTS=" hosts
-Comma-separated host names or addresses, without port, that the web UI and
-the API answer to in addition to
-.BR localhost ,
-.BR 127.0.0.1 ,
-.B ::1
-and the host of
-.BR HEALTH_LISTEN ,
-see
-.BR "HTTP INTERFACES" .
-Empty by default.
-.TP
-.BI "MAX_CONNECTIONS=" n
-Limit of concurrent client connections over all proxy listeners; a
-connection over the limit is closed at once.
-.B 0
-disables the limit. Default
-.BR 4096 .
-.TP
-.BI "DATA_DIR=" dir
-Directory holding
-.IR ssh_key ,
-.IR ssh_key.pub
-and
+SSH host fingerprints are pinned by server ID in
 .IR ssh_known_hosts .
-Default
-.BR /data ;
-the systemd unit sets
-.BR /var/lib/ssh-gate ,
-which systemd creates and owns.
+.SH OPTIONS
 .TP
-.BI "DIRECT_RULES=" rules
-Comma-separated destinations that bypass the tunnel, see
-.BR "DIRECT RULES" .
-Empty by default, which sends everything through the tunnel.
+.BI --config " file"
+Read the strict YAML configuration from
+.IR file .
+Default:
+.IR /etc/ssh-gate/config.yaml .
+Configuration changes take effect after restart. Unknown fields and invalid
+values prevent startup.
+.SH CONFIGURATION
+The root keys are
+.BR proxy ,
+.BR routing ,
+.BR ssh ,
+.BR balancing ,
+.BR dns ,
+.BR health ,
+.BR ui ,
+.BR logging ,
+and
+.BR storage .
+See
+.I /usr/share/doc/ssh-gate/config.example.yaml
+for a complete example.
 .TP
-.BI "DIRECT_IP_FAMILY=" family
-Address family used when dialing direct destinations:
-.BR ipv4 ", " ipv6 ", " both .
-Default
-.BR ipv4 .
+.B proxy.socks5.listen, proxy.http.listen
+Lists of listen addresses. Presence of each section enables that proxy.
 .TP
-.BI "TUNNEL_DNS=" servers
-Comma-separated DNS servers for tunnel destinations: IP addresses with an
-optional port, queried over TCP through the tunnel. A server that cannot be
-reached is skipped for 10 seconds; a failure for one name is not held against
-the server. If no server answers, the name goes to the local resolver. Default
-.BR 1.1.1.1,8.8.8.8 .
+.B routing.direct.rules
+Ordered domain, regular-expression and
+.B ip:
+CIDR rules for local direct routing. Domain and regex rules use the local
+resolver. Matching CIDRs can use tunnel DNS to decide the route, then resolve
+locally for the direct connection. Accepts a YAML sequence, or one
+comma-separated string in the form the old
+.B DIRECT_RULES
+variable held; only the string form splits entries on commas.
 .TP
-.BI "DOH_HOST=" host
-DNS-over-HTTPS server to use instead of
-.BR TUNNEL_DNS ,
-reached through the tunnel. Use a hostname with optional
-.BR :443 ,
-for example
-.B dns.google
-or
-.BR cloudflare-dns.com .
-An empty value uses
-.BR TUNNEL_DNS .
-Setting both variables is a startup error.
-Requests start at
-.B /dns-query
-with an RFC 8484 GET. HTTP 400, 406, or 415 on the first A request triggers
-one JSON retry. All DoH requests for the lookup share a 3-second budget.
-Redirects must use HTTPS on the original host and port.
+.B ssh.servers[]
+Each entry has a stable
+.BR id ,
+.BR host ,
+.BR port ,
+.BR user ,
+optional
+.B transports
+and optional per-server
+.BR limits .
+Defaults are four SSH transports, 4096 client tunnels, 256 pending client
+opens and 32 pending service opens. All servers use the one generated client
+key. A legacy single fingerprint in
+.I ssh_known_hosts
+must be explicitly assigned to one server ID.
 .TP
-.BI "LOCAL_DNS_ON_NXDOMAIN=" on|off
-Ask the local resolver when a tunnel resolver says a name does not exist, for
-names only the local network knows. A local answer with only private
-addresses then goes direct, except loopback and link-local, and is refused
-while the tunnel is up but no tunnel resolver answers. Every unknown name
-reaches the local resolver, and a web page can use DNS rebinding to reach the
-local network. Default
-.BR off .
+.B balancing.hash_key
+Either
+.B client_ip_destination
+(default) or
+.BR client_ip .
+Source and destination ports are not part of the hash.
 .TP
-.BI "SSH_DIAL_TIMEOUT=" dur
-Deadline for dialing one destination through the tunnel. Must be positive
-and under 10m, which is the size of the in-memory connection history window.
-Default
-.BR 30s .
+.B balancing.retry
+Maximum channel-open attempts (default 3) and the total time budget
+(default 30s).
 .TP
-.BI "SSH_KEEPALIVE_PERIOD=" dur
-Idle time before keepalive probes start. Drives both the OS-level TCP
-keepalive and the SSH-layer
-.I keepalive@openssh.com
-probe that drops a transport which is alive at TCP level but stuck.
-.B 0
-disables both. Default
-.BR 10s .
+.B balancing.passive
+Per-server failure threshold and exclusion interval. Defaults: three
+confirmed transport failures within 30s, excluded for 30s.
 .TP
-.BI "SSH_KEEPALIVE_INTERVAL=" dur
-Keepalive probe retransmission interval, rounded to whole seconds;
-.B 0
-keeps the kernel default of 75s. Default
-.BR 1s .
+.B dns.tunnel.servers, dns.tunnel.doh_host
+Tunnel DNS servers or one DNS-over-HTTPS hostname. These forms are mutually
+exclusive. A tunnel route never falls back to local DNS, including after
+NXDOMAIN.
 .TP
-.BI "SSH_KEEPALIVE_PROBES=" n
-Unanswered probes before the connection is declared dead;
-.B 0
-keeps the kernel default of 9. Default
-.BR 5 .
-.PP
-Worst case time to notice a dead path on the OS side is
-.I period
-plus
-.I interval
-times
-.IR probes
-.
-With the defaults that is 15 seconds; an unanswered SSH-layer probe drops the
-tunnel within about two periods.
+.B health.url, health.interval, health.timeout, health.max_fails, health.successes
+Common HTTPS probe settings. Defaults are
+.B https://www.youtube.com
+, 10s, 5s, three failures and two successes. TLS is verified, redirects are
+not followed, and every probe uses a fresh SSH channel and a fresh DNS lookup.
 .TP
-.BI "LOG_LEVEL=" level
-Level of the service log, one of
-.BR debug ", " info ", " warn ", " error .
-Default
-.BR info .
-.TP
-.BI "ACCESS_LOG=" on|off
-One line per proxied connection: client, destination, route, bytes,
-duration and
-.IR result :
-.BR ok ", " resolve_error ", " dial_error " or " relay_error .
-The error text of a failed connection is a warning in the service log with
-the same
-.IR conn_id .
-.B LOG_LEVEL
-does not affect it. Default
-.BR on .
-.PP
-Both logs are structured JSON lines. Under systemd they go to the journal
-with a syslog priority per line, the service log as
-.B ssh-gate
-and the access log as
-.BR ssh-gate-access ;
-elsewhere both go to standard error.
-.SH "DIRECT RULES"
-A rule names a destination that is dialed from the local network instead of
-the tunnel. Three forms are accepted:
-.TP
-.BI ip: cidr
-Matches a destination whose resolved address falls in
-.IR cidr .
-The address comes from the same lookup as a tunnel destination, so choosing a
-route never shows a name to the local resolver. An intranet name that public
-DNS does not know needs a
-.I domain
-rule or
-.BR LOCAL_DNS_ON_NXDOMAIN=on .
-These rules are checked after the other forms, so a name that matches one of
-those never reaches a tunnel resolver.
-.TP
-.BI re: regex
-Matches the destination host name against a Go regular expression. An empty
-pattern is rejected rather than treated as match-all.
-.TP
-.I domain
-Matches the name itself and any name below it, so
-.I internal.local
-covers
-.IR db.internal.local .
-.PP
-Without any rule, an address literal in a private, loopback, link-local,
-shared (100.64.0.0/10) or unique local range is always dialed directly. A
-name routed through the tunnel whose addresses are all in these ranges is
-refused: through the tunnel the gateway would dial its own local network,
-for example a cloud metadata service. Add a direct rule to reach such a name
-from the local network.
-.PP
-Host names are compared in their canonical form: case-insensitively and
-without a trailing dot. The value is not shell-quoted, so one backslash in
-.I DIRECT_RULES
-is one backslash: write
-.IR re:\e.ru$ .
-.SH "HTTP INTERFACES"
-All served on
-.BR HEALTH_LISTEN .
-The web UI and the
-.B /api
-endpoints have no authentication. They answer only to requests whose
-.I Host
-header is
-.BR localhost ,
-.BR 127.0.0.1 ,
-.BR ::1 ,
-the host of
-.B HEALTH_LISTEN
-or a name in
-.BR UI_ALLOWED_HOSTS ,
-and refuse others with 403; this blocks web pages in a local browser from
-reading them through DNS rebinding. The health endpoints answer to any
-.IR Host .
+.B storage.directory
+Directory for the generated key pair and host key pins. The Debian unit uses
+.IR /var/lib/ssh-gate .
+.SH HEALTH AND STATUS
 .TP
 .B /healthz
-Process is up.
+Liveness endpoint.
 .TP
 .B /readyz
-Tunnel is connected; answers 503 while it is down.
+Returns success when configured proxy listeners are running. Readiness does
+not depend on SSH pool health, allowing direct routes to continue during an
+SSH outage.
 .TP
 .B /api/status
-Tunnel and configuration state as JSON.
+Returns aggregate SSH connectivity and eligibility plus a
+.B ssh.servers[]
+entry for each server. Server status includes health, reasons, channel and
+quota use, and transport states with TCP statistics when available. The
+response also includes DNS status, active connection counts and uptime.
 .TP
 .B /api/connections
-Recent connections as JSON: the last 1000 entries within 10 minutes, kept in
-memory only.
-.TP
-.B /
-Web UI over the same data.
+Lists active and completed tunneled client connections, including selected
+server ID and transport slot.
+.PP
+The Web UI is served from
+.BR / .
+The UI and API accept only loopback/allowed Host names and have no
+authentication. Keep the health listener on a trusted interface.
 .SH FILES
 .TP
-.B /usr/bin/ssh-gate
-The daemon.
+.I /etc/ssh-gate/config.yaml
+System configuration, supplied as a package conffile.
 .TP
-.B /usr/lib/systemd/system/ssh-gate.service
-Unit shipped by the package. It runs the daemon as a dynamic user with the
-filesystem read-only except for the data directory.
+.I /var/lib/ssh-gate/ssh_key
+Private Ed25519 client key.
 .TP
-.B /etc/default/ssh-gate
-Configuration, a conffile: local edits are kept across upgrades.
+.I /var/lib/ssh-gate/ssh_key.pub
+Public client key to install in
+.IR authorized_keys .
 .TP
-.B /etc/rsyslog.d/40-ssh-gate.conf
-Keeps the access log out of the syslog files when rsyslog is installed; the
-journal still has it.
-.TP
-.B /var/lib/ssh-gate
-Data directory:
-.IR ssh_key ,
-.IR ssh_key.pub ,
-.IR ssh_known_hosts .
-Kept on purge because the public half of the key pair is registered on the
-gateway.
-.SH "EXIT STATUS"
+.I /var/lib/ssh-gate/ssh_known_hosts
+Host key fingerprints indexed by server ID.
+.SH MIGRATION
+The old
+.I /etc/default/ssh-gate
+environment file is no longer read. Copy its values into the nested YAML
+schema; one old SSH endpoint becomes one item under
+.BR ssh.servers .
+The old application-wide
+.B MAX_CONNECTIONS
+becomes per-server
+.BR ssh.servers[].limits.max_client_tunnels .
+There is no local DNS fallback on tunnel NXDOMAIN. Preserve the old
+single-line host fingerprint and convert it explicitly to
+.BR "server-id SHA256:fingerprint" .
+The generated client key remains usable. Before rollback, restore the old
+configuration and original one-line host pin together with the old binary.
+.SH EXIT STATUS
 .TP
 .B 0
-Clean shutdown after SIGTERM or SIGINT.
+Normal shutdown.
 .TP
 .B 78
-Fatal startup error:
-.B SSH_PORT
-not a port, an unparsable
-.BR PROXY_MODES ", " DIRECT_RULES ", " DIRECT_IP_FAMILY
-or duration value, the data directory not writable, an unreadable key, or a
-listen address already in use. A restart cannot fix it, so the unit lists the
-status in
-.B RestartPreventExitStatus
-and stays failed.
+Invalid configuration or another startup error that will not be fixed by
+restarting, such as a busy listen address or unreadable key.
 .SH EXAMPLES
-Serve the whole LAN instead of loopback only, then restart:
-.PP
+Copy and edit the complete sample:
+.P
 .EX
-sed -i 's/^SOCKS5_LISTEN=.*/SOCKS5_LISTEN=0.0.0.0:1080/' /etc/default/ssh-gate
+cp /usr/share/doc/ssh-gate/config.example.yaml /etc/ssh-gate/config.yaml
+sudoedit /etc/ssh-gate/config.yaml
 systemctl restart ssh-gate
 .EE
-.PP
-Route traffic through the proxy:
-.PP
-.EX
-curl --socks5-hostname 127.0.0.1:1080 https://example.com
-curl -x http://127.0.0.1:3128 https://example.com
-.EE
-.PP
-Check whether the tunnel is up, and why not:
-.PP
-.EX
-systemctl status ssh-gate
-curl -fsS http://127.0.0.1:9090/readyz
-.EE
-.PP
-The public key to put in the gateway's
-.IR authorized_keys :
-.PP
-.EX
-cat /var/lib/ssh-gate/ssh_key.pub
-.EE
-.PP
-Read the access log, or only the service warnings and errors:
-.PP
-.EX
-journalctl -u ssh-gate -t ssh-gate-access -o cat
-journalctl -u ssh-gate -t ssh-gate -p warning
-.EE
-.SH "SEE ALSO"
+.SH SEE ALSO
 .BR ssh (1),
-.BR systemctl (1),
-.BR journalctl (1),
-.BR proxy (7),
-.IR /usr/share/doc/ssh-gate/README.md ,
-.IR /usr/share/doc/ssh-gate/THIRD-PARTY-NOTICES
+.BR sshd (8),
+.BR sshd_config (5)

@@ -96,7 +96,7 @@ func TestSOCKS5ShutdownDrains(t *testing.T) {
 		}
 	}()
 
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestSOCKS5RelayOutlivesHandshakeTimeout(t *testing.T) {
 		io.Copy(c, c)
 	}()
 
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}
@@ -361,7 +361,7 @@ func (s *syncBuffer) String() string {
 func TestSOCKS5ResolveFailureLogged(t *testing.T) {
 	app, access, flush := captureLogs(t)
 
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatalf("NewRuleEngine: %v", err)
 	}

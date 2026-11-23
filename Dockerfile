@@ -19,7 +19,7 @@ COPY --from=builder /app/ssh-gate .
 # documents 10001 as the directory owner the app runs as. /data baked into
 # the image (mode 0700) so named volumes inherit a writable owner.
 RUN addgroup -S -g 10001 sshgate && adduser -S -u 10001 -G sshgate sshgate && \
-    mkdir -p /data && chown sshgate:sshgate /data && chmod 0700 /data && \
+    mkdir -p /data /etc/ssh-gate && chown sshgate:sshgate /data && chmod 0700 /data && \
     chown -R sshgate:sshgate /app && chmod 0755 /app
 USER sshgate
-ENTRYPOINT ["./ssh-gate"]
+ENTRYPOINT ["./ssh-gate", "--config", "/etc/ssh-gate/config.yaml"]

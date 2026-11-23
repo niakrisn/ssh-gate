@@ -1,7 +1,6 @@
 #!/usr/bin/make -f
 # Build the package the way the distribution does: dpkg-buildpackage drives dh
-# (debhelper), which installs the unit file, the /etc/default config and the
-# systemd maintainer snippets.
+# (debhelper), which installs the unit file, YAML config and systemd snippets.
 #
 # Only the compile step is overridden. It uses the Go toolchain from the build
 # environment because the golang packages in the target distributions are older
@@ -38,6 +37,7 @@ override_dh_auto_test:
 
 override_dh_auto_install:
 	install -D -m 0755 bin/ssh-gate debian/tmp/usr/bin/ssh-gate
+	install -D -m 0644 debian/ssh-gate.config.yaml debian/tmp/etc/ssh-gate/config.yaml
 	install -D -m 0644 debian/rsyslog.conf debian/tmp/etc/rsyslog.d/40-ssh-gate.conf
 
 override_dh_auto_clean:
@@ -50,20 +50,18 @@ override_dh_dwz:
 override_dh_strip:
 	dh_strip --no-automatic-dbgsym
 
-# The service starts on a fresh install too: with SSH_HOST still empty it runs
-# with the proxies off and its systemctl status line asks for the config. On
+# The service starts on a fresh install too: with an empty ssh.servers list,
+# direct routes remain available while the operator configures the tunnel. On
 # upgrade the debhelper snippet restarts it (a plain restart, so a service the
 # 0.1.0 prerm stopped comes back as well).
 #
-# The move after dh_installsystemd: debhelper installs a unit found in
-# debian/*.service under /lib with no option for the destination (see
-# $tmpdir/lib/systemd/system in dh_installsystemd), and on the merged-usr targets
-# lintian reports that path as aliased-location. Moving it once the maintainer
-# snippets are generated keeps the canonical path; the snippets name units rather
-# than paths, and deb-systemd-helper searches /usr/lib/systemd/system itself.
+# Older debhelper versions install the unit under /lib. Move it after the
+# maintainer snippets are generated so all packages use the canonical path.
 override_dh_installsystemd:
 	dh_installsystemd
-	mkdir -p debian/ssh-gate/usr/lib/systemd/system
-	mv debian/ssh-gate/lib/systemd/system/*.service \
-		debian/ssh-gate/usr/lib/systemd/system/
-	rmdir --ignore-fail-on-non-empty -p debian/ssh-gate/lib/systemd/system
+	if [ -f debian/ssh-gate/lib/systemd/system/ssh-gate.service ]; then \
+		mkdir -p debian/ssh-gate/usr/lib/systemd/system && \
+		mv debian/ssh-gate/lib/systemd/system/ssh-gate.service debian/ssh-gate/usr/lib/systemd/system/ && \
+		rmdir --ignore-fail-on-non-empty -p debian/ssh-gate/lib/systemd/system; \
+	fi
+	test -f debian/ssh-gate/usr/lib/systemd/system/ssh-gate.service

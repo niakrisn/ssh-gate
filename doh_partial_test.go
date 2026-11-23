@@ -102,7 +102,7 @@ func familyDoH(t *testing.T, format string, reply func(*http.Request, dnsmessage
 		fmt.Fprintf(w, `{"Status":0,"Answer":[{"Type":%d,"Data":%q}]}`, q.Type, ip)
 	}))
 	t.Cleanup(srv.Close)
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestDNSPartialFamilyDoH(t *testing.T) {
 					if !errors.Is(err, errNotFound) || local.Load() != 0 {
 						t.Fatalf("negative=%v local=%d", err, local.Load())
 					}
-				} else if err == nil || local.Load() != 1 {
+				} else if !errors.Is(err, errUnreachable) || local.Load() != 0 {
 					t.Fatalf("failure=%v local=%d", err, local.Load())
 				}
 			})

@@ -55,8 +55,7 @@ type sshDialer struct {
 	status tunnelStatus
 	// connect establishes one tunnel connection; the monitor calls it
 	// instead of connectSSH directly so tests can observe and control
-	// reconnect rounds. The constructor sets connectSSH; a nil value (test
-	// literals built by hand) falls back to connectSSH in the monitor.
+	// reconnect rounds. A nil value uses connectSSH.
 	connect func(context.Context, sshDialerCfg) (*ssh.Client, string, syscall.RawConn, error)
 }
 
@@ -65,6 +64,10 @@ type sshDialerCfg struct {
 	port            int
 	user            string
 	keyPath         string
+	serverID        string
+	transportSlot   int
+	hostKeys        *hostKeyStore
+	openQuota       *serverQuota
 	fingerprint     string
 	keepalivePeriod time.Duration
 	// keepaliveInterval / keepaliveProbes set TCP_KEEPINTVL / TCP_KEEPCNT
@@ -90,16 +93,19 @@ type sshDialerCfg struct {
 	onStatus func(tunnelStatus)
 }
 
-// newSSHDialer builds the dialer and starts the connection lifecycle in the
-// background. The start is deliberately lazy: a VPS that is down at process
-// start must not take the proxies, the Web UI or readyz down with it (a
-// fatal exit under `restart: unless-stopped` loops the container and buries
-// the first-run key output in the restart noise). The monitor dials
-// immediately on its first pass, then retries with backoff; Connected()
-// reports liveness and only connect/known_hosts config errors can fail the
-// constructor.
+// newSSHDialer loads the host key pin. The caller starts the monitor after
+// all slots in its pool have been built.
 func newSSHDialer(cfg sshDialerCfg) (*sshDialer, error) {
-	fp, err := readKnownHostFingerprint(filepath.Dir(cfg.keyPath))
+	var fp string
+	var err error
+	if cfg.serverID != "" {
+		if cfg.hostKeys == nil {
+			cfg.hostKeys = &hostKeyStore{path: filepath.Join(filepath.Dir(cfg.keyPath), sshKnownHostsFile)}
+		}
+		fp, err = cfg.hostKeys.fingerprint(cfg.serverID)
+	} else {
+		fp, err = readKnownHostFingerprint(filepath.Dir(cfg.keyPath))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -107,11 +113,19 @@ func newSSHDialer(cfg sshDialerCfg) (*sshDialer, error) {
 		cfg.fingerprint = fp
 	}
 
-	d := &sshDialer{cfg: cfg, connect: connectSSH, monitorDone: make(chan struct{})}
-	d.lifetimeContext()
+	return &sshDialer{cfg: cfg, status: tunnelStatus{State: stateConnecting}}, nil
+}
+
+func (d *sshDialer) start() {
+	d.mu.Lock()
+	if d.done.Load() || d.monitorDone != nil {
+		d.mu.Unlock()
+		return
+	}
+	d.monitorDone = make(chan struct{})
+	d.mu.Unlock()
 	d.setStatus(tunnelStatus{State: stateConnecting})
 	go d.monitor()
-	return d, nil
 }
 
 // setStatus stores the tunnel state and reports it to onStatus.
@@ -179,6 +193,11 @@ func tunnelHTTPClient(lifetime context.Context, d dialer, timeout time.Duration,
 			IdleConnTimeout:     30 * time.Second,
 			MaxConnsPerHost:     32,
 			MaxIdleConnsPerHost: 8,
+			// Each request dials again: the route depends on the SSH server
+			// the request selected, and an idle connection is keyed only by
+			// URL and TLS config. Reusing one would send the next request
+			// through whichever server opened it.
+			DisableKeepAlives: true,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				// Transport detaches this context from the request. Bound
 				// our wait even after the original caller has returned.
@@ -189,7 +208,8 @@ func tunnelHTTPClient(lifetime context.Context, d dialer, timeout time.Duration,
 				if err := lifetime.Err(); err != nil {
 					return nil, err
 				}
-				conn, err := d.DialContext(ctxWithNoTrack(ctx), network, addr)
+				dialCtx := ctxWithNoTrack(ctx)
+				conn, err := dialerForContext(dialCtx, d).DialContext(dialCtx, network, addr)
 				if err != nil {
 					return nil, err
 				}
@@ -233,6 +253,10 @@ func (d *sshDialer) trackDial(ctx context.Context, network, addr string) (net.Co
 
 	dialHost, port := parseDialAddr(addr)
 	meta, ok := connMetaFromCtx(ctx)
+	if transport, exists := transportFromContext(ctx); exists {
+		meta.ServerID = transport.serverID
+		meta.Transport = transport.slot
+	}
 	host := dialHost
 	if ok && meta.Host != "" {
 		host = meta.Host
@@ -264,29 +288,58 @@ func (d *sshDialer) dial(ctx context.Context, network, addr string) (net.Conn, e
 	if err := ctx.Err(); err != nil {
 		return nil, NewNetworkError("SSH dial", addr, err)
 	}
+	budget, _ := ctx.Value(sshOpenBudgetKey{}).(*sshOpenBudget)
+	if budget != nil && budget.remaining() == 0 {
+		return nil, errSSHOpenBudgetExhausted
+	}
 	d.mu.Lock()
 	c := d.client
 	if d.done.Load() || c == nil {
 		d.mu.Unlock()
 		return nil, fmt.Errorf("SSH client not connected")
 	}
-	if d.pending == nil {
-		d.pending = make(chan struct{}, 256)
-	}
-	pool := d.pending
-	if ctx.Value(noTrackKey{}) != nil {
-		if d.pendingDNS == nil {
-			d.pendingDNS = make(chan struct{}, 32)
+	var pool chan struct{}
+	var quotaErr error
+	if d.cfg.openQuota != nil {
+		service := ctx.Value(noTrackKey{}) != nil
+		pool, quotaErr = d.cfg.openQuota.acquireOpen(service)
+		d.pending = d.cfg.openQuota.pendingOpens
+		d.pendingDNS = d.cfg.openQuota.serviceOpens
+	} else {
+		if d.pending == nil {
+			d.pending = make(chan struct{}, 256)
 		}
-		pool = d.pendingDNS
+		pool = d.pending
+		if ctx.Value(noTrackKey{}) != nil {
+			if d.pendingDNS == nil {
+				d.pendingDNS = make(chan struct{}, 32)
+			}
+			pool = d.pendingDNS
+		}
+		select {
+		case pool <- struct{}{}:
+		default:
+			quotaErr = &pendingOpenLimitError{limit: cap(pool)}
+		}
 	}
-	select {
-	case pool <- struct{}{}:
+	if quotaErr == nil {
+		if budget != nil && !budget.take() {
+			<-pool
+			d.mu.Unlock()
+			return nil, errSSHOpenBudgetExhausted
+		}
 		d.opens.Add(1)
 		d.mu.Unlock()
-	default:
+	} else {
 		d.mu.Unlock()
-		return nil, NewNetworkError("SSH dial", addr, &pendingOpenLimitError{limit: cap(pool)})
+		if d.cfg.openQuota != nil {
+			limitType := "client_pending_opens"
+			if ctx.Value(noTrackKey{}) != nil {
+				limitType = "service_pending_opens"
+			}
+			log.Warn().Str("server_id", d.cfg.serverID).Str("limit_type", limitType).Err(quotaErr).Msg("SSH server quota exhausted")
+		}
+		return nil, NewNetworkError("SSH dial", addr, quotaErr)
 	}
 	type result struct {
 		conn net.Conn
@@ -452,7 +505,7 @@ func (d *sshDialer) monitor() {
 			d.setStatus(tunnelStatus{State: stateReconnecting})
 		}
 
-		log.Warn().Int("attempt", attempt+1).Dur("delay", delay).Msg("SSH not connected, dialing...")
+		log.Warn().Str("server_id", d.cfg.serverID).Int("slot", d.cfg.transportSlot).Int("attempt", attempt+1).Dur("delay", delay).Msg("SSH not connected, dialing...")
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -474,7 +527,7 @@ func (d *sshDialer) monitor() {
 			return
 		}
 		if err != nil {
-			log.Error().Err(err).Int("attempt", attempt+1).Msg("SSH connect failed")
+			log.Error().Str("server_id", d.cfg.serverID).Int("slot", d.cfg.transportSlot).Err(err).Int("attempt", attempt+1).Msg("SSH connect failed")
 			attempt++
 			delay = reconnectDelay(attempt) + time.Duration(rand.Intn(500))*time.Millisecond
 			d.setStatus(tunnelStatus{State: failState(err), Err: err, Attempt: attempt, Retry: delay})
@@ -509,7 +562,7 @@ func (d *sshDialer) monitor() {
 		attempt = 0
 		delay = 0
 		d.setStatus(tunnelStatus{State: stateConnected})
-		log.Info().Str("host", d.cfg.host).Int("port", d.cfg.port).Str("fingerprint", fp).Msg("SSH connected")
+		log.Info().Str("server_id", d.cfg.serverID).Int("slot", d.cfg.transportSlot).Str("host", d.cfg.host).Int("port", d.cfg.port).Str("fingerprint", fp).Msg("SSH connected")
 	}
 }
 
@@ -526,7 +579,7 @@ func (d *sshDialer) keepalive(ctx context.Context, client *ssh.Client) {
 	period := d.cfg.keepalivePeriod
 	tick := time.NewTicker(period)
 	defer tick.Stop()
-	defer log.Debug().Msg("SSH keepalive loop stopped")
+	defer log.Debug().Str("server_id", d.cfg.serverID).Int("slot", d.cfg.transportSlot).Msg("SSH keepalive loop stopped")
 	for {
 		select {
 		case <-ctx.Done():
@@ -560,7 +613,7 @@ func (d *sshDialer) keepalive(ctx context.Context, client *ssh.Client) {
 			client.Close()
 			<-alive
 		}
-		log.Warn().Msg("SSH keepalive unanswered, dropping tunnel")
+		log.Warn().Str("server_id", d.cfg.serverID).Int("slot", d.cfg.transportSlot).Msg("SSH keepalive unanswered, dropping tunnel")
 		client.Close()
 		return
 	}
@@ -633,6 +686,9 @@ func connectSSH(ctx context.Context, cfg sshDialerCfg) (*ssh.Client, string, sys
 	var remoteKey ssh.PublicKey
 	callback := func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		remoteKey = key
+		if cfg.hostKeys != nil {
+			return cfg.hostKeys.verifyAndPin(cfg.serverID, sshFingerprint(key))
+		}
 		if cfg.fingerprint != "" {
 			got := sshFingerprint(key)
 			if got != cfg.fingerprint {
@@ -678,13 +734,13 @@ func connectSSH(ctx context.Context, cfg sshDialerCfg) (*ssh.Client, string, sys
 			_ = tc.SetKeepAlive(true)
 			_ = tc.SetKeepAlivePeriod(cfg.keepalivePeriod)
 			if err := setKeepaliveProbeOpts(raw, cfg.keepaliveInterval, cfg.keepaliveProbes); err != nil {
-				log.Warn().Err(err).Msg("set TCP keepalive probe parameters")
+				log.Warn().Str("server_id", cfg.serverID).Int("slot", cfg.transportSlot).Err(err).Msg("set TCP keepalive probe parameters")
 			}
 		} else {
 			_ = tc.SetKeepAlive(false)
 		}
 	} else {
-		log.Warn().Str("type", fmt.Sprintf("%T", rawConn)).Msg("raw TCPConn unavailable; OS keepalive skipped")
+		log.Warn().Str("server_id", cfg.serverID).Int("slot", cfg.transportSlot).Str("type", fmt.Sprintf("%T", rawConn)).Msg("raw TCPConn unavailable; OS keepalive skipped")
 	}
 	// x/crypto applies Config.Timeout to the TCP dial only; bound the
 	// handshake itself on the established socket, then clear the deadline
@@ -707,7 +763,7 @@ func connectSSH(ctx context.Context, cfg sshDialerCfg) (*ssh.Client, string, sys
 
 	if remoteKey != nil {
 		fp := sshFingerprint(remoteKey)
-		if cfg.fingerprint == "" {
+		if cfg.fingerprint == "" && cfg.hostKeys == nil {
 			// TOFU: the key is trusted only once it is saved. A connect
 			// that cannot pin the key fails, otherwise the next process
 			// start would trust whatever key the network presents.

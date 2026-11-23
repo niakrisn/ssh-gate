@@ -151,7 +151,7 @@ func TestShutdownIdempotent(t *testing.T) {
 
 func TestShutdownCountsDial(t *testing.T) {
 	d, live, pending := pendingSSH(t)
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,7 +265,7 @@ func TestHTTPShutdownClosesClients(t *testing.T) {
 					closed <- err
 				})
 			}
-			rules, err := NewRuleEngine("")
+			rules, err := NewRuleEngine(nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -350,7 +350,7 @@ func TestShutdownStopsAllListenersBeforeDrain(t *testing.T) {
 	}
 	second.Start()
 	defer second.Shutdown(context.Background())
-	health, err := NewHealthServer("127.0.0.1:0", "", 0, testDialer{}, NewConnTracker(8, time.Minute))
+	health, err := NewHealthServer("127.0.0.1:0", testDialer{}, NewConnTracker(8, time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +412,7 @@ func TestDNSStopDoesNotWaitForTransportClose(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
-	rules, _ := NewRuleEngine("")
+	rules, _ := NewRuleEngine(nil)
 	rules.dns.dohClient = &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
 		if err != nil {
@@ -474,7 +474,7 @@ func TestShutdownPreservesInFlightPayload(t *testing.T) {
 		}
 		upstreamDone <- err
 	}()
-	rules, _ := NewRuleEngine("drain.example")
+	rules, _ := NewRuleEngine([]string{"drain.example"})
 	defer rules.Stop()
 	lookup, release := make(chan struct{}), make(chan struct{})
 	var releaseOnce sync.Once

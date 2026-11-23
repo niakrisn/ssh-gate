@@ -28,7 +28,7 @@ func TestOpenProxyBudget(t *testing.T) {
 	for _, proto := range []string{"http", "socks5"} {
 		t.Run(proto, func(t *testing.T) {
 			d, live, pending := pendingSSH(t)
-			rules, err := NewRuleEngine("")
+			rules, err := NewRuleEngine(nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -114,7 +114,7 @@ func (*stalledDestinationDialer) Connected() bool { return true }
 func (*stalledDestinationDialer) stop()           {}
 
 func TestOpenTotalBudget(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestOpenTotalBudget(t *testing.T) {
 }
 
 func TestOpenPrepareTotalBudget(t *testing.T) {
-	rules, err := NewRuleEngine("ip:203.0.113.0/24")
+	rules, err := NewRuleEngine([]string{"ip:203.0.113.0/24"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestOpenPrepareTotalBudget(t *testing.T) {
 }
 
 func TestOpenParentDeadline(t *testing.T) {
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,5 +203,73 @@ func TestOpenParentDeadline(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "addresses tried") {
 		t.Fatalf("counted attempts before dial: %v", err)
+	}
+}
+
+func TestDialCandidatesLimitCapsChannelOpens(t *testing.T) {
+	addrs := []netip.Addr{netip.MustParseAddr("203.0.113.1"), netip.MustParseAddr("203.0.113.2"), netip.MustParseAddr("203.0.113.3"), netip.MustParseAddr("203.0.113.4")}
+	var opened atomic.Int64
+	_, _, attempts, err := dialCandidatesLimit(context.Background(), addrs, time.Second, 0, 2, func(context.Context, netip.Addr) (net.Conn, error) { opened.Add(1); return nil, errors.New("refused") })
+	if err == nil || attempts != 2 || opened.Load() != 2 {
+		t.Fatalf("err=%v attempts=%d opened=%d, want 2", err, attempts, opened.Load())
+	}
+}
+
+func TestOpenBudgetsSSHChannelOpensAcrossSlotsAndServers(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		reason    ssh.RejectionReason
+		max       int
+		ips       int
+		first     int64
+		neighbour int64
+	}{
+		{"one attempt across four slots", ssh.ResourceShortage, 1, 2, 1, 0},
+		{"server transition spends one attempt", ssh.ConnectionFailed, 3, 1, 1, 1},
+		{"destination refuses both IPs without trying more slots", ssh.ConnectionFailed, 3, 2, 2, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &sshDialerSet{}
+			var opened [2]atomic.Int64
+			for i := range opened {
+				addr, signer := startTestSSHServerWithChannelHandler(t, "", true, func(open ssh.NewChannel) error {
+					opened[i].Add(1)
+					return open.Reject(tt.reason, "test refusal")
+				})
+				var transports []dialer
+				for range 4 {
+					transports = append(transports, &sshDialer{client: connectTestSSHClient(t, addr, signer)})
+				}
+				p := newSSHTransportPool(transports...)
+				p.id = []string{"edge-a", "edge-b"}[i]
+				d.pools = append(d.pools, p)
+			}
+			t.Cleanup(d.stop)
+			rules, err := NewRuleEngine(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(rules.Stop)
+			rules.dns.tunnel = []*upstream{{name: "test", lookup: func(context.Context, string) ([]netip.Addr, time.Time, error) {
+				addrs := []netip.Addr{netip.MustParseAddr("203.0.113.1"), netip.MustParseAddr("203.0.113.2")}
+				return addrs[:tt.ips], time.Now(), nil
+			}}}
+			o := &Opener{rules: rules, d: d, dialTimeout: time.Second, maxAttempts: tt.max}
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			const source, host = "192.0.2.10:1234", "example.test"
+			first, second := &opened[0], &opened[1]
+			if d.selectPool(source, host, "") == d.pools[1] {
+				first, second = second, first
+			}
+			_, _, _, _, err = o.Open(ctx, source, "http", host, 443)
+			var refusal *ssh.OpenChannelError
+			if !errors.As(err, &refusal) || refusal.Reason != tt.reason {
+				t.Errorf("Open error = %v, want SSH channel refusal %v", err, tt.reason)
+			}
+			if a, b := first.Load(), second.Load(); a != tt.first || b != tt.neighbour {
+				t.Fatalf("CHANNEL_OPEN sent on ranked servers = %d/%d, want %d/%d", a, b, tt.first, tt.neighbour)
+			}
+		})
 	}
 }

@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
-	"strconv"
 	"testing"
 	"time"
 )
@@ -43,22 +41,31 @@ func TestManualWebUIVisualHold(t *testing.T) {
 		tr.Done(id, &fakeHalfCloseConn{}).Close()
 	}
 
-	// a live local port so the status line probes a reachable endpoint.
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listener: %v", err)
+	// UI_VISUAL picks the DNS row: 1 healthy, 2 recent failures, 3 excluded,
+	// 4 no resolver status, 5 no SSH servers (direct routes only).
+	mode := os.Getenv("UI_VISUAL")
+	var d dialer
+	if mode == "5" {
+		d = &sshDialerSet{}
+	} else {
+		pool := &sshTransportPool{id: "edge-a", host: "ssh-a.example.net", port: 22, user: "tunnel", healthURL: "https://www.youtube.com", quota: newServerQuota(4096, 256, 32), health: newServerHealth(3, 30*time.Second, 30*time.Second, 3, 2), slots: []*transportSlot{{dialer: testDialer{}, index: 0}}}
+		switch mode {
+		case "1", "4":
+			pool.recordHealthProbe(nil)
+			pool.recordHealthProbe(nil)
+		case "2":
+			pool.recordHealthProbe(nil)
+			pool.recordHealthProbe(nil)
+			pool.recordHealthProbe(errors.New("i/o timeout"))
+			pool.recordHealthProbe(errors.New("i/o timeout"))
+		case "3":
+			for range 3 {
+				pool.recordHealthProbe(errors.New("i/o timeout"))
+			}
+		}
+		d = &sshDialerSet{pools: []*sshTransportPool{pool}}
 	}
-	defer l.Close()
-	sshHost, portStr, _ := net.SplitHostPort(l.Addr().String())
-	sshPort, _ := strconv.Atoi(portStr)
-
-	// UI_VISUAL picks the DNS row: 1 healthy, 2 failures, 3 degraded, 4 no
-	// resolvers (dns is null), 5 not configured (the whole status line).
-	var d dialer = testDialer{}
-	if os.Getenv("UI_VISUAL") == "5" {
-		d = unconfiguredDialer{}
-	}
-	h, err := NewHealthServer("127.0.0.1:0", sshHost, sshPort, d, tr)
+	h, err := NewHealthServer("127.0.0.1:0", d, tr)
 	if err != nil {
 		t.Fatalf("NewHealthServer: %v", err)
 	}
@@ -71,7 +78,7 @@ func TestManualWebUIVisualHold(t *testing.T) {
 			{Name: "1.1.1.1", OK: 1197, Fail: 3, RTTMs: 14, LastOKAt: 1, Error: "i/o timeout"},
 			{Name: "8.8.8.8"},
 		}},
-		"3": {Mode: "servers", Degraded: true, LocalFallbacks: 3, LastFallbackAt: 1, Servers: []dnsServerStatus{
+		"3": {Mode: "servers", Degraded: true, Servers: []dnsServerStatus{
 			{Name: "1.1.1.1", Fail: 3, LastFailed: true, Error: "i/o timeout"},
 			{Name: "8.8.8.8", Fail: 3, LastFailed: true, Error: "i/o timeout"},
 		}},

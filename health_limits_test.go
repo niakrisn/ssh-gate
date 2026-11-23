@@ -15,7 +15,7 @@ import (
 
 func healthForLimits(t *testing.T) *HealthServer {
 	t.Helper()
-	h, err := NewHealthServer("127.0.0.1:0", "", 0, testDialer{}, NewConnTracker(8, time.Minute))
+	h, err := NewHealthServer("127.0.0.1:0", testDialer{}, NewConnTracker(8, time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestHealthConnectionLimitIndependent(t *testing.T) {
 	h.srv.ReadHeaderTimeout = 2 * time.Second
 	h.Start()
 	proxyLimit := newConnLimiter(1)
-	rules, err := NewRuleEngine("")
+	rules, err := NewRuleEngine(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

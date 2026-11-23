@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"mime"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/netip"
 	"net/url"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,17 +32,13 @@ const (
 	// dohMaxResponse bounds a single DoH answer body against a misbehaving
 	// endpoint returning an unreasonably large response.
 	dohMaxResponse = 1 << 20
-	// tunnelLookupTimeout bounds the tunnel step of a lookup, so a silent
-	// server leaves the local resolver the rest of the 5 s lookup bound.
+	// tunnelLookupTimeout bounds a tunnel resolver round.
 	tunnelLookupTimeout = 3 * time.Second
 	// upstreamPause is how long lookups skip a tunnel resolver no channel
 	// could be opened to. A silent port 53 must not cost every connection the
 	// tunnel step, and each timed-out dial leaves a pending channel on sshd
 	// (see sshDialerCfg).
 	upstreamPause = 10 * time.Second
-	// dnsDegradedWindow is how long a fallback to the local resolver keeps
-	// the DNS status degraded.
-	dnsDegradedWindow = time.Minute
 )
 
 // SetDOH makes cached resolution query the given DNS-over-HTTPS endpoint
@@ -51,25 +49,46 @@ func (e *RuleEngine) SetDOH(host string, d dialer) {
 	e.dns.dohHost = host
 	e.dns.dohClient = tunnelHTTPClient(e.dns.ctx, d, 0, nil)
 	e.dns.dohClient.CheckRedirect = checkDoHRedirect
-	e.dns.tunnel = []*upstream{{name: host, lookup: e.dns.dohLookup}}
-	e.dns.tunnelUp = d.Connected
+	e.dns.setTunnel(d, []*upstream{{name: host, lookup: e.dns.dohLookup}})
 }
 
 // SetTunnelDNS makes cached resolution query the given DNS servers (host:port)
 // over TCP through the SSH dialer, so DNS traffic stays inside the encrypted
 // tunnel and cannot be poisoned on the client side. A definitive answer
-// (including NXDOMAIN) is authoritative; the local resolver is used only when
-// no server answers. Direct destinations keep using local DNS.
+// (including NXDOMAIN) is authoritative. A tunneled name never falls back to
+// the local resolver: that would leak the name and let the ISP answer. Direct
+// destinations keep using local DNS (see localResolveAll).
 func (e *RuleEngine) SetTunnelDNS(servers []string, d dialer) {
-	e.dns.tunnel = make([]*upstream, 0, len(servers))
+	resolvers := make([]*upstream, 0, len(servers))
 	for _, server := range servers {
 		name := server
 		if host, port, err := net.SplitHostPort(server); err == nil && port == "53" {
 			name = host
 		}
-		e.dns.tunnel = append(e.dns.tunnel, &upstream{name: name, lookup: dnsServerLookup(d, server)})
+		resolvers = append(resolvers, &upstream{name: name, lookup: dnsServerLookup(d, server)})
 	}
-	e.dns.tunnelUp = d.Connected
+	e.dns.setTunnel(d, resolvers)
+}
+
+func (c *dnsCache) setTunnel(d dialer, resolvers []*upstream) {
+	c.tunnel = resolvers
+	c.tunnelUp = d.Connected
+	c.tunnelByServer = nil
+	if set, ok := d.(*sshDialerSet); ok {
+		c.tunnelByServer = make(map[string][]*upstream, len(set.pools))
+		for _, pool := range set.pools {
+			for _, u := range resolvers {
+				c.tunnelByServer[pool.id] = append(c.tunnelByServer[pool.id], &upstream{name: u.name, lookup: u.lookup})
+			}
+		}
+	}
+}
+
+func (c *dnsCache) tunnelResolvers(ctx context.Context) []*upstream {
+	if resolvers, ok := c.tunnelByServer[selectedServerKey(ctx)]; ok {
+		return resolvers
+	}
+	return c.tunnel
 }
 
 // dnsCache caches DNS resolution with TTL.
@@ -92,15 +111,12 @@ type dnsCache struct {
 	// tunnel holds the resolvers reached through the SSH tunnel, tried in
 	// order.
 	tunnel []*upstream
+	// Configured SSH server IDs and resolvers bound the health state for
+	// each route. Lookups do not add entries to this map.
+	tunnelByServer map[string][]*upstream
 	// tunnelUp reports the SSH tunnel state: with the tunnel down a failed
 	// query says nothing about the server.
 	tunnelUp func() bool
-	// localOnNXDomain asks the local resolver after a tunnel not-found.
-	localOnNXDomain bool
-	// fallbacks counts lookups no tunnel resolver answered; lastFallback is
-	// the Unix time in nanoseconds of the last one.
-	fallbacks    atomic.Int64
-	lastFallback atomic.Int64
 	// now is time.Now, replaced in tests of the pause.
 	now func() time.Time
 	// localLookup replaces net.DefaultResolver in tests; nil means the
@@ -192,8 +208,6 @@ type cacheEntry struct {
 	// neg marks a cached authoritative NXDOMAIN: repeats within the
 	// negative TTL fail fast without touching the network.
 	neg bool
-	// localDirect is lookupResult.localDirect.
-	localDirect bool
 }
 
 // ResolveAll resolves host to all of its IPv4 and IPv6 addresses. IP
@@ -205,11 +219,53 @@ func (c *dnsCache) ResolveAll(ctx context.Context, host string) ([]netip.Addr, e
 	return addrs, err
 }
 
-// resolveTunnel is ResolveAll that also reports lookupResult.localDirect.
+// resolveTunnel retains the route metadata return for callers; tunnel DNS
+// answers can never mark a local route.
 func (c *dnsCache) resolveTunnel(ctx context.Context, host string) ([]netip.Addr, bool, error) {
 	host = normalizeHost(host)
-	res, err := c.cachedLookup(ctx, host, host, c.lookup)
-	return res.addrs, res.localDirect, err
+	key := host
+	if serverID := selectedServerKey(ctx); serverID != "" {
+		key = "server:" + serverID + ":" + host
+	}
+	res, err := c.cachedLookup(ctx, key, host, c.lookup)
+	return res.addrs, false, err
+}
+
+// resolveTunnelFresh bypasses positive and negative cache entries for health
+// checks. It uses only tunnel resolvers and inherits the selected server from ctx.
+func (c *dnsCache) resolveTunnelFresh(ctx context.Context, host string) ([]netip.Addr, error) {
+	host = normalizeHost(host)
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return []netip.Addr{ip.Unmap()}, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, tunnelLookupTimeout)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	resolvers := c.tunnelResolvers(ctx)
+	var last error
+	for i, u := range resolvers {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		remaining := time.Until(deadline)
+		if deadline.IsZero() {
+			remaining = tunnelLookupTimeout
+		}
+		uctx, stop := context.WithTimeout(ctx, remaining/time.Duration(len(resolvers)-i))
+		addrs, _, err := u.lookup(uctx, host)
+		stop()
+		if err == nil {
+			return addrs, nil
+		}
+		if errors.Is(err, errNotFound) || sshQuotaExhausted(err) {
+			return nil, NewDNSError(host, err)
+		}
+		last = err
+	}
+	if last == nil {
+		last = fmt.Errorf("%w: no tunnel DNS resolver configured", errUnreachable)
+	}
+	return nil, NewDNSError(host, last)
 }
 
 // localResolveAll resolves host through the local resolver only, never a
@@ -249,7 +305,7 @@ func (c *dnsCache) cachedLookup(ctx context.Context, key, host string, lookup fu
 		if entry.neg {
 			return lookupResult{}, NewDNSError(host, errNotFound)
 		}
-		return lookupResult{addrs: entry.addrs, authoritative: true, localDirect: entry.localDirect}, nil
+		return lookupResult{addrs: entry.addrs, authoritative: true}, nil
 	}
 	c.mu.Unlock()
 
@@ -290,7 +346,7 @@ func (c *dnsCache) cachedLookup(ctx context.Context, key, host string, lookup fu
 				expires = res.validUntil
 			}
 			if now.Before(expires) {
-				c.store(key, cacheEntry{addrs: res.addrs, localDirect: res.localDirect, expires: expires, neg: negative})
+				c.store(key, cacheEntry{addrs: res.addrs, expires: expires, neg: negative})
 			}
 		}
 		if err != nil {
@@ -348,16 +404,11 @@ var errNotFound = errors.New("no answer")
 // broken domain.
 var errUnreachable = errors.New("server unreachable")
 
-// lookupResult is one resolver answer. authoritative marks it for the key
-// space: tunnel resolver answers are; the fallback when no resolver answers is
-// not — it must not be cached under the tunnel key or it would route tunnel
-// destinations by home DNS for the whole TTL. localDirect marks a local answer
-// whose private addresses may go direct (see notFound and lookup).
+// lookupResult is one tunnel resolver answer.
 type lookupResult struct {
 	addrs         []netip.Addr
 	validUntil    time.Time // Zero leaves the cache's fixed TTL in effect.
 	authoritative bool
-	localDirect   bool
 }
 
 // upstream is one tunnel resolver: a DNS server or the DoH endpoint.
@@ -381,6 +432,7 @@ type upstream struct {
 
 // dnsServerStatus is the /api/status view of one tunnel resolver.
 type dnsServerStatus struct {
+	ServerID   string `json:"server_id,omitempty"`
 	Name       string `json:"name"`
 	OK         int64  `json:"ok"`
 	Fail       int64  `json:"fail"`
@@ -393,25 +445,23 @@ type dnsServerStatus struct {
 
 // dnsStatus is the /api/status view of the tunnel resolvers.
 type dnsStatus struct {
-	Mode           string            `json:"mode"`
-	Degraded       bool              `json:"degraded"`
-	LocalFallbacks int64             `json:"local_fallbacks"`
-	LastFallbackAt int64             `json:"last_fallback_at"`
-	Servers        []dnsServerStatus `json:"servers"`
+	Mode     string            `json:"mode"`
+	Degraded bool              `json:"degraded"`
+	Servers  []dnsServerStatus `json:"servers"`
 }
 
-// claim reports whether a lookup may use the resolver now.
-func (u *upstream) claim(now time.Time) bool {
+// claim reports whether a lookup may use the resolver now and owns a probe.
+func (u *upstream) claim(now time.Time) (ready, probe bool) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.pausedUntil.IsZero() {
-		return true
-	}
 	if u.probing || now.Before(u.pausedUntil) {
-		return false
+		return false, false
+	}
+	if u.pausedUntil.IsZero() {
+		return true, false
 	}
 	u.probing = true
-	return true
+	return true, true
 }
 
 // releaseProbes ends the probes of a finished lookup.
@@ -441,45 +491,47 @@ func (u *upstream) status(now time.Time) dnsServerStatus {
 	return st
 }
 
-// DNSStatus reports the tunnel resolvers: any answer, NXDOMAIN too, counts as
-// a success; cache hits and skipped resolvers count as nothing. Degraded means
-// a resolver is paused or names reached the local resolver in the last minute.
-// A failed last lookup does not: it may be about one name, and a spare server
-// that nothing uses would stay failed for good.
+// DNSStatus reports the tunnel resolvers. Degraded means a resolver is paused.
 func (e *RuleEngine) DNSStatus() dnsStatus {
 	c := e.dns
 	now := c.now()
-	st := dnsStatus{Mode: "servers", LocalFallbacks: c.fallbacks.Load()}
+	st := dnsStatus{Mode: "servers", Servers: []dnsServerStatus{}}
 	if c.dohClient != nil {
 		st.Mode = "doh"
 	}
-	if last := c.lastFallback.Load(); last != 0 {
-		at := time.Unix(0, last)
-		st.LastFallbackAt = at.Unix()
-		st.Degraded = now.Sub(at) < dnsDegradedWindow
+	add := func(id string, resolvers []*upstream) {
+		for _, u := range resolvers {
+			s := u.status(now)
+			s.ServerID = id
+			st.Degraded = st.Degraded || s.Paused
+			st.Servers = append(st.Servers, s)
+		}
 	}
-	for _, u := range c.tunnel {
-		s := u.status(now)
-		st.Degraded = st.Degraded || s.Paused
-		st.Servers = append(st.Servers, s)
+	if len(c.tunnelByServer) == 0 {
+		add("", c.tunnel)
+	}
+	for _, id := range slices.Sorted(maps.Keys(c.tunnelByServer)) {
+		add(id, c.tunnelByServer[id])
 	}
 	return st
 }
 
-// lookup resolves host through the tunnel resolvers in order, skipping the
-// paused ones, and falls back to the local resolver only when none answers.
-// That answer may go direct only while the tunnel is down: with the tunnel up,
-// a private address from a resolver of the provider may be a block page, and
-// a tunnel destination must not go there in the clear.
+// lookup resolves host through tunnel resolvers only. Tunnel failures and
+// NXDOMAIN never consult the local resolver.
 func (c *dnsCache) lookup(ctx context.Context, host string) (lookupResult, error) {
-	var active []*upstream
+	var active, probes []*upstream
 	now := c.now()
-	for _, u := range c.tunnel {
-		if u.claim(now) {
+	for _, u := range c.tunnelResolvers(ctx) {
+		ready, probe := u.claim(now)
+		if ready {
 			active = append(active, u)
 		}
+		if probe {
+			probes = append(probes, u)
+		}
 	}
-	defer releaseProbes(active)
+	defer releaseProbes(probes)
+	var last error
 
 	tunnelCtx, cancel := context.WithTimeout(ctx, tunnelLookupTimeout)
 	defer cancel()
@@ -498,27 +550,27 @@ func (c *dnsCache) lookup(ctx context.Context, host string) (lookupResult, error
 		}
 		if errors.Is(err, errNotFound) {
 			c.upstreamAnswered(u, rtt)
-			return c.notFound(ctx, host, validUntil)
+			return c.notFound(validUntil)
 		}
-		c.upstreamFailed(u, err)
+		if sshQuotaExhausted(err) {
+			return lookupResult{}, err
+		}
+		last = err
+		c.upstreamFailed(ctx, u, err)
 	}
 
-	c.fallbacks.Add(1)
-	c.lastFallback.Store(c.now().UnixNano())
-	addrs, err := c.lookupLocal(ctx, host)
-	return lookupResult{addrs: addrs, localDirect: c.localOnNXDomain && !c.tunnelUp()}, err
+	if last == nil {
+		// Every resolver is paused: nothing was asked, so there is no cause
+		// to report beyond "no resolver was tried".
+		return lookupResult{}, fmt.Errorf("%w: no tunnel DNS resolver answered", errUnreachable)
+	}
+	// The caller sees both the aggregate state and the last real cause, so a
+	// SERVFAIL is not reported as a timeout. Status keeps every server's error.
+	return lookupResult{}, fmt.Errorf("%w: no tunnel DNS resolver answered: %w", errUnreachable, last)
 }
 
-// notFound handles a definitive not-found from a tunnel resolver: it stands,
-// unless localOnNXDomain lets the local resolver answer for names public DNS
-// does not know. Asking was a policy choice, so that answer is authoritative,
-// and a local failure leaves the name not found.
-func (c *dnsCache) notFound(ctx context.Context, host string, validUntil time.Time) (lookupResult, error) {
-	if c.localOnNXDomain {
-		if addrs, err := c.lookupLocal(ctx, host); err == nil {
-			return lookupResult{addrs: addrs, authoritative: true, localDirect: true}, nil
-		}
-	}
+// notFound preserves authoritative tunnel NXDOMAIN without consulting local DNS.
+func (c *dnsCache) notFound(validUntil time.Time) (lookupResult, error) {
 	return lookupResult{validUntil: validUntil, authoritative: true}, errNotFound
 }
 
@@ -536,8 +588,12 @@ func (c *dnsCache) upstreamAnswered(u *upstream, rtt time.Duration) {
 // upstreamFailed records a failed lookup and pauses a resolver that cannot be
 // reached. With the tunnel down the failure is instant and says nothing about
 // the server.
-func (c *dnsCache) upstreamFailed(u *upstream, err error) {
-	if !c.tunnelUp() {
+func (c *dnsCache) upstreamFailed(ctx context.Context, u *upstream, err error) {
+	connected := c.tunnelUp
+	if d := dialerForContext(ctx, nil); d != nil {
+		connected = d.Connected
+	}
+	if connected == nil || !connected() {
 		return
 	}
 	reachable := !errors.Is(err, errUnreachable)
@@ -553,7 +609,7 @@ func (c *dnsCache) upstreamFailed(u *upstream, err error) {
 	u.pausedUntil = c.now().Add(upstreamPause)
 	name := u.name
 	u.mu.Unlock()
-	log.Warn().Str("resolver", name).Err(err).Dur("pause", upstreamPause).Msg("tunnel DNS unreachable, pausing the resolver")
+	log.Warn().Str("server_id", selectedServerKey(ctx)).Str("resolver", name).Err(err).Dur("pause", upstreamPause).Msg("tunnel DNS unreachable, pausing the resolver")
 }
 
 // lookupLocal resolves host through the local resolver. Unlike lookup it
