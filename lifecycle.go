@@ -150,18 +150,23 @@ type clientListener struct {
 }
 
 func (l *clientListener) Accept() (net.Conn, error) {
-	if !l.clients.beginAccept() {
-		return nil, net.ErrClosed
-	}
-	defer l.clients.endAccept()
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	owned, ok := l.clients.add(c)
-	if !ok {
+	for {
+		if !l.clients.beginAccept() {
+			return nil, net.ErrClosed
+		}
+		c, err := l.Listener.Accept()
+		if err != nil {
+			l.clients.endAccept()
+			return nil, err
+		}
+		owned, ok := l.clients.add(c)
+		if ok {
+			l.clients.endAccept()
+			return owned, nil
+		}
+		// A rejected client does not close the listener. Check for shutdown
+		// again before accepting another connection.
 		c.Close()
-		return nil, net.ErrClosed
+		l.clients.endAccept()
 	}
-	return owned, nil
 }

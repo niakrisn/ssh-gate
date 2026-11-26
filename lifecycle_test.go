@@ -43,6 +43,50 @@ func TestClientCloseWaitsForHandler(t *testing.T) {
 	}
 }
 
+type clientConnWithAddr struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c clientConnWithAddr) RemoteAddr() net.Addr { return c.addr }
+
+func TestClientListenerSkipsDuplicateRemoteAddr(t *testing.T) {
+	r := newClientRegistry()
+	old, oldPeer := net.Pipe()
+	defer oldPeer.Close()
+	owned, ok := r.add(old)
+	if !ok {
+		t.Fatal("registration failed")
+	}
+	defer owned.finish()
+
+	duplicate, duplicatePeer := net.Pipe()
+	defer duplicate.Close()
+	defer duplicatePeer.Close()
+	next, nextPeer := net.Pipe()
+	defer next.Close()
+	defer nextPeer.Close()
+	distinct := clientConnWithAddr{Conn: next, addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10001}}
+	l := &clientListener{
+		Listener: &scriptedListener{items: []any{duplicate, distinct}},
+		clients:  r,
+	}
+
+	got, err := l.Accept()
+	if err != nil {
+		t.Fatalf("Accept stopped at duplicate: %v", err)
+	}
+	client := got.(*clientConn)
+	defer client.finish()
+	if got.RemoteAddr().String() != distinct.RemoteAddr().String() {
+		t.Fatalf("Accept returned %s, want %s", got.RemoteAddr(), distinct.RemoteAddr())
+	}
+	_ = duplicatePeer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := duplicatePeer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("duplicate connection still open: %v", err)
+	}
+}
+
 type pausedAcceptListener struct {
 	net.Listener
 	accepted chan struct{}

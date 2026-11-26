@@ -1,3 +1,10 @@
+ssh-gate (0.7.1-1) unstable; urgency=medium
+
+  * Keep proxy listeners open when a newly accepted connection conflicts
+    with an existing client registration.
+
+ -- Nikita Kozlov <niakrisn@gmail.com>  Thu, 26 Nov 2026 17:51:17 +0300
+
 ssh-gate (0.7.0-1) unstable; urgency=medium
 
   * Replace environment settings with a strict YAML configuration file.
